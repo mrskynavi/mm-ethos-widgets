@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.0
+-- @version 1.1
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -34,6 +34,11 @@
 --   Netto:   Luftmassenbewegung = TE + Sinken(TAS)   (positiv = Luft steigt), geglaettet
 --   Sollfahrt:  v = h + sqrt( h^2 + (C + MC - Netto + B*h) / A )      (h = Gegenwind m/s)
 --   Abweichung = geglaettete Ist-Fahrt - Sollfahrt (km/h), positiv = zu schnell.
+--   Streckenverlust (nur im Gleitflug): Mit der Sollfahrt haette dieselbe "Hoehe inkl. MC"
+--   (Sinken + MC - Netto) die Strecke  Kosten * (vs - h) / (w(vs) + MC - Netto)  gebracht,
+--   geflogen wurde (v - h) * dt  (v = geglaettete Ist-Fahrt). Die Differenz wird aufsummiert.
+--   Bei MC 0 ist das genau die verschenkte Gleitstrecke ueber Grund, bei MC > 0 die Strecke,
+--   die man in derselben Zeit nach MacCready mehr geschafft haette. 2x tippen = auf 0.
 --
 -- Glaettung (gegen die Phygoide): Fahrt, Netto, Vario; Totzone; Ton-Verzoegerung.
 -- Ton (system.playTone): wie beim Vario zeigt die Tonhoehe die Richtung, die Taktfolge die
@@ -250,6 +255,20 @@ local function process(w, teRaw, vRaw, dt, now, hRaw)
       w.climbSince = nil
       w.cruiseSince = w.cruiseSince or now
       if now - w.cruiseSince >= 3 then w.cruise = true end
+    end
+  end
+
+  -- Streckenverlust gegenueber der Sollfahrt aufsummieren (nur im Gleitflug)
+  if w.cruise and dt > 0 then
+    local h = w.headwind or 0
+    local air = w.mcValue - clamp(w.netto, -5, 5)
+    local dOpt = polarSink(w.polar, w.vstf) + air
+    local dIst = polarSink(w.polar, w.vSlow) + air
+    if dOpt > 0.05 and dIst > 0 and w.vstf > h then
+      local opt = dIst * (w.vstf - h) / dOpt * dt        -- moegliche Strecke (m)
+      local ist = (w.vSlow - h) * dt                     -- geflogene Strecke (m)
+      w.lossM = (w.lossM or 0) + math.max(opt - ist, 0)
+      w.lossOpt = (w.lossOpt or 0) + opt
     end
   end
 
@@ -961,11 +980,26 @@ local function paint(w)
   drawT(margin, y, leftW - margin, "VARIO TE", FONT_S, DIM, "l")
   y = y + textHeight(FONT_S)
   local teStr = (w.valid and w.teFast) and string.format("%+.1f", w.teFast) or "--"
-  drawT(margin, y, leftW - margin, teStr, FONT_L, WHITE, "l")
+  th = drawT(margin, y, leftW - margin, teStr, FONT_L, WHITE, "l")
+  y = y + th + 6
 
-  -- Status klein unten links: Polare, Glaettung, Wind, Gegenwind
+  -- Streckenverlust gegenueber der Sollfahrt (2x tippen = auf 0)
   local xsH = textHeight(FONT_XS)
   local sy = H - margin - (xsH + 2) * 4 - 2
+  local lossH = textHeight(FONT_S) * 2
+  if y + lossH <= sy then
+    local armed = w.lossArmed and os.clock() - w.lossArmed < 4
+    drawT(margin, y, leftW - margin, armed and "NOCHMAL = 0" or "VERLUST", FONT_S, armed and ORANGE or DIM, "l")
+    local m = w.lossM or 0
+    local lossStr = (m < 1000) and string.format("%.0f m", m) or string.format("%.2f km", m / 1000)
+    if (w.lossOpt or 0) > 200 then lossStr = string.format("%s  %.0f%%", lossStr, 100 * m / w.lossOpt) end
+    drawT(margin, y + textHeight(FONT_S), leftW - margin, lossStr, FONT_S, m >= 100 and ORANGE or WHITE, "l")
+    w.lossBox = {x = 0, y = y, w = leftW, h = lossH}
+  else
+    w.lossBox = nil
+  end
+
+  -- Status klein unten links: Polare, Glaettung, Wind, Gegenwind
   local pname = tostring(w.fileKey or w.modelName or "?")
   drawT(margin, sy, leftW - margin, string.format("%s %d%%", string.sub(pname, 1, 10), w.ballast), FONT_XS, GREEN, "l")
   drawT(margin, sy + xsH + 2, leftW - margin, string.format("Glaett. %ds  Totz. +-%d", w.smoothSpd, w.dead), FONT_XS, DIM, "l")
@@ -1127,6 +1161,15 @@ local function event(w, category, value, x, y)
   if EVT_TOUCH and category == EVT_TOUCH and (TOUCH_START == nil or value == TOUCH_START) and w.buttons then
     if inside(w.buttons.plus, x, y) then changeMc(w, w.mcStep); lcd.invalidate(); return true end
     if inside(w.buttons.minus, x, y) then changeMc(w, -w.mcStep); lcd.invalidate(); return true end
+    if inside(w.lossBox, x, y) then
+      local now = os.clock()
+      if w.lossArmed and now - w.lossArmed < 4 then
+        w.lossM, w.lossOpt, w.lossArmed = 0, 0, nil
+      else
+        w.lossArmed = now
+      end
+      lcd.invalidate(); return true
+    end
   end
   if EVT_KEY and category == EVT_KEY and w.polar then
     if KEY_ROTARY_RIGHT and value == KEY_ROTARY_RIGHT then changeMc(w, w.mcStep); lcd.invalidate(); return true end
