@@ -1,5 +1,5 @@
 -- @widget  Polarflug
--- @version 1.0
+-- @version 1.1
 -- Polarflug fuer Ethos -- Vollbild-Widget, hilft beim Erfliegen der Polare.
 --
 -- Anzeige 1 (Balken): ein Balken pro Geschwindigkeitsbereich (Standard 20-30, 30-40 ... km/h).
@@ -402,6 +402,11 @@ local function nBrackets(w) return clamp(math.ceil((w.vMax - w.vMin) / math.max(
 local function bracketOf(w, kmh) return math.floor((kmh - w.vMin) / math.max(w.width, 1)) + 1 end
 local function bracketLo(w, b) return w.vMin + (b - 1) * w.width end
 
+-- Ethos bricht einen Aufruf ab, wenn er zu viele Lua-Befehle braucht ("Max instructions count
+-- reached"). Alles, was ueber alle Messpunkte laeuft, wird deshalb in Stuecken zu CHUNK Punkten
+-- pro wakeup erledigt (Laden, Zaehlen, Klassen, Speichern, Punkte fuers Diagramm).
+local CHUNK = 250
+
 local function recount(w)
   local n = nBrackets(w)
   local c = {}
@@ -414,15 +419,45 @@ local function recount(w)
   w.cntSig = table.concat({w.vMin, w.vMax, w.width}, ",")
 end
 
+-- Zaehlt in Stuecken neu. Liefert true, solange noch Arbeit offen ist.
+local function recountStep(w)
+  local sig = table.concat({w.vMin, w.vMax, w.width}, ",")
+  local j = w.cntJob
+  if not j or j.sig ~= sig then
+    local c = {}
+    for i = 1, nBrackets(w) do c[i] = 0 end
+    j = {sig = sig, c = c, i = 1, n = #w.pv}
+    w.cntJob = j
+  end
+  local pv, c = w.pv, j.c
+  local e = math.min(j.i + CHUNK - 1, j.n)
+  for i = j.i, e do
+    local b = bracketOf(w, pv[i])
+    if c[b] then c[b] = c[b] + 1 end
+  end
+  j.i = e + 1
+  if j.i <= j.n then return true end
+  -- Punkte, die waehrend des Zaehlens dazukamen
+  for i = j.n + 1, #pv do
+    local b = bracketOf(w, pv[i])
+    if c[b] then c[b] = c[b] + 1 end
+  end
+  w.cnt, w.cntSig, w.cntJob = c, sig, nil
+  return false
+end
+
 local function addPoint(w, kmh, sink, now)
   local pv, ps = w.pv, w.ps
   pv[#pv + 1], ps[#ps + 1] = kmh, sink
+  local b = bracketOf(w, kmh)
+  if w.cnt[b] then w.cnt[b] = w.cnt[b] + 1 end
   if #pv > MAX_POINTS then
-    table.remove(pv, 1); table.remove(ps, 1)
-    w.cntSig = nil
-  else
-    local b = bracketOf(w, kmh)
-    if w.cnt[b] then w.cnt[b] = w.cnt[b] + 1 end
+    -- die aeltesten auf einmal entfernen (table.move ist C), dann neu zaehlen und neu schreiben
+    local drop = MAX_POINTS // 10
+    local n = #pv
+    table.move(pv, drop + 1, n, 1); table.move(ps, drop + 1, n, 1)
+    for i = n, n - drop + 1, -1 do pv[i], ps[i] = nil, nil end
+    w.cntSig, w.rewrite = nil, true
   end
   w.dirty, w.fitDirty, w.lastOk = true, true, now
 end
@@ -448,6 +483,7 @@ local function evalPoint(w, now)
   if sec == w.lastSec then return end
   local r = w.ring
   if #r < 3 then w.reason = "keine Daten"; return end
+  if w.loadIt then w.reason = "laedt Punkte"; return end
   if tc - (w.t0 or now) < SKIP then w.reason = "Start"; return end
   if not w.wt.filled then w.reason = "Wind fehlt: kreisen"; return end
   if w.lastMotor and tc - w.lastMotor < AFTER_MOTOR then w.reason = "Motor"; return end
@@ -526,6 +562,36 @@ local function refreshFit(w)
   w.fitDirty = false
 end
 
+-- Klassen und Fit in Stuecken. Liefert true, solange noch Arbeit offen ist.
+local function fitStep(w)
+  local j = w.fitJob
+  if not j then
+    j = {bins = {}, i = 1, n = #w.pv}
+    w.fitJob = j
+    w.fitDirty = false
+  end
+  local pv, ps, bins = w.pv, w.ps, j.bins
+  local e = math.min(j.i + CHUNK - 1, j.n, #pv)
+  for i = j.i, e do
+    local k = math.floor(pv[i] / CLASS_W)
+    local t = bins[k]
+    if not t then t = {}; bins[k] = t end
+    t[#t + 1] = ps[i]
+  end
+  j.i = e + 1
+  if j.i <= math.min(j.n, #pv) then return true end
+  local out = {}
+  for k, a in pairs(bins) do
+    if #a >= CLASS_MIN then out[#out + 1] = {v = k * CLASS_W + CLASS_W / 2, m = median(a), n = #a} end
+  end
+  table.sort(out, function(x, y) return x.v < y.v end)
+  w.classes = out
+  w.polarFit = polarFit(out)
+  w.fitJob = nil
+  w.newFor = false     -- neue Parabel rechnen (naechster Schritt)
+  return false
+end
+
 -- ---------------------------------------------------------------- Speichern pro Modell
 
 local function fileName(w)
@@ -535,41 +601,115 @@ end
 
 local function loadPoints(w)
   w.pv, w.ps = {}, {}
+  w.loadIt, w.saveJob, w.fitJob, w.cntJob, w.rewrite, w.savedN = nil, nil, nil, nil, false, 0
+  w.dots, w.classes, w.polarFit, w.newPol, w.newFor = nil, nil, nil, nil, false
   if io and io.open then
     local ok, f = pcall(io.open, fileName(w), "r")
     if ok and f then
       local okR, text = pcall(f.read, f, "*a")
       pcall(f.close, f)
       if okR and type(text) == "string" then
-        for a, b in text:gmatch("(%-?[%d%.]+);(%-?[%d%.]+)") do
-          w.pv[#w.pv + 1], w.ps[#w.ps + 1] = tonumber(a), tonumber(b)
-        end
+        w.loadIt = text:gmatch("(%-?[%d%.]+);(%-?[%d%.]+)")
       end
     end
   end
   w.cntSig, w.fitDirty, w.dirty = nil, true, false
 end
 
-local function savePoints(w, now)
-  w.saveT = now
-  if not (io and io.open) then w.saveErr = "io.open fehlt"; return end
-  local parts = {"# Polarflug Messpunkte: Fahrt km/h;Sinken m/s\n"}
-  for i = 1, #w.pv do parts[#parts + 1] = string.format("%.1f;%.2f\n", w.pv[i], w.ps[i]) end
-  local ok, f = pcall(io.open, fileName(w), "w")
-  if not (ok and f) then w.saveErr = "Speichern nicht moeglich"; return end
-  local okW, e = pcall(f.write, f, table.concat(parts))
+-- Zerlegt die geladene Datei in Stuecken. Liefert true, solange noch Arbeit offen ist.
+local function loadStep(w)
+  local it = w.loadIt
+  local pv, ps = w.pv, w.ps
+  for _ = 1, CHUNK do
+    local a, b = it()
+    if not a then
+      w.loadIt, w.cntSig, w.fitDirty, w.savedN = nil, nil, true, #pv
+      return false
+    end
+    a, b = tonumber(a), tonumber(b)
+    if a and b then pv[#pv + 1], ps[#ps + 1] = a, b end
+  end
+  return true
+end
+
+local FILE_HEAD = "# Polarflug Messpunkte: Fahrt km/h;Sinken m/s\n"
+
+local function writeFile(w, mode, text)
+  if not (io and io.open) then w.saveErr = "io.open fehlt"; return false end
+  local ok, f = pcall(io.open, fileName(w), mode)
+  if not (ok and f) then return false end
+  local okW, e = pcall(f.write, f, text)
   pcall(f.close, f)
   w.saveErr = (not okW) and tostring(e) or nil
-  w.dirty = false
+  return okW
+end
+
+-- Neue Punkte ans Ende der Datei haengen (wenige Punkte, kurzer Aufruf). Klappt das nicht, oder
+-- wurden alte Punkte entfernt, wird die Datei in Stuecken neu geschrieben (saveStep).
+local function savePoints(w, now)
+  w.saveT = now
+  local n = #w.pv
+  if w.rewrite or w.loadIt or (w.savedN or 0) > n then w.rewrite = true; return end
+  if (w.savedN or 0) == n then w.dirty = false; return end
+  local parts = {}
+  for i = (w.savedN or 0) + 1, n do parts[#parts + 1] = string.format("%.1f;%.2f\n", w.pv[i], w.ps[i]) end
+  if writeFile(w, "a", table.concat(parts)) then
+    w.savedN, w.dirty = n, false
+  else
+    w.rewrite = true
+  end
+end
+
+-- Datei in Stuecken neu schreiben. Liefert true, solange noch Arbeit offen ist.
+local function saveStep(w, now)
+  local j = w.saveJob
+  if not j then
+    j = {parts = {FILE_HEAD}, i = 1}
+    w.saveJob = j
+    w.rewrite = false
+  end
+  local pv, ps, parts = w.pv, w.ps, j.parts
+  local e = math.min(j.i + CHUNK - 1, #pv)
+  for i = j.i, e do parts[#parts + 1] = string.format("%.1f;%.2f\n", pv[i], ps[i]) end
+  j.i = e + 1
+  if j.i <= #pv then return true end
+  w.saveJob, w.saveT = nil, now
+  if writeFile(w, "w", table.concat(parts)) then
+    w.savedN, w.dirty = #pv, false
+  elseif not w.saveErr then
+    w.saveErr = "Speichern nicht moeglich"
+  end
+  return false
 end
 
 local function clearPoints(w)
   w.pv, w.ps = {}, {}
-  w.cntSig, w.fitDirty = nil, true
-  savePoints(w, os.clock())
+  w.loadIt, w.saveJob, w.fitJob, w.cntJob, w.rewrite = nil, nil, nil, nil, false
+  w.cntSig, w.fitDirty, w.dots = nil, true, nil
+  w.saveT = os.clock()
+  if writeFile(w, "w", FILE_HEAD) then w.savedN, w.dirty = 0, false else w.saveErr = "Speichern nicht moeglich" end
 end
 
 -- ---------------------------------------------------------------- Ansage
+
+-- Einheit km/h fuer system.playNumber. Der Name der Konstante ist je nach Ethos-Version anders
+-- (Ethos 1.6.6 kennt UNIT_KPH nicht). Sonst einmal in _G suchen; ohne Treffer nur die Zahl.
+local kmhUnit
+local function findKmhUnit()
+  if kmhUnit ~= nil then return kmhUnit end
+  kmhUnit = UNIT_KPH or UNIT_KMH or UNIT_KM_PER_HOUR or UNIT_KILOMETER_PER_HOUR or UNIT_KMPH
+  if kmhUnit == nil then
+    for k, v in pairs(_G) do
+      if type(k) == "string" and type(v) == "number" and k:sub(1, 5) == "UNIT_"
+        and (k:find("KPH") or k:find("KMH") or k:find("KILOMETER") or k:find("KM_")) then
+        kmhUnit = v
+        break
+      end
+    end
+  end
+  if kmhUnit == nil then kmhUnit = false end
+  return kmhUnit
+end
 
 local function speak(w, value, now)
   if not widgetVisible() then return end   -- unsichtbar: keine Ansage (wie Sollfahrt)
@@ -577,9 +717,11 @@ local function speak(w, value, now)
   w.annCount = (w.annCount or 0) + 1
   local err
   if not (system and system.playNumber) then err = "system.playNumber fehlt"
-  elseif UNIT_KPH == nil then err = "UNIT_KPH fehlt"
   else
-    local ok, e = pcall(system.playNumber, value, UNIT_KPH, 0)
+    local u = findKmhUnit()
+    local ok, e
+    if u then ok, e = pcall(system.playNumber, value, u, 0) end
+    if not ok then ok, e = pcall(system.playNumber, value, UNIT_RAW or 0, 0) end   -- nur die Zahl
     if not ok then err = tostring(e) end
   end
   w.annErr = err
@@ -711,7 +853,7 @@ local function solve3(M, r)
 end
 
 -- Parabel a*v^2 + b*v + c (Sinken positiv, m/s), kleinste Quadrate ueber die Zielkurve target(v)
--- zwischen lo und hi (m/s), Stuetzstellen alle 0.05 m/s.
+-- zwischen lo und hi (m/s), Stuetzstellen alle 0.1 m/s.
 local function fitParabola(target, lo, hi)
   local S, R = {0, 0, 0, 0, 0}, {0, 0, 0}
   local v = lo
@@ -720,7 +862,7 @@ local function fitParabola(target, lo, hi)
     local p = 1
     for i = 1, 5 do S[i] = S[i] + p; p = p * v end
     R[1], R[2], R[3] = R[1] + wv, R[2] + wv * v, R[3] + wv * v * v
-    v = v + 0.05
+    v = v + 0.1
   end
   local x = solve3({{S[1], S[2], S[3]}, {S[2], S[3], S[4]}, {S[3], S[4], S[5]}}, R)
   if not x then return nil end
@@ -814,6 +956,63 @@ local function create()
   return w
 end
 
+-- Punkte fuers Diagramm (Pixel, ohne doppelte) in Stuecken; Massstab kommt aus paintPolar (w.geo).
+local MAX_DOTS = 1000
+local function dotsStep(w, now)
+  local g = w.geo
+  local j = w.dotJob
+  if not j then
+    local n = #w.pv
+    j = {key = g.key, n = n, i = math.max(1, n - MAX_DOTS + 1), d = {}, seen = {}}
+    w.dotJob = j
+  end
+  if j.key ~= g.key then w.dotJob = nil; return true end
+  local pv, ps, d, seen = w.pv, w.ps, j.d, j.seen
+  local vlo, ymax, px0, py0 = g.vlo, g.ymax, g.px0, g.py0
+  local sx, sy = (g.px1 - px0) / (g.vhi - vlo), (g.py1 - py0) / ymax
+  local e = math.min(j.i + CHUNK - 1, j.n, #pv)
+  for i = j.i, e do
+    local v, sk = pv[i], ps[i]
+    if v >= vlo and v <= g.vhi and sk >= 0 and sk <= ymax then
+      local x, y = math.floor(px0 + (v - vlo) * sx + 0.5), math.floor(py0 + sk * sy + 0.5)
+      local k = (x // 2) * 1024 + y // 2
+      if not seen[k] then seen[k] = true; d[#d + 1] = x; d[#d + 1] = y end
+    end
+  end
+  j.i = e + 1
+  if j.i <= math.min(j.n, #pv) then return true end
+  w.dots, w.dotsKey, w.dotsN, w.dotsT, w.dotJob = d, j.key, j.n, now, nil
+  return false
+end
+
+-- Hintergrundarbeit: pro wakeup hoechstens ein Stueck, damit kein Aufruf zu lang wird.
+local function work(w, now)
+  if w.loadIt then loadStep(w); return end
+  if w.cntJob or w.cntSig ~= table.concat({w.vMin, w.vMax, w.width}, ",") then recountStep(w); return end
+  if w.saveJob or (w.rewrite and now - (w.saveT or -99) >= 5) then saveStep(w, now); return end
+  if w.fitJob or (w.fitDirty and (w.polT == nil or now - w.polT >= 3)) then
+    if not w.fitJob then w.polT = now end
+    fitStep(w)
+    return
+  end
+  if not w.storedT or now - w.storedT >= 30 or w.storedModel ~= w.modelName then
+    local old = w.stored
+    refreshStored(w, now)
+    if (old == nil) ~= (w.stored == nil) or (old and w.stored and (old.a ~= w.stored.a or old.c ~= w.stored.c
+      or old.vMin ~= w.stored.vMin or old.vMax ~= w.stored.vMax)) then w.newFor = false end
+    return
+  end
+  if not w.newFor then
+    w.newFor = true
+    w.newPol = newPolar(w.polarFit, w.classes or {}, w.stored)
+    return
+  end
+  local g = w.geo
+  if w.view == 2 and g and (w.dotJob or g.key ~= w.dotsKey or (#w.pv ~= w.dotsN and now - (w.dotsT or 0) >= 2)) then
+    dotsStep(w, now)
+  end
+end
+
 local function wakeup(w)
   local now = os.clock()
   local dt = w.lastT and (now - w.lastT) or 0
@@ -824,11 +1023,14 @@ local function wakeup(w)
   -- Messpunkte des aktiven Modells laden (auch nach Modellwechsel)
   local name = currentModelName()
   if not w.loaded or name ~= w.modelName then
-    if w.loaded and w.dirty then savePoints(w, now) end
-    w.modelName, w.loaded = name, true
-    loadPoints(w)
+    if w.loaded and w.dirty and not w.loadIt then savePoints(w, now) end
+    if w.loaded and (w.rewrite or w.saveJob) and not w.loadIt then
+      saveStep(w, now)      -- erst fertig schreiben, dann wechseln (naechste wakeups)
+    else
+      w.modelName, w.loaded = name, true
+      loadPoints(w)
+    end
   end
-  if w.cntSig ~= table.concat({w.vMin, w.vMax, w.width}, ",") then recount(w) end
 
   -- Hoehe: GPS-Hoehe, sonst aus dem Vario aufintegriert (wie Sollfahrt)
   local vario = readNumber(w.vario)
@@ -865,11 +1067,8 @@ local function wakeup(w)
   w.tasA = tas and lpf(w.tasA, tas, dt, 2.0) or nil    -- fuer die Ansage etwas ruhiger
   announceStep(w, now, w.tasA and w.tasA * KMH or nil)
 
-  if w.fitDirty and (w.polT == nil or now - w.polT >= 3) then
-    w.polT = now
-    refreshFit(w)
-  end
   if w.dirty and (w.saveT == nil or now - w.saveT >= 30) then savePoints(w, now) end
+  work(w, now)
 
   if now - w.lastInvalidate >= 0.2 then
     w.lastInvalidate = now
@@ -1060,11 +1259,15 @@ local function paintPolar(w, W, top, bot)
     s = s + 0.5
   end
 
-  -- Messpunkte (die letzten 1500)
-  lcd.color(C.PT)
-  for i = math.max(1, #w.pv - 1500), #w.pv do
-    local v, sk = w.pv[i], w.ps[i]
-    if v >= vlo and v <= vhi and sk >= 0 and sk <= ymax then lcd.drawFilledRectangle(X(v) - 1, Y(sk) - 1, 2, 2) end
+  -- Messpunkte (die letzten 1000, als Pixel in wakeup vorbereitet, siehe dotsStep)
+  local key = string.format("%d,%d,%d,%d,%d,%d,%.2f", vlo, vhi, px0, px1, py0, py1, ymax)
+  if not w.geo or w.geo.key ~= key then
+    w.geo = {key = key, vlo = vlo, vhi = vhi, px0 = px0, px1 = px1, py0 = py0, py1 = py1, ymax = ymax}
+  end
+  local d = w.dots
+  if d and w.dotsKey == key then
+    lcd.color(C.PT)
+    for i = 1, #d, 2 do lcd.drawFilledRectangle(d[i] - 1, d[i + 1] - 1, 2, 2) end
   end
 
   -- Kurven: alt = polaren.lua (violett), neu = Parabel, die der Knopf schreiben wuerde (gruen)
@@ -1076,21 +1279,16 @@ local function paintPolar(w, W, top, bot)
       local x, y = X(v), Y(clamp(fn(v / KMH), 0, ymax))
       if lx then lcd.drawLine(lx, ly, x, y); lcd.drawLine(lx, ly + 1, x, y + 1) end
       lx, ly = x, y
-      v = v + 1
+      v = v + 2
     end
   end
-  refreshStored(w, os.clock())
   local sp = w.stored
   if sp then
     curve(function(ms) return sp.a * ms * ms + sp.b * ms + sp.c end,
       (sp.vMin or vlo / KMH) * KMH, (sp.vMax or vhi / KMH) * KMH, C.OLD)
   end
   local f = w.polarFit
-  if f ~= w.newFor or sp ~= w.newOld then
-    w.newFor, w.newOld = f, sp
-    w.newPol = newPolar(f, bs, sp)
-  end
-  local np = w.newPol
+  local np = f and w.newPol
   if np then
     curve(function(ms) return np.a * ms * ms + np.b * ms + np.c end, np.lo * KMH, np.hi * KMH, C.NEW)
     -- erflogener Bereich als Klammer unten an der gruenen Kurve
