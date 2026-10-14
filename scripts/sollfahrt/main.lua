@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.1
+-- @version 1.2
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -21,13 +21,16 @@
 --   Kreisfit (Kasa) ueber die GPS-Geschwindigkeitsvektoren der letzten ~28 s: Kreismittelpunkt =
 --   Windvektor, Radius = Fluggeschwindigkeit. Mit GPS-Geschw. wie im MM Flight Analyzer: alle 0.7 s
 --   ein Bodenvektor (Sensor-Geschwindigkeit in Richtung GPS-Kurs), Fit jede Sekunde, gleiche
---   Plausibilitaetsgrenzen. Vor dem ersten Fit: Wind 0, TAS = Grundgeschwindigkeit. Der erste Fit
+--   Plausibilitaetsgrenzen. Gefittet wird nur bei echtem Kreisen (etwa 270 Grad Kurswechsel im
+--   Fenster), eine einzelne Kurve aendert den Wind nicht. Vor dem ersten Fit: Wind 0,
+--   TAS = Grundgeschwindigkeit. Der erste Fit
 --   braucht ein volles Fenster (40 Stuetzwerte), damit der Start keinen falschen Wind liefert.
 --   Der erste gute Fit gilt als Startwert fuer ALLE Hoehen ("~" in der Anzeige). Jeder weitere Fit ergaenzt/ueberschreibt nur die 100-m-Schichten
 --   seines Hoehenbereichs (gleitend, 30 % pro Fit). Die Fluggeschwindigkeit fuer Polare und Netto
 --   ist |Grundgeschwindigkeit - Wind der aktuellen Hoehe| (linear zwischen den Schichten), auch
 --   im Geradeausflug und sofort nach einem Hoehenwechsel. Die Hoehe kommt vom Sensor "GPS Hoehe"
---   (ohne Sensor: aus dem Vario aufintegriert). Der GPS-Kurs gilt als Richtung zum Ziel.
+--   (ohne Sensor: aus dem Vario aufintegriert). Der GPS-Kurs gilt als Richtung zum Ziel; die
+--   Gegenwindkomponente folgt ihm nach einer Kurve innert ~2 s (eigene kurze Glaettung).
 --
 -- Rechnung
 --   Polare:  Sinken w(v) = A*v^2 + B*v + C
@@ -50,6 +53,7 @@
 
 local KMH = 3.6
 local G = 9.81
+local HEAD_TAU = 2.0   -- s, Glaettung der Gegenwindkomponente (unabhaengig von der Netto-Glaettung)
 local STORE_VER = 5   -- gpsSpd wird am Ende gelesen/geschrieben, deshalb unveraendert
 
 -- ---------------------------------------------------------------- Einstellungen
@@ -223,9 +227,10 @@ local function process(w, teRaw, vRaw, dt, now, hRaw)
   local nettoInst = w.teFast + polarSink(w.polar, w.vFast)
   w.netto = lpf(w.netto, nettoInst, dt, w.smoothNet)
 
-  -- Gegenwindkomponente geglaettet; ohne Winddaten nach 3 s zurueck auf 0
+  -- Gegenwindkomponente aus Wind und aktuellem Kurs, nur kurz geglaettet (HEAD_TAU), damit die
+  -- Sollfahrt nach einer Kurve sofort zum neuen Kurs passt; ohne Winddaten nach 3 s zurueck auf 0
   if hRaw ~= nil then
-    w.headwind = lpf(w.headwind, hRaw, dt, w.smoothNet)
+    w.headwind = lpf(w.headwind, hRaw, dt, HEAD_TAU)
     w.windStale = nil
   else
     w.windStale = w.windStale or now
@@ -316,7 +321,10 @@ local SAMPLE_DT = 0.7         -- Abstand der Geschwindigkeits-Stuetzwerte (s)
 local WINDOW = 40             -- Stuetzwerte im Fit-Fenster (~28 s)
 local MIN_SAMPLES = 10
 local FIT_INTERVAL = 1.0
-local MAX_SPREAD_R = 0.85     -- Richtungsstreuung: 1 = alle gleich, 0 = voller Kreis
+-- Richtungsstreuung: 1 = alle gleich, 0 = voller Kreis. 0.3 entspricht etwa 270 Grad Kurswechsel
+-- im Fenster, also echtem Kreisen. Bei 0.85 reichte schon eine einzelne 90-Grad-Kurve: dann liegen
+-- nur zwei Punktgruppen im Fenster, durch die fast jeder Kreis passt, und der Wind wurde falsch.
+local MAX_SPREAD_R = 0.3
 local MAX_TAS_FACTOR = 2.0    -- Radius darf max. so viel groesser als die mittlere Grundgeschw. sein
 local MAX_WIND_FACTOR = 1.0   -- Wind darf nicht groesser als die Fluggeschwindigkeit sein
 local MAX_RESIDUAL_FRAC = 0.25
