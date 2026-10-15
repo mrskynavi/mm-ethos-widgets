@@ -828,6 +828,29 @@ local TEXT_DEFS = {
   {key = "gliderId", def = ""},
 }
 
+-- Einstellungen aus der App (aufgaben.lua, Tabelle settings): Schluessel, Bereich. Am Sender stehen nur noch
+-- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
+local APP_SETTINGS = {
+  sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, radMode = {1, 2}, radFix = {5, 200},
+  margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
+  ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
+}
+
+local function applyAppSettings(w, st)
+  if type(st) ~= "table" then return end
+  local changed = false
+  for k, def in pairs(APP_SETTINGS) do
+    local v = st[k]
+    if type(def) == "table" and type(v) == "number" then v = math.floor(clamp(v, def[1], def[2]) + 0.5)
+    elseif def == true and type(v) ~= "boolean" then v = nil
+    elseif type(def) == "string" then v = type(v) == "string" and v:sub(1, 20) or nil
+    elseif type(def) == "table" then v = nil end
+    if v ~= nil and w[k] ~= v then w[k] = v; changed = true end
+  end
+  if changed then w.polarT = nil; if not w.mcSrc then w.mcValue = w.mc / 10 end end
+end
+
 local function resetFlight(w)
   if w.igc then igcClose(w) end
   w.state = S_IDLE
@@ -872,6 +895,7 @@ local function refreshTasks(w, now, force)
     w.pilot = type(t.pilot) == "string" and t.pilot or w.pilot
     w.pilotId = type(t.pilotId) == "string" and t.pilotId or w.pilotId
     w.activeId = t.active and tostring(t.active) or nil
+    applyAppSettings(w, t.settings)
   end
   w.tasks = list
   local idx = w.taskIdx or 0
@@ -1021,6 +1045,7 @@ end
 
 local function event(w, code, f, now)
   w.lastEvent, w.lastEventT = code, now
+  if code == "STP" then w.endClk = f and f.clk end
   if code == "PEV" or code == "STA" or code == "TPC" or code == "FIN" or code == "STP" then igcEvent(w, code, f) end
 end
 
@@ -1570,7 +1595,8 @@ end
 local function restTime(w)
   local T = w.task
   if not T then return nil end
-  if (w.state == S_STARTED or w.state == S_STOPPED) and w.startT and w.cur and w.cur.clk then
+  if w.state == S_STOPPED and w.startT and w.endClk then return T.work * 60 - (w.endClk - w.startT), false end
+  if w.state == S_STARTED and w.startT and w.cur and w.cur.clk then
     return T.work * 60 - (w.cur.clk - w.startT), true
   end
   return T.work * 60, false
@@ -1601,6 +1627,7 @@ local function header(w, W)
     clock = string.format("%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60)
     if w.state == S_STARTED then st = string.format("R%d %s", #w.laps + 1, w.tp == 3 and "ZIEL" or ("TP" .. (w.tp + 1))) end
     if w.state == S_ARMED then st = "SCHARF" end
+    if w.state == S_STOPPED then st = "ENDE" end
   else
     clock = string.format("%02d:%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60, ls % 60)
   end
@@ -2339,42 +2366,15 @@ local function configure(w)
   addSwitch(w, "Schalter Seite Gleiten", "swGlide")
   addSwitch(w, "Schalter Seite Thermik", "swTherm")
   addSwitch(w, "Schalter Seite Auswertung", "swEval")
-  addBool(w, "Seite automatisch (wenn kein Seiten-Schalter ein ist)", "autoPage")
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
-  -- Toene
-  addBool(w, "Ton", "sound")
   addSwitch(w, "Ton-Schalter (optional)", "soundSw")
-  addBool(w, "Ereignisse immer melden", "eventsAlways")
-  addBool(w, "Start: Gleitwinkel-Ton", "startTone")
-  addNumber(w, "Einflugfenster unter Limit (m)", "winLo", 2, 50)
-  addNumber(w, "Vibration ab Limit minus (km/h)", "speedMargin", 0, 20)
-  addBool(w, "Gleiten: Sollfahrt-Ton", "stfTone")
-  addBool(w, "Gleiten: Kurs-Kommandos", "navVoice")
-  addNumber(w, "Kommando ab (Grad)", "cmdMin", 3, 45)
-  addNumber(w, "Kommando höchstens alle (s)", "cmdGap", 3, 60)
-  addBool(w, "Thermik: Vario-Ton", "varioTone")
-  -- Weg
-  addChoice(w, "Wenderadius", "radMode", {{"Gemessen", 1}, {"Fest", 2}})
-  addNumber(w, "Wenderadius fest / Start (m)", "radFix", 5, 200)
-  addNumber(w, "Reserve im Sektor (m)", "margin", 0, 100)
-  addNumber(w, "Piepse vor dem Wenden (s)", "warnSec", 0, 10)
-  addNumber(w, "Vorhalt Kurveneinleitung (0.1 s)", "lead", 0, 30)
-  addNumber(w, "Eckansicht vor dem Wendepunkt (s)", "zoomSec", 3, 60)
-  -- Sollfahrt
   addSource(w, "MC Poti (optional)", "mcSrc")
-  addNumber(w, "MC (0.1 m/s)", "mc", 0, 50)
-  addNumber(w, "MC Maximum (0.1 m/s)", "mcMax", 10, 100)
-  addNumber(w, "Fluggewicht (% der Polare)", "ballast", 50, 300)
-  addNumber(w, "Verschmutzung (%)", "bugs", 0, 30)
-  addNumber(w, "Totzone Sollfahrt (+- km/h)", "dead", 0, 20)
   -- Zeit
-  addNumber(w, "Senderuhr minus UTC (min, -999 = App)", "utcOver", -999, 840)
   addNumber(w, "Startfenster von Hand: Stunde (-1 = Aufgabe)", "slotH", -1, 23)
   addNumber(w, "Startfenster von Hand: Minute", "slotM", 0, 59)
   addNumber(w, "Startfenster von Hand: Länge (min)", "slotLen", 1, 120)
-  -- IGC
-  addText(w, "Wettbewerbskennung (IGC)", "compId")
-  addText(w, "Kennzeichen (IGC)", "gliderId")
+  l = form.addLine("Weitere Einstellungen")
+  form.addStaticText(l, form.getFieldSlots(l)[0], "in der App (Tab SkyNavigator)")
   l = form.addLine("Version")
   form.addStaticText(l, form.getFieldSlots(l)[0], "SkyNavigator " .. VERSION)
 end
