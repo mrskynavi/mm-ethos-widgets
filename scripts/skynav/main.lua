@@ -18,7 +18,7 @@
 --   Ziel: erster Fix im Zielsektor, 3D-Speed >= Mindestspeed, innerhalb der Arbeitszeit.
 --   Schnitt = Anzahl Dreiecke * Umfang / (letztes Ziel - Start), Umfang = dTP * (2 + 2*sqrt(2)).
 --
--- Seiten (Schalter in der Konfiguration, Stufen- oder Tastschalter; Tippen auf die Kopfzeile geht
+-- Seiten (je Seite ein Schalter mit Stellung in der Konfiguration; Tippen auf die Kopfzeile geht
 -- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Toene kommen nur fuer die angezeigte Seite.
 --
 -- Optimaler Weg (Seite GLEITEN): Das Widget rechnet im Luftmassen-System. Dort sind Kurven echte
@@ -439,6 +439,7 @@ local function planPath(px, py, wx, wy, V, R, C)
       thIn = thOut
       addPt(Z[k + 1].x + R * rx, Z[k + 1].y + R * ry, L / V)
     end
+    res.L, res.tAll = L, L / V
   end
   return res
 end
@@ -589,11 +590,62 @@ local function igcLon(v)
   return string.format("%03d%05d%s", d, m, v >= 0 and "E" or "W")
 end
 
--- UTC-Zeit: os.time() der Senderuhr minus Versatz (Minuten). Die App schreibt den Versatz ihres
--- Rechners in aufgaben.lua; in der Konfiguration laesst er sich ueberschreiben.
+-- Uhrzeit vom GPS: Quelle "GPS-Zeit" (Sekunden des Tages in UTC, Unix-Zeit oder Text hh:mm:ss). Ohne eigene
+-- Quelle versucht das Widget eine Zeit-Option der GPS-Quelle. Gemerkt wird der Versatz zur Senderuhr, damit die
+-- Zeit zwischen den Telemetrie-Werten weiterlaeuft.
+local function gpsSecs(w)
+  local src = validSource(w.gpsTime)
+  if src then
+    local v = readNumber(src)
+    if v then return v end
+    local ok, s = pcall(src.stringValue, src)
+    if ok and type(s) == "string" then
+      local h, mi, se = s:match("(%d+):(%d+):?(%d*)")
+      if h then return tonumber(h) * 3600 + tonumber(mi) * 60 + (tonumber(se) or 0) end
+    end
+    return nil
+  end
+  if validSource(w.gps) then
+    for _, name in ipairs({"OPTION_TIME", "OPTION_GPS_TIME", "OPTION_DATE_TIME"}) do
+      local opt = rawget(_G, name)
+      if opt then
+        local ok, r = pcall(w.gps.value, w.gps, {options = opt})
+        if ok and type(r) == "number" and r > 0 then return r end
+      end
+    end
+  end
+  return nil
+end
+
+local function updateGpsClock(w, now)
+  local v = gpsSecs(w)
+  if not v or v <= 0 then return end
+  local radio = (os and os.time) and os.time() or 0
+  local guess = radio - (w.utcOffset or 0) * 60
+  local utc
+  if v > 1e8 then utc = v
+  elseif v < 86400 then
+    utc = guess - guess % 86400 + v
+    if utc - guess > 43200 then utc = utc - 86400 elseif guess - utc > 43200 then utc = utc + 86400 end
+  else return end
+  w.gpsDelta, w.gpsClockT = utc - radio, now
+end
+
+local function gpsClock(w)
+  return w.gpsDelta ~= nil and w.gpsClockT ~= nil and os.clock() - w.gpsClockT < 120
+end
+
+-- UTC-Zeit: vom GPS, wenn es eine Zeit liefert; sonst os.time() der Senderuhr minus Versatz (Minuten). Die App
+-- schreibt den Versatz ihres Rechners in aufgaben.lua; in der Konfiguration laesst er sich ueberschreiben.
 local function utcNow(w)
   local t = (os and os.time) and os.time() or 0
+  if gpsClock(w) then return t + w.gpsDelta end
   return t - (w.utcOffset or 0) * 60
+end
+
+-- Ortszeit (fuer Anzeige und das von Hand eingestellte Startfenster)
+local function localNow(w)
+  return utcNow(w) + (w.utcOffset or 0) * 60
 end
 
 local function hms(utc)
@@ -737,19 +789,11 @@ end
 
 -- ---------------------------------------------------------------- Zustand
 
-local SOURCE_KEYS = {"gps", "gpsSpd", "gpsAlt", "relAlt", "vario", "pageSw", "armSw", "soundSw", "mcSrc"}
+local SOURCE_KEYS = {"gps", "gpsSpd", "gpsAlt", "relAlt", "vario", "swStart", "swGlide", "swTherm", "swEval", "armSw", "soundSw", "mcSrc", "gpsTime"}
 local NUM_DEFS = {
   {key = "taskIdx",   def = 0},     -- 0 = in der App als aktiv markierte Aufgabe
   {key = "altMode",   def = 1},     -- 1 = GPS minus Platzhoehe, 2 = relative Hoehe (Sensor)
   {key = "varioType", def = 1},     -- 1 = TE, 2 = barometrisch
-  {key = "swMode",    def = 1},     -- 1 = Stufenschalter, 2 = Taster (weiterschalten)
-  {key = "swPos",     def = 3},     -- Stufen 2..6
-  {key = "pos1",      def = P_START},
-  {key = "pos2",      def = P_GLIDE},
-  {key = "pos3",      def = P_THERM},
-  {key = "pos4",      def = P_EVAL},
-  {key = "pos5",      def = P_EVAL},
-  {key = "pos6",      def = P_EVAL},
   {key = "radMode",   def = 1},     -- 1 = gemessen, 2 = fest
   {key = "radFix",    def = 30},    -- m
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
@@ -757,7 +801,7 @@ local NUM_DEFS = {
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
   {key = "cmdMin",    def = 10},    -- Kommando ab x Grad
   {key = "cmdGap",    def = 8},     -- Kommando höchstens alle x s
-  {key = "zoomDist",  def = 200},   -- Eckansicht ab x m
+  {key = "zoomSec",   def = 10},    -- Eckansicht x s vor dem Wendepunkt
   {key = "winLo",     def = 10},    -- Einflugfenster: Limit minus x m
   {key = "speedMargin", def = 3},   -- Vibration ab Limit minus x km/h
   {key = "mc",        def = 10},    -- 0.1 m/s
@@ -775,7 +819,7 @@ local BOOL_DEFS = {
   {key = "eventsAlways", def = false},
   {key = "stfTone", def = true},
   {key = "navVoice", def = true},
-  {key = "varioTone", def = true},
+  {key = "varioTone", def = false},   -- Vario-Ton macht normalerweise der Sender selbst
   {key = "startTone", def = true},
   {key = "autoPage", def = true},
 }
@@ -859,15 +903,15 @@ end
 -- Startfenster in Senderuhr-Zeit: von Hand (Konfiguration) oder aus der Aufgabe (UTC)
 local function slotWindow(w)
   if w.slotH >= 0 then
-    local now = (os and os.time) and os.time() or 0
-    local t0 = now - now % 86400 + w.slotH * 3600 + w.slotM * 60
+    local now = localNow(w)
+    local t0 = now - now % 86400 + w.slotH * 3600 + w.slotM * 60 - (w.utcOffset or 0) * 60
     return t0, t0 + w.slotLen * 60, "hand"
   end
   local T = w.task
   if not T or not T.slot then return nil end
   local a, b = slotEpoch(T.slot)
   if not a then return nil end
-  return a + (w.utcOffset or 0) * 60, b + (w.utcOffset or 0) * 60, "aufgabe"
+  return a, b, "aufgabe"
 end
 
 -- ---------------------------------------------------------------- Messwerte
@@ -1017,11 +1061,13 @@ local function assess(w, f, now)
   local lat = f.x * T.px + f.y * T.py
   f.s, f.lat_ = s, lat
   local prev = w.lastFix
+  -- geflogene Strecke ueber Grund in der laufenden Runde (fuer den Index)
+  if w.state == S_STARTED and prev then w.lapDist = (w.lapDist or 0) + math.sqrt((f.x - prev.x) ^ 2 + (f.y - prev.y) ^ 2) end
   -- Linie ueberquert (Startsektor -> Zielsektor)
   if prev and prev.s and prev.s < 0 and s >= 0 and math.abs(lat) <= LINE_HALF and math.abs(prev.lat_ or 0) <= LINE_HALF then
     if w.state == S_ARMED then
       local a, b = slotWindow(w)
-      local nowClock = (os and os.time) and os.time() or 0
+      local nowClock = utcNow(w)
       if a and (nowClock < a or nowClock > b) then
         note(w, nowClock < a and "Start ungültig: Fenster noch zu" or "Start ungültig: Fenster vorbei", now)
         w.badStartT = now
@@ -1029,6 +1075,7 @@ local function assess(w, f, now)
         local e = w.lastInStart or prev
         w.state = S_STARTED
         w.startT, w.startUtc, w.lapT = e.clk, e.utc, e.clk
+        w.lapDist = 0
         w.entry = {agl = e.agl, v3d = e.v3d}
         w.penalty = penaltyOf(T, e.agl, e.v3d)
         w.tp = 0
@@ -1041,7 +1088,9 @@ local function assess(w, f, now)
       if f.v3d >= T.minF and f.clk - w.startT <= T.work * 60 then
         local lt = f.clk - w.lapT
         w.laps[#w.laps + 1] = {n = #w.laps + 1, time = lt, speed = T.perim / math.max(lt, 1) * KMH,
-          agl = f.agl, dAlt = f.agl - (w.lapAgl or (w.entry and w.entry.agl) or f.agl), at = f.clk - w.startT, v3d = f.v3d}
+          agl = f.agl, dAlt = f.agl - (w.lapAgl or (w.entry and w.entry.agl) or f.agl), at = f.clk - w.startT, v3d = f.v3d,
+          dist = w.lapDist, idx = w.lapDist and (w.lapDist / T.perim * 100) or nil}
+        w.lapDist = 0
         w.lapAgl = f.agl
         w.lapT, w.tp = f.clk, 0
         w.lapDoneAt = now
@@ -1159,6 +1208,8 @@ local function glideCalc(w, f, now, dt)
   elseif not w.polar then
     w.vstf, w.stfDv = nil, nil
   end
+  -- mittleres Sinken im Geradeausflug (Ersatz, wenn keine Polare da ist)
+  if f and f.vz and not w.therm and (w.omega or 0) < math.rad(8) then w.sinkAvg = lpf(w.sinkAvg, -f.vz, dt, 20) end
   if not T or not f or w.state ~= S_STARTED then return g end
   local R = radius(w)
   local C = cornersFrom(T, w.tp + 1, 3, R, w.margin)
@@ -1170,11 +1221,31 @@ local function glideCalc(w, f, now, dt)
   g.next = w.tp % 3 + 1
   local nxt = T.tp[g.next]
   g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
-  -- Eckansicht: nah an der naechsten Ecke oder kurz nach dem Erreichen der letzten
-  if g.dV < w.zoomDist then g.corner = g.next
+  g.brgTP = bearingOf(nxt.x - f.x, nxt.y - f.y)
+  -- Wind zerlegt auf den Sollkurs (Linie zur naechsten Ecke): Gegenwind positiv, Seitenwind positiv = blaest nach rechts
+  local crsRef = w.ref and bearingOf(w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay) or plan.hdg
+  local hx, hy = dirVec(crsRef)
+  if w.windOk then g.head, g.cross = -(wx * hx + wy * hy) * KMH, (wx * hy - wy * hx) * KMH end
+  -- Hoehe an der Ziellinie: restliche Ecken dieser Runde, dann von TP3 zur Linie (durch den Ursprung)
+  local V = w.vstf or w.tasF or f.tas or 20
+  local nRem = 3 - w.tp
+  local tRem
+  local gsU = math.max(V + wx * T.ux + wy * T.uy, 3)                -- Grundgeschwindigkeit Richtung TP1
+  if nRem > 0 then
+    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, R, w.margin))
+    tRem = (pr.tAll or 0) + T.dist / gsU
+  else
+    tRem = math.max(-(f.x * T.ux + f.y * T.uy), 0) / gsU
+  end
+  local sink = w.polar and polarSink(w.polar, V) or w.sinkAvg
+  if sink then g.hFin, g.tFin = f.agl - sink * tRem, tRem end
+  -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan) oder kurz nach dem Erreichen der letzten
+  local gs = math.max(f.gs or V, 5)
+  g.tCorner = plan.t1 or (g.dV / gs)
+  if g.tCorner < w.zoomSec then g.corner = g.next
   elseif w.tpT and now - w.tpT < 8 and w.tp > 0 then
     local c = T.tp[w.tp]
-    if math.sqrt((f.x - c.x) ^ 2 + (f.y - c.y) ^ 2) < w.zoomDist * 1.2 then g.corner = w.tp end
+    if math.sqrt((f.x - c.x) ^ 2 + (f.y - c.y) ^ 2) < gs * w.zoomSec * 1.2 then g.corner = w.tp end
   end
   return g
 end
@@ -1267,6 +1338,8 @@ local function thermCalc(w, f, now, dt)
   if w.therm and w.straightSince and now - w.straightSince > 8 then
     w.lastTherm = w.therm
     w.therm, w.circSince = nil, nil
+    -- abgetrieben: Querablage ab hier neu messen (Linie vom Ausstieg zur naechsten Ecke)
+    if w.state == S_STARTED and f then setRef(w, f) end
     if w.autoPage and w.state == S_STARTED then w.autoTarget = P_GLIDE end
   end
   if w.therm and f then
@@ -1294,22 +1367,29 @@ end
 
 -- ---------------------------------------------------------------- Seitenwahl
 
+-- Ein Schalter (mit Stellung) je Seite. Die Seite, deren Schalter zuletzt eingeschaltet wurde, gilt, solange er
+-- eingeschaltet bleibt. Ist keiner ein, waehlt die Automatik bzw. das Tippen auf die Kopfzeile.
+local PAGE_SW = {"swStart", "swGlide", "swTherm", "swEval"}
+
 local function pageFromSwitch(w, now)
-  local sw = w.pageSw
-  if validSource(sw) then
-    local v = readNumber(sw) or -1024
-    if w.swMode == 1 then
-      local n = clamp(w.swPos, 2, 6)
-      local idx = clamp(math.floor((v + 1024) / 2048 * (n - 1) + 0.5) + 1, 1, n)
-      if idx ~= w.swIdx then w.swIdx = idx; w.manual = nil end
-      if w.manual then return w.manual end
-      return clamp(w["pos" .. idx] or P_START, 1, 4)
+  w.swState = w.swState or {}
+  local any = false
+  for p, key in ipairs(PAGE_SW) do
+    if validSource(w[key]) then
+      any = true
+      local on = (readNumber(w[key]) or -1024) > 0
+      if on and not w.swState[p] then w.swPage, w.manual = p, nil end
+      w.swState[p] = on
     else
-      local on = v > 0
-      if on and not w.swOn then w.page = w.page % 4 + 1; w.manual = w.page end
-      w.swOn = on
-      return w.page
+      w.swState[p] = nil
     end
+  end
+  if any then
+    if not (w.swPage and w.swState[w.swPage]) then
+      w.swPage = nil
+      for p = 1, 4 do if w.swState[p] then w.swPage = p; break end end
+    end
+    if w.swPage then return w.manual or w.swPage end
   end
   if w.manual then
     if w.autoTarget and w.autoTarget ~= w.manualFrom then w.manual = nil else return w.manual end
@@ -1319,6 +1399,22 @@ local function pageFromSwitch(w, now)
 end
 
 -- ---------------------------------------------------------------- wakeup
+
+-- Scharf stellen oder, nach einem misslungenen Start (gestartet, noch keine Runde fertig), neu starten
+local function armOrRestart(w, now)
+  if not w.task then return end
+  if w.state == S_IDLE then
+    w.state, w.armedAt, w.armPending = S_ARMED, now, true
+  elseif w.state == S_STARTED and #w.laps == 0 then
+    w.state, w.armedAt, w.armPending = S_ARMED, now, true
+    w.startT, w.startUtc, w.lapT, w.entry, w.penalty, w.tp, w.lapAgl = nil, nil, nil, nil, 0, 0, nil
+    w.zoneHit, w.altHit = nil, nil
+    w.restarts = (w.restarts or 0) + 1
+    note(w, "Neustart: wieder scharf", now)
+  elseif w.state == S_STARTED then
+    note(w, "Neustart nur vor der ersten Runde", now)
+  end
+end
 
 local function wakeup(w)
   local now = os.clock()
@@ -1332,10 +1428,12 @@ local function wakeup(w)
     if v then w.mc = math.floor(clamp((v + 1024) / 2048, 0, 1) * w.mcMax + 0.5); w.mcValue = w.mc / 10 end
   end
   -- ARM
+  -- Jede Betaetigung (Flanke) stellt scharf, nach einem misslungenen Start startet sie neu. Taster und
+  -- Kippschalter gehen beide; zurueckschalten tut nichts.
   local arm = (readNumber(w.armSw) or -1) > 0
-  if arm and not w.armOn and w.state == S_IDLE and w.task then w.state = S_ARMED; w.armedAt = now; w.armPending = true end
-  if not arm and w.armOn and w.state == S_ARMED and validSource(w.armSw) then w.state = S_IDLE end
-  w.armOn = arm
+  if arm and not w.armOn and w.armInit then armOrRestart(w, now) end
+  w.armOn, w.armInit = arm, true
+  if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
   local f = readInputs(w, now, dt)
   if f then
@@ -1451,14 +1549,35 @@ local function valBox(x, y, bw, label, value, color, font)
   return h1 + h2
 end
 
+-- gefuellter Pfeil von (x,y) in Richtung (ux,uy) (Einheitsvektor, Bildschirm), Laenge L, Schaftbreite sw
+local function arrow(x, y, ux, uy, L, sw, hw)
+  local hl = math.min(L * 0.45, hw * 1.6)
+  local bx, by = x + ux * (L - hl), y + uy * (L - hl)
+  local nx, ny = -uy, ux
+  local h = sw / 2
+  tri(x + nx * h, y + ny * h, x - nx * h, y - ny * h, bx + nx * h, by + ny * h)
+  tri(x - nx * h, y - ny * h, bx - nx * h, by - ny * h, bx + nx * h, by + ny * h)
+  tri(x + ux * L, y + uy * L, bx + nx * hw, by + ny * hw, bx - nx * hw, by - ny * hw)
+end
+
 local function planeSymbol(cx, cy, size, color)
   lcd.color(color)
   tri(math.floor(cx), math.floor(cy - size), math.floor(cx - size * 0.7), math.floor(cy + size * 0.7),
     math.floor(cx + size * 0.7), math.floor(cy + size * 0.7))
 end
 
+-- Restzeit der Aufgabe (s): vor dem Start die volle Arbeitszeit, danach ab dem Start
+local function restTime(w)
+  local T = w.task
+  if not T then return nil end
+  if (w.state == S_STARTED or w.state == S_STOPPED) and w.startT and w.cur and w.cur.clk then
+    return T.work * 60 - (w.cur.clk - w.startT), true
+  end
+  return T.work * 60, false
+end
+
 local function header(w, W)
-  local th = textH(FONT_S)
+  local th = math.max(textH(FONT_S), textH(FONT_STD))
   lcd.color(rgb(25, 25, 25))
   rect(0, 0, W, th + 4)
   -- Seiten-Reiter
@@ -1476,8 +1595,24 @@ local function header(w, W)
   elseif w.state == S_STARTED then st, col = string.format("RUNDE %d  %s", #w.laps + 1, w.tp == 3 and "ZIEL" or ("TP" .. (w.tp + 1))), C_GREEN
   elseif w.state == S_STOPPED then st, col = "BEENDET", C_BLUE end
   if not w.gpsOk then st, col = st .. "  GPS?", C_RED end
-  local clock = (os and os.date and os.time) and os.date("%H:%M:%S", os.time()) or ""
-  drawT(W * 0.5, 2, W * 0.5 - 6, st .. "   " .. clock, FONT_S, col, "r")
+  local ls = math.floor(localNow(w)) % 86400
+  local clock
+  if W < 600 then
+    clock = string.format("%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60)
+    if w.state == S_STARTED then st = string.format("R%d %s", #w.laps + 1, w.tp == 3 and "ZIEL" or ("TP" .. (w.tp + 1))) end
+    if w.state == S_ARMED then st = "SCHARF" end
+  else
+    clock = string.format("%02d:%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60, ls % 60)
+  end
+  clock = clock .. (gpsClock(w) and "" or "*")
+  drawT(W * 0.5, 2, W * 0.5 - 6, st .. "  " .. clock, FONT_S, col, "r")
+  -- Restzeit prominent gleich nach den Reitern
+  local rest, running = restTime(w)
+  if rest then
+    local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
+    if running and rest < 0 then rest = 0 end
+    drawT(tabW * 4 + 4, 1, W, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+  end
   return th + 6
 end
 
@@ -1502,7 +1637,7 @@ local function paintStart(w, W, H, top)
   local m = 6
   -- Zeile: Startfenster und Arbeitszeit
   local a, b = slotWindow(w)
-  local nowClock = (os and os.time) and os.time() or 0
+  local nowClock = utcNow(w)
   local slotTxt, slotCol = "kein Startfenster", C_DIM
   if a then
     if nowClock < a then slotTxt, slotCol = "Fenster öffnet in " .. fmtMS(a - nowClock), C_ORANGE
@@ -1519,6 +1654,12 @@ local function paintStart(w, W, H, top)
   local cx, cy = m + mapW / 2, y + mapH * 0.42
   lcd.color(rgb(20, 20, 20))
   rect(m, y, mapW, mapH)
+  -- Vor dem Start: Seite Linie - TP1 ist die falsche Seite (rot), Startsektor unten
+  local before = w.state ~= S_STARTED and w.state ~= S_STOPPED
+  if before then
+    lcd.color(rgb(60, 14, 14))
+    rect(m, y, mapW, math.max(1, math.floor(y + mapH * 0.42 - y)))
+  end
   local scale = (mapW / 2 - 4) / 1200           -- +-1200 m sichtbar
   if c and c.dist then scale = math.min(scale, (mapH * 0.5) / math.max(math.abs(c.dist) * 1.15, 200)) end
   -- Linie +-2 km
@@ -1529,6 +1670,24 @@ local function paintStart(w, W, H, top)
   disc(math.floor(cx), math.floor(cy), 3)
   drawT(m, y + 2, mapW, "TP1 ^", FONT_XS, C_DIM, "c")
   drawT(m + 2, cy + 3, mapW, "Linie", FONT_XS, C_YELLOW, "l")
+  if before then drawT(m + 2, cy - textH(FONT_XS) - 2, mapW, "TP1-Seite", FONT_XS, rgb(200, 80, 80), "l") end
+  -- Wind: Pfeil in Windrichtung (wohin er blaest), im Bild mit TP1 oben
+  if T then
+    local wx0, wy0 = m + mapW - 26, y + 26
+    if w.windOk then
+      local sdx = w.wx * T.px + w.wy * T.py
+      local sdy = -(w.wx * T.ux + w.wy * T.uy)
+      local n = math.sqrt(sdx * sdx + sdy * sdy)
+      lcd.color(C_BLUE)
+      if n > 0.3 then
+        local ux, uy = sdx / n, sdy / n
+        arrow(wx0 - ux * 16, wy0 - uy * 16, ux, uy, 32, 4, 8)
+      end
+      drawT(m, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - m, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
+    else
+      drawT(m, wy0 - 6, mapW - 4, "Wind ?", FONT_S, C_DIM, "r")
+    end
+  end
   if T then
     -- TP3-Richtung unten (Startsektor), TP2 rechts/links je nach Lage
     local t3 = T.dist * scale
@@ -1555,39 +1714,76 @@ local function paintStart(w, W, H, top)
     lcd.color(C_WHITE)
     tri(math.floor(x1), math.floor(y1), math.floor(x2), math.floor(y2), math.floor(x3), math.floor(y3))
     local dTxt = c.dist >= 0 and string.format("%d m vor Linie", math.floor(c.dist + 0.5)) or string.format("%d m hinter Linie", math.floor(-c.dist + 0.5))
-    drawT(m + 2, y + mapH - textH(FONT_XS) - 2, mapW - 4, dTxt, FONT_XS, C_WHITE, "l")
-    drawT(m + 2, y + mapH - textH(FONT_XS) - 2, mapW - 4, string.format("seitl. %+d m", math.floor(c.lat + 0.5)), FONT_XS, C_DIM, "r")
+    local dF = SMALL and FONT_S or FONT_L
+    drawT(m + 2, y + mapH - textH(dF) - 2, mapW - 4, dTxt, dF, C_WHITE, "l")
+    if before and c.dist < 0 then
+      drawT(m, y + textH(FONT_XS) + 6, mapW, "FALSCHE SEITE", SMALL and FONT_STD or FONT_L, C_RED, "c")
+    end
   end
-  -- Mitte: Profil Hoehe ueber Distanz mit Einflugfenster
+  -- Mitte: Gleitpfad wie beim ILS. Mitte = Fenstermitte an der Linie, Skala +-50 m.
+  -- Zu tief: Pfeil von unten nach oben (steigen/weniger sinken), zu hoch: Pfeil von oben nach unten.
   local px0 = m * 2 + mapW
   local profW = math.floor(W * 0.24)
   lcd.color(rgb(20, 20, 20))
   rect(px0, y, profW, mapH)
   if T then
-    local hMax = math.max(T.maxH * 1.4, f and f.agl * 1.1 or 0)
-    local yOf = function(h) return y + mapH - 4 - clamp(h / hMax, 0, 1) * (mapH - 8) end
-    local lineX = px0 + profW - 10
-    -- Fenster
-    lcd.color(rgb(0, 90, 40))
-    rect(lineX - 6, math.floor(yOf(T.maxH)), 12, math.max(2, math.floor(yOf(T.maxH - w.winLo) - yOf(T.maxH))))
-    lcd.color(C_YELLOW)
-    line(lineX, y + 2, lineX, y + mapH - 2)
-    lcd.color(C_RED)
-    line(lineX - 10, yOf(T.maxH), lineX + 6, yOf(T.maxH))
-    drawT(px0 + 2, yOf(T.maxH) - textH(FONT_XS), profW, tostring(T.maxH), FONT_XS, C_RED, "l")
-    if c and c.dist and f and c.dist > 0 then
-      local dMax = math.max(c.dist * 1.1, 300)
-      local xOf = function(d) return lineX - clamp(d / dMax, 0, 1) * (profW - 16) end
-      local ex, ey = xOf(c.dist), yOf(f.agl)
-      -- Soll-Gleitpfad zur Fenstermitte
-      lcd.color(C_GREEN)
-      line(ex, ey, lineX, yOf(c.target))
-      -- aktueller Pfad
-      if c.predAgl then
-        lcd.color((math.abs(c.err) <= w.winLo / 2) and C_GREEN or (c.err > 0 and C_ORANGE or C_BLUE))
-        line(ex, ey, lineX, yOf(c.predAgl))
+    local FS = 50
+    local hdrH = textH(FONT_XS) + 2
+    drawT(px0, y + 2, profW, "GLEITPFAD", FONT_XS, C_DIM, "c")
+    local gy0, gh = y + hdrH + 2, mapH - hdrH - 4
+    local gcx, gcy = math.floor(px0 + profW / 2), math.floor(gy0 + gh / 2)
+    local k = (gh / 2 - 2) / FS
+    local half = w.winLo / 2
+    -- Fensterband und Mittellinie
+    lcd.color(rgb(0, 70, 30))
+    local bh = math.max(2, math.floor(half * k))
+    rect(px0 + 4, gcy - bh, profW - 8, 2 * bh)
+    lcd.color(C_GREEN)
+    line(px0 + 4, gcy, px0 + profW - 4, gcy)
+    -- Teilstriche alle 10 m
+    lcd.color(C_GRID)
+    for d = -FS, FS, 10 do
+      if d ~= 0 then
+        local ty = math.floor(gcy - d * k)
+        local tl = (d % 50 == 0) and 10 or 5
+        line(px0 + 4, ty, px0 + 4 + tl, ty)
+        line(px0 + profW - 4 - tl, ty, px0 + profW - 4, ty)
       end
-      planeSymbol(ex, ey, 5, C_WHITE)
+    end
+    drawT(px0 + 3, math.floor(gcy - FS * k), profW, "+" .. FS, FONT_XS, C_DIM, "l")
+    drawT(px0 + 3, math.floor(gcy + FS * k) - textH(FONT_XS), profW, "-" .. FS, FONT_XS, C_DIM, "l")
+    if c and c.err then
+      local e = c.err
+      local aw = math.floor(profW * 0.28)
+      local fV = SMALL and FONT_STD or FONT_L
+      if math.abs(e) <= half then
+        lcd.color(C_GREEN)
+        disc(gcx, math.floor(gcy - clamp(e, -FS, FS) * k), math.max(5, math.floor(profW / 10)))
+        drawT(px0, gy0 + gh - textH(FONT_S) - 2, profW, "IM FENSTER", FONT_S, C_GREEN, "c")
+      else
+        -- Pfeilspitze zeigt auf die Mitte, Laenge = Abweichung (begrenzt auf die Skala)
+        local over = math.abs(e) - half
+        local dir = e < 0 and 1 or -1                -- Bildschirm: zu tief Pfeil unten (zeigt hoch), zu hoch oben
+        local col = e < 0 and C_BLUE or C_ORANGE
+        local tipY = math.floor(gcy + dir * bh)
+        local tailY = math.floor(gcy + dir * (bh + clamp(over, 5, FS) * k))
+        local sw = math.max(2, math.floor(aw / 4))
+        local hh = math.max(6, math.floor(aw * 0.7))
+        lcd.color(col)
+        if math.abs(tailY - tipY) > hh then
+          local sy = tipY + dir * hh
+          local ty0, ty1 = math.min(sy, tailY), math.max(sy, tailY)
+          rect(gcx - sw, ty0, 2 * sw, math.max(1, ty1 - ty0))
+        end
+        tri(gcx, tipY, gcx - aw, tipY + dir * hh, gcx + aw, tipY + dir * hh)
+        -- Text auf der freien Seite, zwischen Band und Skalenende
+        local tH = textH(fV) + textH(FONT_XS)
+        local ty = e < 0 and (gcy - bh - tH - 4) or (gcy + bh + 4)
+        drawT(px0, ty, profW, string.format("%d m", math.floor(over + 0.5)), fV, col, "c")
+        drawT(px0, ty + textH(fV), profW, e < 0 and "ZU TIEF" or "ZU HOCH", FONT_XS, col, "c")
+      end
+    else
+      drawT(px0, gcy - textH(FONT_S) - 4, profW, "kein Anflug", FONT_S, C_DIM, "c")
     end
   end
   -- Rechts: Zahlen
@@ -1610,21 +1806,26 @@ local function paintStart(w, W, H, top)
     row(SMALL and "HÖHE AN LINIE" or ("HÖHE AN LINIE (" .. (T.maxH - w.winLo) .. "-" .. T.maxH .. ")"), string.format("%d m  %+d", math.floor(c.predAgl + 0.5), math.floor(c.predAgl - T.maxH + 0.5)), col)
     local vc = (c.predV or 0) > T.maxV and C_RED or ((c.predV or 0) > T.maxV - w.speedMargin and C_ORANGE or C_GREEN)
     row(SMALL and string.format("SPEED (MAX %d)", math.floor(T.maxV)) or string.format("SPEED AN LINIE (max %d, jetzt %d)", math.floor(T.maxV), math.floor(f.v3d + 0.5)), string.format("%d km/h", math.floor((c.predV or 0) + 0.5)), vc)
-    if not SMALL then row("ZEIT BIS LINIE", fmtMS(c.tLine), C_WHITE) end
+    row("ZEIT BIS LINIE", fmtMS(c.tLine), C_WHITE)
   else
     row("HÖHE", hNow, C_WHITE)
     row("SPEED 3D", vNow, C_WHITE)
   end
-  if c then
-    row((SMALL and c.tLine) and ("STRAFE  LINIE " .. fmtMS(c.tLine)) or "STRAFE JETZT", tostring(c.penaltyNow), c.penaltyNow > 0 and C_RED or C_GREEN)
+  -- Strafe nur nach dem Ueberqueren der Linie, und nur wenn es eine gibt
+  local started = w.state == S_STARTED and w.entry
+  if started and (w.penalty or 0) > 0 then row("STRAFE", tostring(w.penalty), C_RED) end
+  if started then
+    local sTxt = string.format("Start: %d m %d km/h", math.floor(w.entry.agl + 0.5), math.floor(w.entry.v3d + 0.5))
+    if (w.penalty or 0) > 0 then sTxt = sTxt .. string.format("  Strafe %d", w.penalty) end
+    drawT(rx, yy, rw, sTxt, FONT_XS, (w.penalty or 0) > 0 and C_RED or C_GREEN, "l")
+    yy = yy + textH(FONT_XS) + 2
   end
-  if w.state == S_STARTED and w.entry then
-    drawT(rx, yy, rw, string.format("Start: %d m %d km/h  Strafe %d", math.floor(w.entry.agl + 0.5), math.floor(w.entry.v3d + 0.5), w.penalty), FONT_XS, C_GREEN, "l")
-  elseif w.state ~= S_ARMED then
+  local canRestart = w.state == S_STARTED and #w.laps == 0
+  if w.state == S_IDLE or w.state == S_STOPPED or canRestart then
     w.armBox = {x = rx, y = yy, w = rw, h = textH(FONT_STD) + 8}
     lcd.color(rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
-    drawT(rx, yy + 4, rw, "SCHARF (tippen)", FONT_STD, C_ORANGE, "c")
+    drawT(rx, yy + 4, rw, canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)", FONT_STD, C_ORANGE, "c")
   end
 end
 
@@ -1649,8 +1850,36 @@ local function paintCorner(w, g, x0, y0, bw, bh)
     local ry = dx * sn + dy * cs
     return cx + rx * sc, cy - ry * sc
   end
-  -- Sektor (Kanten +-45 Grad zur Halbierenden)
+  -- Sektor (Kanten +-45 Grad zur Halbierenden); noch nicht erreicht = gefuellt
   local bd = bearingOf(c.bx, c.by)
+  local done = w.tp > 0 and i <= w.tp
+  if not done then
+    local vx0, vy0 = P(c.x, c.y)
+    local HP = {}
+    local bxs, bys = P(c.x + c.bx * 100, c.y + c.by * 100)
+    for _, off in ipairs({-45, 45}) do
+      local ex, ey = dirVec(bd + off)
+      local qx, qy = P(c.x + ex * 100, c.y + ey * 100)
+      local dx, dy = qx - vx0, qy - vy0
+      -- Halbebene a*X + b*Y + k >= 0 auf der Seite der Halbierenden
+      local a, b = -dy, dx
+      local k = -(a * vx0 + b * vy0)
+      if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
+      HP[#HP + 1] = {a, b, k}
+    end
+    lcd.color(rgb(0, 55, 25))
+    for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
+      local lo, hi = x0, x0 + bw - 1
+      for _, h in ipairs(HP) do
+        local rhs = -(h[2] * yr + h[3])
+        if math.abs(h[1]) < 1e-9 then
+          if rhs > 0 then lo = hi + 1 end
+        elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
+        else hi = math.min(hi, rhs / h[1]) end
+      end
+      if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
+    end
+  end
   lcd.color(rgb(0, 110, 50))
   for _, off in ipairs({-45, 45}) do
     local ex, ey = dirVec(bd + off)
@@ -1690,7 +1919,19 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   local ax, ay = P(f.x, f.y)
   if inClip(ax, ay) then planeSymbol(ax, ay, 8, C_WHITE) end
   CLIP = nil
-  local done = w.tp > 0 and i <= w.tp
+  -- Wind: Pfeil (wohin er blaest) im Bild mit Kurs oben, Staerke daneben
+  if w.windOk then
+    local rx = w.wx * cs - w.wy * sn
+    local ry = w.wx * sn + w.wy * cs
+    local n = math.sqrt(rx * rx + ry * ry)
+    local wcx, wcy = x0 + bw - 24, y0 + 24
+    lcd.color(C_BLUE)
+    if n > 0.3 then
+      local ux, uy = rx / n, -ry / n
+      arrow(wcx - ux * 16, wcy - uy * 16, ux, uy, 32, 4, 8)
+    end
+    drawT(x0, wcy - textH(FONT_S) / 2, bw - 50, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
+  end
   drawT(x0 + 4, y0 + 2, bw, "TP" .. i .. (done and "  INNEN" or string.format("  %d m", math.floor(d + 0.5))), FONT_STD, done and C_GREEN or C_WHITE, "l")
   drawT(x0, y0 + bh - textH(FONT_XS) - 2, bw - 4, string.format("%d m Raster", math.floor(span)), FONT_XS, C_DIM, "r")
 end
@@ -1766,41 +2007,93 @@ local function paintGlide(w, W, H, top)
     else cmd, col = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE end
     local th = drawT(nx, y, nw, cmd, F_XL, col, "c")
     local yy = y + th + 4
-    -- Querablage (CDI), Bezug: optimale Linie
-    local cdiH = 34
+    -- Kursgrafik: links Steuerpfeil (Soll-Kurs relativ zur Nase, oben = geradeaus), rechts Querablage mit Seitenwind
+    local cdiH = SMALL and 38 or 78
+    local sq = cdiH
     lcd.color(rgb(25, 25, 25))
-    rect(nx, yy, nw, cdiH)
+    rect(nx, yy, sq, cdiH)
+    do
+      local acx, acy = nx + sq / 2, yy + cdiH / 2
+      local ang = math.rad(err)
+      local L = sq / 2 - 5
+      local ux, uy = math.sin(ang), -math.cos(ang)              -- Bildschirm: oben = -y
+      local acol = a < 5 and C_GREEN or (a >= w.cmdMin and C_ORANGE or C_WHITE)
+      lcd.color(acol)
+      arrow(acx - ux * L * 0.75, acy - uy * L * 0.75, ux, uy, L * 1.75, math.max(4, sq / 9), math.max(7, sq / 5))
+    end
+    local cx0, cw = nx + sq + 4, nw - sq - 4
+    lcd.color(rgb(25, 25, 25))
+    rect(cx0, yy, cw, cdiH)
     local xt = g.xt or 0
-    local rng = (math.abs(xt) > 100) and 300 or 100
-    local ccx = nx + nw / 2
-    lcd.color(C_GRID)
-    for k = -2, 2 do local tx = ccx + k * (nw / 2 - 8) / 2; line(tx, yy + 4, tx, yy + cdiH - 4) end
-    lcd.color(C_BLUE)
-    line(ccx, yy, ccx, yy + cdiH)
-    line(ccx + 1, yy, ccx + 1, yy + cdiH)
-    -- Flugzeug relativ zur Linie (rechts der Linie = rechts gezeichnet)
-    local ppx = ccx + clamp(xt / rng, -1, 1) * (nw / 2 - 10)
-    planeSymbol(ppx, yy + cdiH / 2, 9, math.abs(xt) < 20 and C_GREEN or C_WHITE)
+    local far = math.abs(xt) > 300
+    local ccx = cx0 + cw / 2
+    if far then
+      -- weit daneben (z. B. abgetrieben): kein Massstab mehr, Peilung direkt zur naechsten Ecke
+      drawT(cx0, yy + 2, cw, string.format("WEIT DANEBEN  %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_S, C_ORANGE, "c")
+      drawT(cx0, yy + 2 + textH(FONT_S), cw, string.format("TP%d direkt %03d°  %.1f km", g.next, math.floor(g.brgTP + 0.5), g.dV / 1000), SMALL and FONT_STD or FONT_L, C_WHITE, "c")
+    else
+      local rng = (math.abs(xt) > 100) and 300 or 100
+      lcd.color(C_GRID)
+      for k = -2, 2 do local tx = ccx + k * (cw / 2 - 8) / 2; line(tx, yy + 4, tx, yy + cdiH - 4) end
+      lcd.color(C_BLUE)
+      line(ccx, yy, ccx, yy + cdiH)
+      line(ccx + 1, yy, ccx + 1, yy + cdiH)
+      -- Flugzeug relativ zur Linie (rechts der Linie = rechts gezeichnet)
+      local ppx = ccx + clamp(xt / rng, -1, 1) * (cw / 2 - 12)
+      planeSymbol(ppx, yy + cdiH * 0.62, SMALL and 9 or 13, math.abs(xt) < 20 and C_GREEN or C_WHITE)
+      local scTxt = SMALL and string.format("%d m %s  (+-%d)", math.floor(math.abs(xt) + 0.5), xt > 0 and "R" or "L", rng) or string.format("+-%d m", rng)
+      drawT(cx0 + 3, yy + cdiH - textH(FONT_XS) - 1, cw, scTxt, FONT_XS, C_DIM, "l")
+    end
+    -- Seitenwind: Pfeil oben in der Grafik, von der Luvseite her, Laenge nach Staerke
+    if g.cross and math.abs(g.cross) >= 2 then
+      local sgn = g.cross > 0 and 1 or -1
+      local Lw = clamp(math.abs(g.cross) / 30, 0.25, 1) * (cw / 2 - 20)
+      local wy0 = far and (yy + cdiH - 8) or (yy + 9)
+      local x1 = ccx - sgn * (cw / 2 - 8)
+      local x2 = x1 + sgn * Lw
+      lcd.color(C_BLUE)
+      rect(math.min(x1, x2), wy0 - 1, math.abs(x2 - x1), 3)
+      tri(x2 + sgn * 7, wy0, x2, wy0 - 6, x2, wy0 + 6)
+      local wt = string.format("SW %d", math.floor(math.abs(g.cross) + 0.5))
+      if sgn > 0 then drawT(x2 + 10, wy0 - textH(FONT_S) / 2, cw, wt, FONT_S, C_BLUE, "l")
+      else drawT(cx0, wy0 - textH(FONT_S) / 2, x2 - 10 - cx0, wt, FONT_S, C_BLUE, "r") end
+    end
     yy = yy + cdiH + 2
-    drawT(nx, yy, nw, string.format("Ablage %d m %s  (Skala +-%d m)", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links", rng), FONT_XS, C_DIM, "c")
-    yy = yy + textH(FONT_XS) + 6
+    if not far and not SMALL then
+      drawT(nx, yy, nw, string.format("Ablage %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_XS, C_DIM, "c")
+      yy = yy + textH(FONT_XS) + 4
+    else yy = yy + 2 end
     local col3 = math.floor(nw / 3)
     valBox(nx, yy, col3, "TP" .. g.next, string.format("%d m", math.floor(g.dV + 0.5)), C_WHITE, F_L)
     valBox(nx + col3, yy, col3, "WENDEN IN", fmtMS(g.plan.tT), (g.plan.tT or 99) < 10 and C_ORANGE or C_WHITE, F_L)
-    yy = yy + valBox(nx + 2 * col3, yy, col3, "RADIUS", string.format("%d m", math.floor(g.R + 0.5)), w.radMode == 1 and w.rMeas and C_WHITE or C_DIM, F_L) + 4
+    local hf = g.hFin
+    local hfCol = hf and (hf < 30 and C_RED or (hf < 80 and C_ORANGE or C_WHITE)) or C_DIM
+    if SMALL then
+      -- kleiner Bildschirm: Zielhoehe statt Radius, Gegen-/Rueckenwind in der Infozeile
+      yy = yy + valBox(nx + 2 * col3, yy, col3, "ZIEL-HÖHE", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, F_L) + 4
+    else
+      yy = yy + valBox(nx + 2 * col3, yy, col3, "RADIUS", string.format("%d m", math.floor(g.R + 0.5)), w.radMode == 1 and w.rMeas and C_WHITE or C_DIM, F_L) + 4
+    end
     local lapNow = (f.clk or 0) - (w.lapT or f.clk)
-    local last = w.laps[#w.laps]
-    if yy + textH(FONT_XS) + textH(FONT_STD) < H - m - infoH then
-    valBox(nx, yy, col3, "HÖHE", string.format("%d m", math.floor(f.agl + 0.5)), C_WHITE, FONT_STD)
-    valBox(nx + col3, yy, col3, "RUNDE " .. (#w.laps + 1), fmtMS(lapNow), C_WHITE, FONT_STD)
-    valBox(nx + 2 * col3, yy, col3, "LETZTE", last and string.format("%.1f km/h", last.speed) or "--", C_WHITE, FONT_STD)
+    if not SMALL and yy + textH(FONT_XS) + textH(FONT_STD) < H - m - infoH then
+      valBox(nx, yy, col3, "HÖHE AM ZIEL", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, FONT_STD)
+      valBox(nx + col3, yy, col3, "RUNDE " .. (#w.laps + 1), fmtMS(lapNow), C_WHITE, FONT_STD)
+      local hw = g.head
+      valBox(nx + 2 * col3, yy, col3, hw and (hw >= 0 and "GEGENWIND" or "RÜCKENWIND") or "WIND", hw and string.format("%d km/h", math.floor(math.abs(hw) + 0.5)) or "--", hw and (hw >= 0 and C_ORANGE or C_GREEN) or C_DIM, SMALL and FONT_STD or F_L)
     end
   end
   -- Infozeile unten
   local sc = scoreOf(w)
-  local left = T.work * 60 - ((f.clk or 0) - (w.startT or 0))
   local wind = w.windOk and string.format("Wind %d aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: kreisen"
-  drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d  Rest %s  %s", sc.n, fmtMS(left), wind), FONT_S, C_DIM, "c")
+  local last = w.laps[#w.laps]
+  local lastTxt = last and string.format("  Letzte %.1f km/h%s", last.speed, last.idx and string.format(" %.1f%%", last.idx) or "") or ""
+  if SMALL and g.head then
+    local hw = g.head
+    drawT(nx, H - m - infoH + 2, nw, string.format("%s %d", hw >= 0 and "GEGENWIND" or "RÜCKENWIND", math.floor(math.abs(hw) + 0.5)), FONT_STD, hw >= 0 and C_ORANGE or C_GREEN, "l")
+    drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d", sc.n), FONT_S, C_DIM, "r")
+    return
+  end
+  drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d%s  %s", sc.n, lastTxt, wind), FONT_S, C_DIM, "c")
 end
 
 local function paintTherm(w, W, H, top)
@@ -1909,7 +2202,7 @@ local function paintEval(w, W, H, top)
   drawT(m, y, W - 2 * m, table.concat(info, "   "), FONT_XS, (w.zoneHit or w.altHit) and C_RED or C_DIM, "l")
   y = y + textH(FONT_XS) + 4
   -- Rundentabelle
-  local cols = {"Runde", "Zeit", "km/h", "Höhe", "dH"}
+  local cols = {"Runde", "Zeit", "km/h", "Index", "Höhe", "dH"}
   local cw = math.floor((W - 2 * m) / #cols)
   lcd.color(rgb(40, 40, 40))
   local rh = textH(FONT_S) + 2
@@ -1923,7 +2216,7 @@ local function paintEval(w, W, H, top)
   for _, l in ipairs(w.laps) do if not best or l.time < best then best = l.time end end
   for k = 1 + w.evalScroll, math.min(n, w.evalScroll + rows) do
     local l = w.laps[k]
-    local cells = {tostring(l.n), fmtMS(l.time), string.format("%.1f", l.speed), string.format("%d", math.floor(l.agl + 0.5)), string.format("%+d", math.floor(l.dAlt + 0.5))}
+    local cells = {tostring(l.n), fmtMS(l.time), string.format("%.1f", l.speed), l.idx and string.format("%.1f%%", l.idx) or "--", string.format("%d", math.floor(l.agl + 0.5)), string.format("%+d", math.floor(l.dAlt + 0.5))}
     for c, s in ipairs(cells) do drawT(m + (c - 1) * cw, y, cw - 6, s, FONT_S, (l.time == best) and C_GREEN or C_WHITE, "r") end
     y = y + rh
   end
@@ -1968,9 +2261,9 @@ local function eventHandler(w, category, value, x, y)
       w.manual, w.manualFrom, w.page = p, w.autoTarget, p
       lcd.invalidate(); return true
     end
-    if inside(w.armBox, x, y) and w.task and w.state ~= S_STARTED then
+    if inside(w.armBox, x, y) and w.task then
       if w.state == S_STOPPED then resetFlight(w) end
-      w.state, w.armedAt, w.armPending = S_ARMED, os.clock(), true
+      armOrRestart(w, os.clock())
       lcd.invalidate(); return true
     end
     if inside(w.resetBox, x, y) then
@@ -2019,7 +2312,6 @@ local function addText(w, label, prop)
   end
 end
 
-local PAGE_CHOICES = {{"Start", P_START}, {"Gleiten", P_GLIDE}, {"Thermik", P_THERM}, {"Auswertung", P_EVAL}}
 
 local function configure(w)
   refreshTasks(w, os.clock(), true)
@@ -2038,15 +2330,16 @@ local function configure(w)
   addSource(w, "GPS", "gps")
   addSource(w, "GPS-Geschw. (empfohlen)", "gpsSpd")
   addSource(w, "GPS-Höhe (ü. M.)", "gpsAlt")
+  addSource(w, "GPS-Zeit (sonst Senderuhr, Uhr mit *)", "gpsTime")
   addSource(w, "Relative Höhe (optional)", "relAlt")
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addSource(w, "Vario", "vario")
   -- Seiten
-  addSource(w, "Seiten-Schalter", "pageSw")
-  addChoice(w, "Schalter-Art", "swMode", {{"Stufen (Position = Seite)", 1}, {"Taster (weiter)", 2}})
-  addNumber(w, "Stufen am Schalter", "swPos", 2, 6)
-  for i = 1, 6 do addChoice(w, "Position " .. i, "pos" .. i, PAGE_CHOICES) end
-  addBool(w, "Seite automatisch (ohne Schalter)", "autoPage")
+  addSwitch(w, "Schalter Seite Start", "swStart")
+  addSwitch(w, "Schalter Seite Gleiten", "swGlide")
+  addSwitch(w, "Schalter Seite Thermik", "swTherm")
+  addSwitch(w, "Schalter Seite Auswertung", "swEval")
+  addBool(w, "Seite automatisch (wenn kein Seiten-Schalter ein ist)", "autoPage")
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
   -- Toene
   addBool(w, "Ton", "sound")
@@ -2066,7 +2359,7 @@ local function configure(w)
   addNumber(w, "Reserve im Sektor (m)", "margin", 0, 100)
   addNumber(w, "Piepse vor dem Wenden (s)", "warnSec", 0, 10)
   addNumber(w, "Vorhalt Kurveneinleitung (0.1 s)", "lead", 0, 30)
-  addNumber(w, "Eckansicht ab (m)", "zoomDist", 50, 600)
+  addNumber(w, "Eckansicht vor dem Wendepunkt (s)", "zoomSec", 3, 60)
   -- Sollfahrt
   addSource(w, "MC Poti (optional)", "mcSrc")
   addNumber(w, "MC (0.1 m/s)", "mc", 0, 50)
