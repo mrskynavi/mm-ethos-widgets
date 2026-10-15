@@ -11,3 +11,5 @@ Ethos-Lua-Widgets von Mächler Modelle. Der MM Flight Analyzer holt sie von hier
 ```
 
 `scripts/maccready/polaren.lua` gehört nicht hierher, die schreibt die App selbst.
+
+`scripts/skynav/aufgaben.lua` schreibt ebenfalls die App (Tab SkyNavigator), die Flüge legt das Widget in `scripts/skynav/fluege/` ab.
