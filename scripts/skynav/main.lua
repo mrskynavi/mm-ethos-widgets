@@ -1390,6 +1390,7 @@ end
 
 local function rgb(r, g, b) return lcd.RGB(r, g, b) end
 local F_L, F_XL = FONT_L, FONT_XL      -- grosse Werte, auf kleinen Bildschirmen eine Stufe kleiner
+local SMALL = false                    -- kleiner Bildschirm (X18 und kleiner): kurze Beschriftungen
 local C_BG, C_DIM, C_WHITE, C_GREEN, C_ORANGE, C_RED, C_BLUE, C_YELLOW, C_GRID
 local function colors()
   C_BG, C_DIM, C_WHITE = rgb(0, 0, 0), rgb(150, 150, 150), rgb(255, 255, 255)
@@ -1606,16 +1607,16 @@ local function paintStart(w, W, H, top)
   if c and c.predAgl then
     local e = c.err
     local col = math.abs(e) <= w.winLo / 2 and C_GREEN or (c.predAgl > T.maxH and C_RED or C_ORANGE)
-    row("HÖHE AN LINIE (" .. (T.maxH - w.winLo) .. "-" .. T.maxH .. ")", string.format("%d m  %+d", math.floor(c.predAgl + 0.5), math.floor(c.predAgl - T.maxH + 0.5)), col)
+    row(SMALL and "HÖHE AN LINIE" or ("HÖHE AN LINIE (" .. (T.maxH - w.winLo) .. "-" .. T.maxH .. ")"), string.format("%d m  %+d", math.floor(c.predAgl + 0.5), math.floor(c.predAgl - T.maxH + 0.5)), col)
     local vc = (c.predV or 0) > T.maxV and C_RED or ((c.predV or 0) > T.maxV - w.speedMargin and C_ORANGE or C_GREEN)
-    row(string.format("SPEED AN LINIE (max %d, jetzt %d)", math.floor(T.maxV), math.floor(f.v3d + 0.5)), string.format("%d km/h", math.floor((c.predV or 0) + 0.5)), vc)
-    row("ZEIT BIS LINIE", fmtMS(c.tLine), C_WHITE)
+    row(SMALL and string.format("SPEED (MAX %d)", math.floor(T.maxV)) or string.format("SPEED AN LINIE (max %d, jetzt %d)", math.floor(T.maxV), math.floor(f.v3d + 0.5)), string.format("%d km/h", math.floor((c.predV or 0) + 0.5)), vc)
+    if not SMALL then row("ZEIT BIS LINIE", fmtMS(c.tLine), C_WHITE) end
   else
     row("HÖHE", hNow, C_WHITE)
     row("SPEED 3D", vNow, C_WHITE)
   end
   if c then
-    row("STRAFE JETZT", tostring(c.penaltyNow), c.penaltyNow > 0 and C_RED or C_GREEN)
+    row((SMALL and c.tLine) and ("STRAFE  LINIE " .. fmtMS(c.tLine)) or "STRAFE JETZT", tostring(c.penaltyNow), c.penaltyNow > 0 and C_RED or C_GREEN)
   end
   if w.state == S_STARTED and w.entry then
     drawT(rx, yy, rw, string.format("Start: %d m %d km/h  Strafe %d", math.floor(w.entry.agl + 0.5), math.floor(w.entry.v3d + 0.5), w.penalty), FONT_XS, C_GREEN, "l")
@@ -1827,7 +1828,7 @@ local function paintTherm(w, W, H, top)
   yy = yy + valBox(m + half, yy, half, "HÖHE", f and string.format("%d m", math.floor(f.agl + 0.5)) or "--", C_WHITE, F_L) + 4
   if T and f then
     local rest = T.maxAlt - f.agl
-    valBox(m, yy, half, "BIS MAX " .. T.maxAlt, string.format("%d m", math.floor(rest + 0.5)), rest < 30 and C_RED or (rest < 80 and C_ORANGE or C_WHITE), FONT_STD)
+    valBox(m, yy, half, SMALL and "RESERVE" or ("RESERVE ZU " .. T.maxAlt), string.format("%d m", math.floor(rest + 0.5)), rest < 30 and C_RED or (rest < 80 and C_ORANGE or C_WHITE), FONT_STD)
     local left = w.startT and (T.work * 60 - (f.clk - w.startT)) or nil
     valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
   end
@@ -1839,7 +1840,7 @@ local function paintTherm(w, W, H, top)
   rect(mx0, y, mw, mh)
   if f then
     local R = radius(w)
-    local span = clamp(R * 3, 60, 300)
+    local span = clamp(R * 2.2, 50, 300)
     local sc = math.min(mw, mh) / 2 / span
     local hr = math.rad(f.crs or 0)
     local cs, sn = math.cos(hr), math.sin(hr)
@@ -1941,6 +1942,7 @@ local function paint(w)
   local W, H = lcd.getWindowSize()
   local small = W < 600 or H < 260
   F_L, F_XL = small and FONT_STD or FONT_L, small and FONT_L or FONT_XL
+  SMALL = small
   lcd.color(C_BG)
   rect(0, 0, W, H)
   local top = header(w, W)
