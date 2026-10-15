@@ -752,7 +752,7 @@ local NUM_DEFS = {
   {key = "pos6",      def = P_EVAL},
   {key = "radMode",   def = 1},     -- 1 = gemessen, 2 = fest
   {key = "radFix",    def = 30},    -- m
-  {key = "margin",    def = 20},    -- m Reserve im Sektor
+  {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
   {key = "warnSec",   def = 3},     -- Piepse vor dem Wenden (s)
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
   {key = "cmdMin",    def = 10},    -- Kommando ab x Grad
