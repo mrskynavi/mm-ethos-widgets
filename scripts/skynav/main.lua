@@ -1709,7 +1709,8 @@ function fillHP(HP, x0, y0, bw, bh)
   end
 end
 
--- Seite UEBERSICHT: ganzes Dreieck mit Flugweg, TP1 oben (wie auf der Startseite). Vor dem Start ist die
+-- Seite UEBERSICHT: ganzes Dreieck mit Flugweg, flach wie im Reglement (Hypotenuse unten, TP3 links, TP1 rechts,
+-- TP2 oben, Linie senkrecht durch den Ursprung). Vor dem Start ist die
 -- TP1-Seite der Linie rot, danach ist der Sektor des naechsten TP gefuellt wie in der Eckansicht.
 local function paintOver(w, W, H, top)
   local T, f = w.task, w.cur
@@ -1724,9 +1725,8 @@ local function paintOver(w, W, H, top)
     drawT(mx0, y + mh / 2 - 10, mw, "Keine Aufgabe", FONT_L, C_RED, "c")
     return
   end
-  local hr = math.rad(T.dir)
-  local cs, sn = math.cos(hr), math.sin(hr)
-  local function R(x, yv) return x * cs - yv * sn, -(x * sn + yv * cs) end
+  -- Bild: rechts = Richtung O -> TP1, oben = Richtung O -> TP2
+  local function R(x, yv) return x * T.ux + yv * T.uy, -(x * T.px + yv * T.py) end
   -- Ausschnitt: Dreieck, Linie im Bereich des Dreiecks und das Modell
   local pts = {{0, 0}, {T.tp[1].x, T.tp[1].y}, {T.tp[2].x, T.tp[2].y}, {T.tp[3].x, T.tp[3].y}}
   for i = 1, 3 do local c = T.tp[i]; pts[#pts + 1] = {c.x + c.bx * T.dist * 0.25, c.y + c.by * T.dist * 0.25} end
@@ -1819,17 +1819,16 @@ local function paintOver(w, W, H, top)
   if f then
     local px, py = P(f.x, f.y)
     px, py = clamp(px, mx0 + 6, mx0 + mw - 6), clamp(py, y + 6, y + mh - 6)
-    local rel = math.rad((f.crs or T.dir) - T.dir)
+    -- Kurs als Einheitsvektor ins Bild drehen
+    local hx, hy = R(dirVec(f.crs or T.dir))
+    local nx, ny = -hy, hx
     local s = 8
-    local function rot(dx, dy) return px + dx * math.cos(rel) - dy * math.sin(rel), py + dx * math.sin(rel) + dy * math.cos(rel) end
-    local ax, ay = rot(0, -s)
-    local bx, by = rot(-s * 0.7, s * 0.7)
-    local qx, qy = rot(s * 0.7, s * 0.7)
     lcd.color(C_WHITE)
-    tri(ax, ay, bx, by, qx, qy)
+    tri(px + hx * s, py + hy * s, px - hx * s * 0.7 + nx * s * 0.7, py - hy * s * 0.7 + ny * s * 0.7,
+      px - hx * s * 0.7 - nx * s * 0.7, py - hy * s * 0.7 - ny * s * 0.7)
   end
   CLIP = nil
-  -- Wind (wohin er blaest), im Bild mit TP1 oben
+  -- Wind (wohin er blaest), im Bild der Übersicht
   local wx0, wy0 = mx0 + mw - 26, y + 26
   if w.windOk then
     local sx, sy = R(w.wx, w.wy)
@@ -1838,7 +1837,6 @@ local function paintOver(w, W, H, top)
     if n > 0.3 then arrow(wx0 - sx / n * 16, wy0 - sy / n * 16, sx / n, sy / n, 32, 4, 8) end
     drawT(mx0, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - mx0, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
   end
-  drawT(mx0 + 4, y + 2, mw, "TP1 ^", FONT_XS, C_DIM, "l")
   -- Rechts: was als naechstes kommt und wie der Start war
   local nxtTxt, nxtCol
   if before then nxtTxt, nxtCol = (w.state == S_ARMED and "Start über Linie" or "Scharf stellen"), C_ORANGE
