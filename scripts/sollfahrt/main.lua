@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.4
+-- @version 1.5
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -16,6 +16,11 @@
 --   Vario      kompensiert (TE) oder rein barometrisch. Barometrisch: das Widget addiert die
 --              Energiekompensation selbst:  TE = Vario + Faktor * (v/g) * dv/dt
 --              (Faktor in %, Vario-Zeitkonstante gleicht die Traegheit des Varios an)
+--   Hoehe fuer Netto  optional, empfohlen: die barometrische Flughoehe. Dann rechnet das Widget
+--              das Netto (und damit die Sollfahrt) aus der Steigrate dieser Hoehe plus
+--              Energiekompensation, wie der MM Flight Analyzer seine Polare. So passen Polare und
+--              Netto zusammen, auch wenn das Vario zu wenig Sinken zeigt (Shark 16.10.: ~20 %).
+--              Vario-Anzeige und Toene bleiben beim Vario. Ohne diesen Sensor: Netto aus dem Vario.
 --   Motor      optional, Strom oder Drehzahl. Motor an und 6 s danach: keine Auswertung, danach
 --              beginnen Netto, Fahrt und Vario neu. Ohne Sensor: nach mehr als 5 s Steigen ueber
 --              5 m/s (TE) startet Netto neu, sobald das Steigen unter 2 m/s faellt.
@@ -37,7 +42,8 @@
 --
 -- Rechnung
 --   Polare:  Sinken w(v) = A*v^2 + B*v + C
---   Netto:   Luftmassenbewegung = TE + Sinken(TAS)   (positiv = Luft steigt), geglaettet
+--   Netto:   Luftmassenbewegung = TE + Sinken(TAS)   (positiv = Luft steigt), geglaettet;
+--            mit "Hoehe fuer Netto": TE = dh/dt + (v/g) * dv/dt
 --   Sollfahrt:  v = h + sqrt( h^2 + (C + MC - Netto + B*h) / A )      (h = Gegenwind m/s)
 --   Abweichung = geglaettete Ist-Fahrt - Sollfahrt (km/h), positiv = zu schnell.
 --   Streckenverlust (nur im Gleitflug): Mit der Sollfahrt haette dieselbe "Hoehe inkl. MC"
@@ -213,11 +219,13 @@ end
 
 -- Ein Rechenschritt. teRaw in m/s, vRaw = Fluggeschwindigkeit in m/s (nil = keine Daten).
 -- hRaw: Gegenwindkomponente in m/s (nil = kein Wind bekannt).
-local function process(w, teRaw, vRaw, dt, now, hRaw)
+-- teNetRaw: TE aus der Hoehe fuer das Netto (nil = Netto aus teRaw).
+local function process(w, teRaw, vRaw, dt, now, hRaw, teNetRaw)
   if not w.polar then w.valid = false; return end
   if teRaw == nil or vRaw == nil or vRaw * KMH < w.minSpeed then
     w.valid = false
     w.vSlow, w.vFast, w.teFast, w.teSlow, w.netto = nil, nil, nil, nil, nil
+    w.teNet = nil
     w.vstf, w.dv, w.stfLimited = nil, nil, false
     w.tooFastSince, w.tooSlowSince = nil, nil
     return
@@ -241,7 +249,8 @@ local function process(w, teRaw, vRaw, dt, now, hRaw)
     w.strongSince, w.strongLast = nil, nil
   end
 
-  local nettoInst = w.teFast + polarSink(w.polar, w.vFast)
+  w.teNet = teNetRaw ~= nil and lpf(w.teNet, teNetRaw, dt, tauVar) or nil
+  local nettoInst = (w.teNet or w.teFast) + polarSink(w.polar, w.vFast)
   w.netto = lpf(w.netto, nettoInst, dt, w.smoothNet)
 
   -- Gegenwindkomponente aus Wind und aktuellem Kurs, nur kurz geglaettet (HEAD_TAU), damit die
@@ -765,7 +774,7 @@ end
 
 -- Kinetischer Anteil (v/g)*dv/dt der TAS (m/s), ueber 1 s Basis (weniger Rauschen).
 local function kineticStep(w, tas, dt, now)
-  if tas == nil then w.tasF, w.kin, w.kT0 = nil, nil, nil; return end
+  if tas == nil then w.tasF, w.kin, w.kinA, w.kT0 = nil, nil, nil, nil; return end
   w.tasF = lpf(w.tasF, tas, dt, 1.0)
   if w.kT0 == nil then w.kT0, w.kTas0 = now, w.tasF; return end
   local span = now - w.kT0
@@ -773,6 +782,7 @@ local function kineticStep(w, tas, dt, now)
     local raw = w.tasF / G * (w.tasF - w.kTas0) / span
     local tau = (w.varioType == 2) and (w.varioTau / 10) or 4
     w.kin = lpf(w.kin, raw, span, tau)
+    w.kinA = lpf(w.kinA, raw, span, 1.0)   -- fuer die Hoehe: kurz, damit es zur Steigrate passt
     w.kT0, w.kTas0 = now, w.tasF
   end
 end
@@ -805,13 +815,29 @@ local function inputsStep(w, now, dt)
     te = (w.varioType == 2) and (vario + w.teFactor / 100 * kin) or vario
   end
 
+  -- TE aus der Hoehe fuer das Netto: Steigrate ueber mindestens 1 s (Hoehe 0.5 s geglaettet)
+  local teNet
+  local hA = readNumber(w.netAlt)
+  if hA ~= nil then
+    w.hAF = lpf(w.hAF, hA, dt, 0.5)
+    if w.hT0 == nil then
+      w.hT0, w.hH0 = now, w.hAF
+    elseif now - w.hT0 >= 1.0 then
+      w.hRate = (w.hAF - w.hH0) / (now - w.hT0)
+      w.hT0, w.hH0 = now, w.hAF
+    end
+    if w.hRate ~= nil then teNet = w.hRate + (w.kinA or 0) end
+  else
+    w.hAF, w.hT0, w.hRate = nil, nil, nil
+  end
+
   local note
   if not validSource(w.gps) then note = "GPS-Quelle waehlen"
   elseif perr then note = perr
   elseif not w.gpsOk then note = "GPS: kein Fix / keine Bewegung"
   elseif te == nil then note = "Vario-Quelle waehlen"
   elseif tas ~= nil and tas * KMH < w.minSpeed then note = "Fahrt unter Mindestfahrt" end
-  return te, tas, air and air.head or nil, note
+  return te, tas, air and air.head or nil, note, teNet
 end
 
 -- Alles, was paint() anzeigt, gerundet wie angezeigt. Aendert sich davon nichts, bleibt das Bild.
@@ -889,13 +915,13 @@ local function wakeup(w)
   if validSource(w.modeSw) and sw ~= nil then w.modeFixed = sw > 0 else w.modeFixed = nil end
 
   -- Eingaben
-  local te, tas, hRaw, note
+  local te, tas, hRaw, note, teNet
   if w.demo then
     te, tas = demoInputs(w, now)
     hRaw = 4 * math.sin(2 * math.pi * now / 50)
     w.air = {gs = tas, course = 0, tas = tas, head = hRaw, wind = {spd = 14 / KMH, from = 270, age = 0}}
   else
-    te, tas, hRaw, note = inputsStep(w, now, dt)
+    te, tas, hRaw, note, teNet = inputsStep(w, now, dt)
   end
   w.dataNote = note
 
@@ -905,13 +931,13 @@ local function wakeup(w)
   if mv ~= nil and math.abs(mv) > w.motorThr then w.motorLast = now end
   w.motorActive = w.motorLast ~= nil and now - w.motorLast < MOTOR_HOLD
   if w.motorActive then
-    te, tas = nil, nil
+    te, tas, teNet = nil, nil, nil
     w.dataNote = "Motor an"
     w.strongSince, w.strongLast = nil, nil
   end
 
   local wasCruise = w.cruise
-  process(w, te, tas, dt, now, hRaw)
+  process(w, te, tas, dt, now, hRaw, teNet)
   if w.valid and wasCruise ~= w.cruise then
     playToneSafe(w.cruise and 700 or 500, 120)
   end
@@ -1291,6 +1317,7 @@ local function configure(w)
   w.baroFields[#w.baroFields + 1] = addNumber(w, "Barometrisch: Kompensation (%)", "teFactor", 0, 150)
   w.baroFields[#w.baroFields + 1] = addNumber(w, "Barometrisch: Vario-Zeitkonst. (0.1 s)", "varioTau", 0, 100)
   updateBaroFields(w)
+  addSource(w, "Hoehe fuer Netto (Flughoehe, empfohlen)", "netAlt")
 
   -- MC
   addSource(w, "MC Poti/Schieber (optional)", "mcSrc")
@@ -1358,6 +1385,7 @@ local function read(w)
   w.motor = same and validSource(storage.read("motor")) or nil
   local thr = same and storage.read("motorThr") or nil
   w.motorThr = (type(thr) == "number") and thr or 3
+  w.netAlt = same and validSource(storage.read("netAlt")) or nil
   w.mcValue = w.mc / 10
   w.polarSig = nil
   w.fileChecked = nil
@@ -1371,6 +1399,7 @@ local function write(w)
   storage.write("gpsSpd", w.gpsSpd)
   storage.write("motor", w.motor)
   storage.write("motorThr", w.motorThr)
+  storage.write("netAlt", w.netAlt)
 end
 
 local function init()
