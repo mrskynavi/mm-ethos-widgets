@@ -1806,6 +1806,30 @@ local function paintOver(w, W, H, top)
   lcd.color(lineNext and C_YELLOW or rgb(140, 125, 0))
   line(l1x, l1y, l2x, l2y)
   if lineNext then line(l1x, l1y + 1, l2x, l2y + 1) end
+  -- Optimale Route (blau) wie in der Eckansicht: in der Aufgabe vom Modell ueber die naechsten Ecken,
+  -- vorher eine ganze Runde ab dem Ursprung (alle 2 s neu gerechnet)
+  local route
+  if w.state == S_STARTED and w.gc and w.gc.plan then route = w.gc.plan.pts
+  elseif before then
+    local nowc = os.clock()
+    if not w.ovPlan or nowc - (w.ovPlanT or 0) > 2 then
+      local R = radius(w)
+      local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, R, cornersFrom(T, 1, 3, R, w.margin))
+      local pts = {}
+      for _, q in ipairs(pr.pts or {}) do pts[#pts + 1] = q end
+      pts[#pts + 1] = {x = 0, y = 0}
+      w.ovPlan, w.ovPlanT = pts, nowc
+    end
+    route = w.ovPlan
+  end
+  if route then
+    lcd.color(C_BLUE)
+    for k = 2, #route do
+      local ax, ay = P(route[k - 1].x, route[k - 1].y)
+      local bx, by = P(route[k].x, route[k].y)
+      line(ax, ay, bx, by)
+    end
+  end
   -- Flugweg: vor dem Start grau, in der Aufgabe weiss
   local tr = w.track or {}
   for k = 2, #tr do
