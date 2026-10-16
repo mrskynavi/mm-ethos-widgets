@@ -1857,6 +1857,35 @@ local function paintStart(w, W, H, top)
 end
 
 -- Eckansicht (Kurs oben), zentriert zwischen Ecke und Flugzeug
+-- Sektor eines TP fuellen (Kanten +-45 Grad zur Halbierenden), im Kasten x0,y0,bw,bh
+local function fillSector(P, c, bd, x0, y0, bw, bh)
+  local vx0, vy0 = P(c.x, c.y)
+  local HP = {}
+  local bxs, bys = P(c.x + c.bx * 100, c.y + c.by * 100)
+  for _, off in ipairs({-45, 45}) do
+    local ex, ey = dirVec(bd + off)
+    local qx, qy = P(c.x + ex * 100, c.y + ey * 100)
+    local dx, dy = qx - vx0, qy - vy0
+    -- Halbebene a*X + b*Y + k >= 0 auf der Seite der Halbierenden
+    local a, b = -dy, dx
+    local k = -(a * vx0 + b * vy0)
+    if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
+    HP[#HP + 1] = {a, b, k}
+  end
+  lcd.color(rgb(0, 55, 25))
+  for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
+    local lo, hi = x0, x0 + bw - 1
+    for _, h in ipairs(HP) do
+      local rhs = -(h[2] * yr + h[3])
+      if math.abs(h[1]) < 1e-9 then
+        if rhs > 0 then lo = hi + 1 end
+      elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
+      else hi = math.min(hi, rhs / h[1]) end
+    end
+    if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
+  end
+end
+
 local function paintCorner(w, g, x0, y0, bw, bh)
   local T, f = w.task, w.cur
   local i = g.corner
@@ -1880,33 +1909,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   -- Sektor (Kanten +-45 Grad zur Halbierenden); noch nicht erreicht = gefuellt
   local bd = bearingOf(c.bx, c.by)
   local done = w.tp > 0 and i <= w.tp
-  if not done then
-    local vx0, vy0 = P(c.x, c.y)
-    local HP = {}
-    local bxs, bys = P(c.x + c.bx * 100, c.y + c.by * 100)
-    for _, off in ipairs({-45, 45}) do
-      local ex, ey = dirVec(bd + off)
-      local qx, qy = P(c.x + ex * 100, c.y + ey * 100)
-      local dx, dy = qx - vx0, qy - vy0
-      -- Halbebene a*X + b*Y + k >= 0 auf der Seite der Halbierenden
-      local a, b = -dy, dx
-      local k = -(a * vx0 + b * vy0)
-      if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
-      HP[#HP + 1] = {a, b, k}
-    end
-    lcd.color(rgb(0, 55, 25))
-    for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
-      local lo, hi = x0, x0 + bw - 1
-      for _, h in ipairs(HP) do
-        local rhs = -(h[2] * yr + h[3])
-        if math.abs(h[1]) < 1e-9 then
-          if rhs > 0 then lo = hi + 1 end
-        elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
-        else hi = math.min(hi, rhs / h[1]) end
-      end
-      if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
-    end
-  end
+  if not done then fillSector(P, c, bd, x0, y0, bw, bh) end
   lcd.color(rgb(0, 110, 50))
   for _, off in ipairs({-45, 45}) do
     local ex, ey = dirVec(bd + off)
@@ -2195,6 +2198,8 @@ local function paintTherm(w, W, H, top)
     local ni = w.tp % 3 + 1
     if T then
       -- Schenkel, Startlinie, Sektorkanten des naechsten TP, Wendepunkte (erledigt grau, naechster gruen)
+      -- aktiver Sektor gefuellt wie in der Eckansicht
+      fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
       lcd.color(rgb(90, 90, 90))
       for i = 1, 3 do
         local a, b = T.tp[i], T.tp[i % 3 + 1]
