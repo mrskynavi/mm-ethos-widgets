@@ -1655,7 +1655,7 @@ local function header(w, W)
   local rest, running = restTime(w)
   if rest then
     local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
-    if running and rest < 0 then rest = 0 end
+    if rest < 0 then rest = 0 end
     drawT(tabW * NP + 4, 1, W, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
   end
   return th + 6
