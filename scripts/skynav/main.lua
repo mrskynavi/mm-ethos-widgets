@@ -1281,14 +1281,11 @@ local function glideCalc(w, f, now, dt)
   end
   local sink = w.polar and polarSink(w.polar, V) or w.sinkAvg
   if sink then g.hFin, g.tFin = f.agl - sink * tRem, tRem end
-  -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan) oder kurz nach dem Erreichen der letzten
+  -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan). Sobald der Sektor erreicht ist,
+  -- zaehlt die naechste Ecke, die Seite ist sofort wieder Gleiten.
   local gs = math.max(f.gs or V, 5)
   g.tCorner = plan.t1 or (g.dV / gs)
-  if g.tCorner < w.zoomSec then g.corner = g.next
-  elseif w.tpT and now - w.tpT < 8 and w.tp > 0 then
-    local c = T.tp[w.tp]
-    if math.sqrt((f.x - c.x) ^ 2 + (f.y - c.y) ^ 2) < gs * w.zoomSec * 1.2 then g.corner = w.tp end
-  end
+  if g.tCorner < w.zoomSec then g.corner = g.next end
   return g
 end
 
@@ -1608,6 +1605,29 @@ local function planeSymbol(cx, cy, size, color)
     math.floor(cx + size * 0.7), math.floor(cy + size * 0.7))
 end
 
+-- Einheitliches Kartenbild auf allen Seiten, das Dreieck dreht nie: wie im Reglement liegt die Hypotenuse
+-- waagrecht unten, rechts = Richtung O -> TP1, oben = Richtung O -> TP2. Liefert Bild-Versatz (y nach unten).
+local function flatXY(T, x, y) return x * T.ux + y * T.uy, -(x * T.px + y * T.py) end
+
+-- Flugzeug an (px,py), Spitze in Bildrichtung des Kurses crs
+local function planeFlat(T, px, py, crs, s, color)
+  local hx, hy = flatXY(T, dirVec(crs or T.dir))
+  local nx, ny = -hy, hx
+  lcd.color(color)
+  tri(px + hx * s, py + hy * s, px - hx * s * 0.7 + nx * s * 0.7, py - hy * s * 0.7 + ny * s * 0.7,
+    px - hx * s * 0.7 - nx * s * 0.7, py - hy * s * 0.7 - ny * s * 0.7)
+end
+
+-- Windpfeil (wohin er blaest) mit Staerke links daneben, im Kartenbild
+local function windFlat(w, T, wx0, wy0, x0)
+  if not w.windOk then return end
+  local sx, sy = flatXY(T, w.wx, w.wy)
+  local n = math.sqrt(sx * sx + sy * sy)
+  lcd.color(C_BLUE)
+  if n > 0.3 then arrow(wx0 - sx / n * 16, wy0 - sy / n * 16, sx / n, sy / n, 32, 4, 8) end
+  drawT(x0, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - x0, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
+end
+
 -- Restzeit der Aufgabe (s): vor dem Start die volle Arbeitszeit, danach ab dem Start
 local function restTime(w)
   local T = w.task
@@ -1726,7 +1746,7 @@ local function paintOver(w, W, H, top)
     return
   end
   -- Bild: rechts = Richtung O -> TP1, oben = Richtung O -> TP2
-  local function R(x, yv) return x * T.ux + yv * T.uy, -(x * T.px + yv * T.py) end
+  local function R(x, yv) return flatXY(T, x, yv) end
   -- Ausschnitt: Dreieck, Linie im Bereich des Dreiecks und das Modell
   local pts = {{0, 0}, {T.tp[1].x, T.tp[1].y}, {T.tp[2].x, T.tp[2].y}, {T.tp[3].x, T.tp[3].y}}
   for i = 1, 3 do local c = T.tp[i]; pts[#pts + 1] = {c.x + c.bx * T.dist * 0.25, c.y + c.by * T.dist * 0.25} end
@@ -1819,24 +1839,11 @@ local function paintOver(w, W, H, top)
   if f then
     local px, py = P(f.x, f.y)
     px, py = clamp(px, mx0 + 6, mx0 + mw - 6), clamp(py, y + 6, y + mh - 6)
-    -- Kurs als Einheitsvektor ins Bild drehen
-    local hx, hy = R(dirVec(f.crs or T.dir))
-    local nx, ny = -hy, hx
-    local s = 8
-    lcd.color(C_WHITE)
-    tri(px + hx * s, py + hy * s, px - hx * s * 0.7 + nx * s * 0.7, py - hy * s * 0.7 + ny * s * 0.7,
-      px - hx * s * 0.7 - nx * s * 0.7, py - hy * s * 0.7 - ny * s * 0.7)
+    planeFlat(T, px, py, f.crs, 8, C_WHITE)
   end
   CLIP = nil
   -- Wind (wohin er blaest), im Bild der Übersicht
-  local wx0, wy0 = mx0 + mw - 26, y + 26
-  if w.windOk then
-    local sx, sy = R(w.wx, w.wy)
-    local n = math.sqrt(sx * sx + sy * sy)
-    lcd.color(C_BLUE)
-    if n > 0.3 then arrow(wx0 - sx / n * 16, wy0 - sy / n * 16, sx / n, sy / n, 32, 4, 8) end
-    drawT(mx0, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - mx0, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
-  end
+  windFlat(w, T, mx0 + mw - 26, y + 26, mx0)
   -- Rechts: was als naechstes kommt und wie der Start war
   local nxtTxt, nxtCol
   if before then nxtTxt, nxtCol = (w.state == S_ARMED and "Start über Linie" or "Scharf stellen"), C_ORANGE
@@ -1895,71 +1902,57 @@ local function paintStart(w, W, H, top)
   local th = drawT(m, y, W - 2 * m, slotTxt, FONT_STD, slotCol, "l")
   drawT(m, y, W - 2 * m, string.format("Arbeitszeit %d min", math.floor(T and T.work or 0)), FONT_S, C_DIM, "r")
   y = y + th + 2
-  -- Links: Draufsicht Linie (waagrecht), TP1 oben
+  -- Links: Draufsicht auf Linie und Dreieck
   local mapW = math.floor(W * 0.42)
   local mapH = H - y - m
-  local cx, cy = m + mapW / 2, y + mapH * 0.42
+  -- Draufsicht im festen Kartenbild (Hypotenuse waagrecht): Linie senkrecht, Startsektor (TP3-Seite) links,
+  -- TP1-Seite rechts, TP2 oben
+  local cx, cy = m + mapW * 0.62, y + mapH / 2
   lcd.color(rgb(20, 20, 20))
   rect(m, y, mapW, mapH)
-  -- Vor dem Start: Seite Linie - TP1 ist die falsche Seite (rot), Startsektor unten
+  -- Vor dem Start: TP1-Seite der Linie ist die falsche Seite (rot)
   local before = w.state ~= S_STARTED and w.state ~= S_STOPPED
   if before then
     lcd.color(rgb(60, 14, 14))
-    rect(m, y, mapW, math.max(1, math.floor(y + mapH * 0.42 - y)))
+    rect(math.floor(cx), y, math.max(1, math.floor(m + mapW - cx)), mapH)
   end
-  local scale = (mapW / 2 - 4) / 1200           -- +-1200 m sichtbar
-  if c and c.dist then scale = math.min(scale, (mapH * 0.5) / math.max(math.abs(c.dist) * 1.15, 200)) end
+  local scale = (mapH / 2 - 4) / 1200           -- +-1200 m entlang der Linie sichtbar
+  if c and c.dist then scale = math.min(scale, (cx - m - 8) / math.max(math.abs(c.dist) * 1.15, 200)) end
+  CLIP = {m, y, m + mapW - 1, y + mapH - 1}
+  -- Dreieck zur Orientierung
+  if T then
+    local d = T.dist * scale
+    lcd.color(C_GRID)
+    line(cx - d, cy, cx + d, cy)
+    line(cx - d, cy, cx, cy - d)
+    line(cx, cy - d, cx + d, cy)
+  end
   -- Linie +-2 km
   lcd.color(C_YELLOW)
-  line(cx - LINE_HALF * scale, cy, cx + LINE_HALF * scale, cy)
-  line(cx - LINE_HALF * scale, cy + 1, cx + LINE_HALF * scale, cy + 1)
+  line(cx, cy - LINE_HALF * scale, cx, cy + LINE_HALF * scale)
+  line(cx + 1, cy - LINE_HALF * scale, cx + 1, cy + LINE_HALF * scale)
+  CLIP = nil
   lcd.color(C_WHITE)
   disc(math.floor(cx), math.floor(cy), 3)
-  drawT(m, y + 2, mapW, "TP1 ^", FONT_XS, C_DIM, "c")
-  drawT(m + 2, cy + 3, mapW, "Linie", FONT_XS, C_YELLOW, "l")
-  if before then drawT(m + 2, cy - textH(FONT_XS) - 2, mapW, "TP1-Seite", FONT_XS, rgb(200, 80, 80), "l") end
-  -- Wind: Pfeil in Windrichtung (wohin er blaest), im Bild mit TP1 oben
+  drawT(math.floor(cx) + 4, y + 2, mapW, "Linie", FONT_XS, C_YELLOW, "l")
+  drawT(m + 2, y + 2, mapW, "Start >", FONT_XS, C_DIM, "l")
+  if before then drawT(math.floor(cx) + 4, y + mapH - textH(FONT_XS) * 2 - 6, m + mapW - cx - 6, "TP1-Seite", FONT_XS, rgb(200, 80, 80), "l") end
+  -- Wind: Pfeil in Windrichtung (wohin er blaest)
   if T then
-    local wx0, wy0 = m + mapW - 26, y + 26
-    if w.windOk then
-      local sdx = w.wx * T.px + w.wy * T.py
-      local sdy = -(w.wx * T.ux + w.wy * T.uy)
-      local n = math.sqrt(sdx * sdx + sdy * sdy)
-      lcd.color(C_BLUE)
-      if n > 0.3 then
-        local ux, uy = sdx / n, sdy / n
-        arrow(wx0 - ux * 16, wy0 - uy * 16, ux, uy, 32, 4, 8)
-      end
-      drawT(m, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - m, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
-    else
-      drawT(m, wy0 - 6, mapW - 4, "Wind ?", FONT_S, C_DIM, "r")
-    end
-  end
-  if T then
-    -- TP3-Richtung unten (Startsektor), TP2 rechts/links je nach Lage
-    local t3 = T.dist * scale
-    lcd.color(C_GRID)
-    line(cx, cy, cx, cy + t3)
+    if w.windOk then windFlat(w, T, m + mapW - 26, y + 26, m)
+    else drawT(m, y + 20, mapW - 4, "Wind ?", FONT_S, C_DIM, "r") end
   end
   if c and f and c.lat then
-    local px, py = cx + c.lat * scale, cy + c.dist * scale
+    local px, py = cx - c.dist * scale, cy - c.lat * scale
     px, py = clamp(px, m + 4, m + mapW - 4), clamp(py, y + 4, y + mapH - 4)
     -- Projektion zur Linie
     if c.predLat then
-      local qx = clamp(cx + c.predLat * scale, m + 2, m + mapW - 2)
+      local qy = clamp(cy - c.predLat * scale, y + 2, y + mapH - 2)
       lcd.color(math.abs(c.predLat) <= LINE_HALF and C_GREEN or C_RED)
-      line(px, py, qx, cy)
-      disc(math.floor(qx), math.floor(cy), 4)
+      line(px, py, cx, qy)
+      disc(math.floor(cx), math.floor(qy), 4)
     end
-    -- Flugzeug in Flugrichtung (Bezug: Linie waagrecht, Kurs relativ zur Richtung TP1)
-    local rel = math.rad((f.crs or T.dir) - T.dir)
-    local s = 8
-    local function rot(dx, dy) return px + dx * math.cos(rel) - dy * math.sin(rel), py + dx * math.sin(rel) + dy * math.cos(rel) end
-    local x1, y1 = rot(0, -s)
-    local x2, y2 = rot(-s * 0.7, s * 0.7)
-    local x3, y3 = rot(s * 0.7, s * 0.7)
-    lcd.color(C_WHITE)
-    tri(math.floor(x1), math.floor(y1), math.floor(x2), math.floor(y2), math.floor(x3), math.floor(y3))
+    planeFlat(T, px, py, f.crs, 8, C_WHITE)
     local dTxt = c.dist >= 0 and string.format("%d m vor Linie", math.floor(c.dist + 0.5)) or string.format("%d m hinter Linie", math.floor(-c.dist + 0.5))
     local dF = SMALL and FONT_S or FONT_L
     drawT(m + 2, y + mapH - textH(dF) - 2, mapW - 4, dTxt, dF, C_WHITE, "l")
@@ -2087,15 +2080,11 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   local span = clamp(d * 1.3, 80, 400)
   local sc = math.min(bw, bh) / 2 / span
   local mx, my = (f.x + c.x) / 2, (f.y + c.y) / 2
-  local hr = math.rad(f.crs or 0)
-  local cs, sn = math.cos(hr), math.sin(hr)
   local cx, cy = x0 + bw / 2, y0 + bh / 2
   CLIP = {x0, y0, x0 + bw - 1, y0 + bh - 1}
   local function P(x, y)
-    local dx, dy = x - mx, y - my
-    local rx = dx * cs - dy * sn
-    local ry = dx * sn + dy * cs
-    return cx + rx * sc, cy - ry * sc
+    local rx, ry = flatXY(T, x - mx, y - my)
+    return cx + rx * sc, cy + ry * sc
   end
   -- Sektor (Kanten +-45 Grad zur Halbierenden); noch nicht erreicht = gefuellt
   local bd = bearingOf(c.bx, c.by)
@@ -2138,21 +2127,10 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   lcd.color(C_YELLOW)
   if inClip(vx, vy) then disc(vx, vy, 4) end
   local ax, ay = P(f.x, f.y)
-  if inClip(ax, ay) then planeSymbol(ax, ay, 8, C_WHITE) end
+  if inClip(ax, ay) then planeFlat(T, ax, ay, f.crs, 8, C_WHITE) end
   CLIP = nil
-  -- Wind: Pfeil (wohin er blaest) im Bild mit Kurs oben, Staerke daneben
-  if w.windOk then
-    local rx = w.wx * cs - w.wy * sn
-    local ry = w.wx * sn + w.wy * cs
-    local n = math.sqrt(rx * rx + ry * ry)
-    local wcx, wcy = x0 + bw - 24, y0 + 24
-    lcd.color(C_BLUE)
-    if n > 0.3 then
-      local ux, uy = rx / n, -ry / n
-      arrow(wcx - ux * 16, wcy - uy * 16, ux, uy, 32, 4, 8)
-    end
-    drawT(x0, wcy - textH(FONT_S) / 2, bw - 50, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
-  end
+  -- Wind: Pfeil (wohin er blaest), Staerke daneben
+  windFlat(w, T, x0 + bw - 24, y0 + 24, x0)
   drawT(x0 + 4, y0 + 2, bw, "TP" .. i .. (done and "  INNEN" or string.format("  %d m", math.floor(d + 0.5))), FONT_STD, done and C_GREEN or C_WHITE, "l")
   drawT(x0, y0 + bh - textH(FONT_XS) - 2, bw - 4, string.format("%d m Raster", math.floor(span)), FONT_XS, C_DIM, "r")
 end
@@ -2346,7 +2324,7 @@ local function paintTherm(w, W, H, top)
     local left = w.startT and (T.work * 60 - (f.clk - w.startT)) or nil
     valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
   end
-  -- Rechts: Kreisbild (Kurs oben) mit Steigen eingefaerbt, Pfeil zum besten Steigen
+  -- Rechts: Kreisbild im festen Kartenbild (Hypotenuse unten), mit Steigen eingefaerbt, Pfeil zum besten Steigen
   local mx0 = lw + m * 2
   local mw = W - mx0 - m
   local mh = H - y - m
@@ -2354,8 +2332,7 @@ local function paintTherm(w, W, H, top)
   rect(mx0, y, mw, mh)
   if f then
     local R = radius(w)
-    local hr = math.rad(f.crs or 0)
-    local cs, sn = math.cos(hr), math.sin(hr)
+    local function Rf(x, yv) if T then return flatXY(T, x, yv) end return x, -yv end
     local cx, cy = mx0 + mw / 2, y + mh / 2
     -- Ausschnitt: ganzes Dreieck (Massstab bleibt beim Kreisen gleich). Liegt das Modell
     -- ausserhalb, rutscht das Dreieck ueber den Rand, das Modell bleibt im Bild.
@@ -2376,15 +2353,15 @@ local function paintTherm(w, W, H, top)
       end
       if dNear > 1 then sc = math.min(sc, 0.8 * math.min(mw, mh) / dNear) end
       local pad = 16
-      local fx = ((f.x - ox) * cs - (f.y - oy) * sn) * sc
-      local fy = -((f.x - ox) * sn + (f.y - oy) * cs) * sc
+      local fx, fy = Rf(f.x - ox, f.y - oy)
+      fx, fy = fx * sc, fy * sc
       cx = cx - (fx - clamp(fx, -mw / 2 + pad, mw / 2 - pad))
       cy = cy - (fy - clamp(fy, -mh / 2 + pad, mh / 2 - pad))
     end
     CLIP = {mx0, y, mx0 + mw - 1, y + mh - 1}
     local function P(x, yv)
-      local dx, dy = x - ox, yv - oy
-      return cx + (dx * cs - dy * sn) * sc, cy - (dx * sn + dy * cs) * sc
+      local rx, ry = Rf(x - ox, yv - oy)
+      return cx + rx * sc, cy + ry * sc
     end
     local ni = w.tp % 3 + 1
     if T then
@@ -2446,17 +2423,18 @@ local function paintTherm(w, W, H, top)
       line(ax0, ay0, bx, by)
     end
     CLIP = nil
-    planeSymbol(ax0, ay0, 8, C_WHITE)
+    if T then planeFlat(T, ax0, ay0, f.crs, 8, C_WHITE) else planeSymbol(ax0, ay0, 8, C_WHITE) end
     if T and w.state == S_STARTED then
       local nxt = T.tp[ni]
       local tx, ty = P(nxt.x, nxt.y)
       if not (tx >= mx0 and tx <= mx0 + mw - 1 and ty >= y and ty <= y + mh - 1) then
         -- naechster TP ausserhalb: gruener Punkt am Rand in seiner Richtung
-        local rel = angDiff(bearingOf(nxt.x - f.x, nxt.y - f.y), f.crs or 0)
-        local ex, ey = dirVec(rel)
+        local ex, ey = tx - (mx0 + mw / 2), ty - (y + mh / 2)
+        local n = math.max(math.sqrt(ex * ex + ey * ey), 1e-3)
+        ex, ey = ex / n, ey / n
         local k = math.min((mw / 2 - 8) / math.max(math.abs(ex), 1e-3), (mh / 2 - 8) / math.max(math.abs(ey), 1e-3))
         lcd.color(C_GREEN)
-        disc(math.floor(mx0 + mw / 2 + ex * k), math.floor(y + mh / 2 - ey * k), 5)
+        disc(math.floor(mx0 + mw / 2 + ex * k), math.floor(y + mh / 2 + ey * k), 5)
       end
       drawT(mx0 + 4, y + 2, mw, string.format("TP%d %d m", ni, math.floor(math.sqrt((nxt.x - f.x) ^ 2 + (nxt.y - f.y) ^ 2) + 0.5)), FONT_S, C_GREEN, "l")
     end
