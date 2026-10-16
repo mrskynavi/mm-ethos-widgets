@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.3
+-- @version 1.4
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -16,6 +16,9 @@
 --   Vario      kompensiert (TE) oder rein barometrisch. Barometrisch: das Widget addiert die
 --              Energiekompensation selbst:  TE = Vario + Faktor * (v/g) * dv/dt
 --              (Faktor in %, Vario-Zeitkonstante gleicht die Traegheit des Varios an)
+--   Motor      optional, Strom oder Drehzahl. Motor an und 6 s danach: keine Auswertung, danach
+--              beginnen Netto, Fahrt und Vario neu. Ohne Sensor: nach mehr als 5 s Steigen ueber
+--              5 m/s (TE) startet Netto neu, sobald das Steigen unter 2 m/s faellt.
 --
 -- Wind (automatisch): Windtabelle nach Hoehe
 --   Kreisfit (Kasa) ueber die GPS-Geschwindigkeitsvektoren der letzten ~28 s: Kreismittelpunkt =
@@ -53,6 +56,9 @@
 
 local KMH = 3.6
 local G = 9.81
+local MOTOR_HOLD = 6.0   -- s nach dem Motor-Stopp ohne Auswertung (Ausleiten), dann Netto neu
+local STRONG_CLIMB = 5.0 -- m/s: so starkes Steigen ueber STRONG_TIME ...
+local STRONG_TIME = 5.0  -- s gilt als Motorsteigflug; danach (TE < 2 m/s) startet Netto neu
 local REDRAW_MIN = 0.3  -- s, kuerzester Abstand zwischen zwei Bildern
 local HEAD_TAU = 2.0   -- s, Glaettung der Gegenwindkomponente (unabhaengig von der Netto-Glaettung)
 local STORE_VER = 5   -- gpsSpd wird am Ende gelesen/geschrieben, deshalb unveraendert
@@ -225,6 +231,16 @@ local function process(w, teRaw, vRaw, dt, now, hRaw)
   w.teSlow = lpf(w.teSlow, teRaw, dt, 4)
 
   -- Netto: Steigen der Luftmasse = TE + Sinken der Polare bei der Fluggeschwindigkeit
+  -- Langes starkes Steigen (Motor ohne Motor-Sensor): danach Netto neu starten, sonst zeigt die
+  -- Glaettung noch ~20 s lang kraeftiges Steigen an.
+  if w.teFast > STRONG_CLIMB then
+    w.strongSince = w.strongSince or now
+    w.strongLast = now
+  elseif w.strongSince and w.teFast < 2 then
+    if w.strongLast - w.strongSince >= STRONG_TIME then w.netto = nil end
+    w.strongSince, w.strongLast = nil, nil
+  end
+
   local nettoInst = w.teFast + polarSink(w.polar, w.vFast)
   w.netto = lpf(w.netto, nettoInst, dt, w.smoothNet)
 
@@ -731,7 +747,7 @@ local function create()
   local w = {
     lastT = nil, lastInvalidate = 0, nextBeep = 0, lastMcChange = nil, mcAnnounced = nil,
     mcUpOn = false, mcDnOn = false, cruise = true, buttons = nil,
-    polarSig = nil, win = {}, wt = {},
+    polarSig = nil, win = {}, wt = {}, motorThr = 3,
   }
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
@@ -803,7 +819,7 @@ local function viewSignature(w)
   local function f(x, fmt) return x and string.format(fmt, x) or "-" end
   local a = w.air and w.air.wind
   return table.concat({
-    tostring(w.valid), tostring(w.cruise), tostring(w.toneState), tostring(w.toneErr), tostring(w.announceErr),
+    tostring(w.valid), tostring(w.motorActive), tostring(w.cruise), tostring(w.toneState), tostring(w.toneErr), tostring(w.announceErr),
     tostring(w.dataNote), f(w.netto, "%.1f"), f(w.teFast, "%.1f"), f(w.vstf and w.vstf * KMH, "%.0f"),
     f(w.vSlow and w.vSlow * KMH, "%.0f"), f(w.dv, "%.0f"), tostring(w.stfLimited), f(w.mcValue, "%.1f"),
     f(w.headwind and w.headwind * KMH, "%.0f"), f(a and a.spd * KMH, "%.0f"), f(a and a.from, "%.0f"),
@@ -882,6 +898,17 @@ local function wakeup(w)
     te, tas, hRaw, note = inputsStep(w, now, dt)
   end
   w.dataNote = note
+
+  -- Motor an (und MOTOR_HOLD s danach): keine Auswertung, alle Filter leer. Danach beginnen
+  -- Netto, Fahrt und Vario neu, ohne das Steigen des Motorsteigflugs mitzuschleppen.
+  local mv = readNumber(w.motor)
+  if mv ~= nil and math.abs(mv) > w.motorThr then w.motorLast = now end
+  w.motorActive = w.motorLast ~= nil and now - w.motorLast < MOTOR_HOLD
+  if w.motorActive then
+    te, tas = nil, nil
+    w.dataNote = "Motor an"
+    w.strongSince, w.strongLast = nil, nil
+  end
 
   local wasCruise = w.cruise
   process(w, te, tas, dt, now, hRaw)
@@ -977,6 +1004,7 @@ local function paint(w)
   local modeText, modeColor = "GLEITEN", GREEN
   if w.valid and not w.cruise then modeText, modeColor = "KREISEN", BLUE end
   if not w.valid then modeText, modeColor = "KEINE DATEN", DIM end
+  if w.motorActive then modeText, modeColor = "MOTOR", ORANGE end
   drawT(0, 3, W, modeText, FONT_S, modeColor, "c")
   local soundOn = w.tone
   local ss = validSource(w.soundSw)
@@ -1276,6 +1304,8 @@ local function configure(w)
     function() return w.announceMode end, function(v) w.announceMode = v end)
 
   -- Modus und Ton
+  addSource(w, "Motor (Strom oder Drehzahl)", "motor")
+  addNumber(w, "Motor an ueber", "motorThr", 0, 20000)
   addSwitch(w, "Modus-Schalter (an = Gleiten)", "modeSw")
   addNumber(w, "Steigen-Schwelle Auto (0.1 m/s)", "climbThr", 1, 30)
   addBool(w, "Ton", "tone")
@@ -1325,6 +1355,9 @@ local function read(w)
   end
   -- spaeter dazugekommen, deshalb am Ende (Ethos-Storage arbeitet nach Aufrufreihenfolge)
   w.gpsSpd = same and validSource(storage.read("gpsSpd")) or nil
+  w.motor = same and validSource(storage.read("motor")) or nil
+  local thr = same and storage.read("motorThr") or nil
+  w.motorThr = (type(thr) == "number") and thr or 3
   w.mcValue = w.mc / 10
   w.polarSig = nil
   w.fileChecked = nil
@@ -1336,6 +1369,8 @@ local function write(w)
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
   for _, d in ipairs(BOOL_DEFS) do storage.write(d.key, w[d.key]) end
   storage.write("gpsSpd", w.gpsSpd)
+  storage.write("motor", w.motor)
+  storage.write("motorThr", w.motorThr)
 end
 
 local function init()
