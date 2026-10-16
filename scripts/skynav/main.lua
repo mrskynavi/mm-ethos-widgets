@@ -2160,17 +2160,73 @@ local function paintTherm(w, W, H, top)
   rect(mx0, y, mw, mh)
   if f then
     local R = radius(w)
-    local span = clamp(R * 2.2, 50, 300)
-    local sc = math.min(mw, mh) / 2 / span
     local hr = math.rad(f.crs or 0)
     local cs, sn = math.cos(hr), math.sin(hr)
     local cx, cy = mx0 + mw / 2, y + mh / 2
+    -- Ausschnitt: ganzes Dreieck (Massstab bleibt beim Kreisen gleich). Liegt das Modell
+    -- ausserhalb, rutscht das Dreieck ueber den Rand, das Modell bleibt im Bild.
+    local ox, oy, sc = f.x, f.y, math.min(mw, mh) / 2 / clamp(R * 2.2, 50, 300)
+    if T then
+      ox = (T.tp[1].x + T.tp[2].x + T.tp[3].x) / 3
+      oy = (T.tp[1].y + T.tp[2].y + T.tp[3].y) / 3
+      local span = 0
+      for i = 1, 3 do span = math.max(span, math.sqrt((T.tp[i].x - ox) ^ 2 + (T.tp[i].y - oy) ^ 2)) end
+      sc = math.min(mw, mh) / 2 / (span * 1.1 + 20)
+      -- weit weg: so weit herauszoomen, dass vom Dreieck noch ein Stueck im Bild bleibt
+      local dNear = math.huge
+      for i = 1, 3 do
+        local a, b = T.tp[i], T.tp[i % 3 + 1]
+        local vx, vy = b.x - a.x, b.y - a.y
+        local u = clamp(((f.x - a.x) * vx + (f.y - a.y) * vy) / (vx * vx + vy * vy), 0, 1)
+        dNear = math.min(dNear, math.sqrt((a.x + u * vx - f.x) ^ 2 + (a.y + u * vy - f.y) ^ 2))
+      end
+      if dNear > 1 then sc = math.min(sc, 0.8 * math.min(mw, mh) / dNear) end
+      local pad = 16
+      local fx = ((f.x - ox) * cs - (f.y - oy) * sn) * sc
+      local fy = -((f.x - ox) * sn + (f.y - oy) * cs) * sc
+      cx = cx - (fx - clamp(fx, -mw / 2 + pad, mw / 2 - pad))
+      cy = cy - (fy - clamp(fy, -mh / 2 + pad, mh / 2 - pad))
+    end
     CLIP = {mx0, y, mx0 + mw - 1, y + mh - 1}
     local function P(x, yv)
-      local dx, dy = x - f.x, yv - f.y
+      local dx, dy = x - ox, yv - oy
       return cx + (dx * cs - dy * sn) * sc, cy - (dx * sn + dy * cs) * sc
     end
-    -- im Luftmassen-System zeichnen (Spur um den Wind zurueckversetzt), dann liegen die Kreise uebereinander
+    local ni = w.tp % 3 + 1
+    if T then
+      -- Schenkel, Startlinie, Sektorkanten des naechsten TP, Wendepunkte (erledigt grau, naechster gruen)
+      lcd.color(rgb(90, 90, 90))
+      for i = 1, 3 do
+        local a, b = T.tp[i], T.tp[i % 3 + 1]
+        local ax, ay = P(a.x, a.y)
+        local bx, by = P(b.x, b.y)
+        line(ax, ay, bx, by)
+      end
+      lcd.color(C_YELLOW)
+      local lh = math.min(LINE_HALF, T.dist * 0.4)
+      local l1x, l1y = P(T.px * lh, T.py * lh)
+      local l2x, l2y = P(-T.px * lh, -T.py * lh)
+      line(l1x, l1y, l2x, l2y)
+      local c = T.tp[ni]
+      local bd = bearingOf(c.bx, c.by)
+      lcd.color(rgb(0, 110, 50))
+      for _, off in ipairs({-45, 45}) do
+        local ex, ey = dirVec(bd + off)
+        local ax, ay = P(c.x, c.y)
+        local bx, by = P(c.x + ex * T.dist * 0.3, c.y + ey * T.dist * 0.3)
+        line(ax, ay, bx, by)
+      end
+      for i = 1, 3 do
+        local tx, ty = P(T.tp[i].x, T.tp[i].y)
+        if inClip(tx, ty) then
+          local nextOne = (w.state == S_STARTED or w.state == S_ARMED) and i == ni
+          lcd.color(nextOne and C_GREEN or C_DIM)
+          disc(tx, ty, nextOne and 5 or 3)
+          if inClip(tx + 30, ty + 14) then drawT(tx + 6, ty - 6, 40, tostring(i), FONT_XS, nextOne and C_GREEN or C_DIM, "l") end
+        end
+      end
+    end
+    -- Spur im Luftmassen-System (um den Wind zurueckversetzt), dann liegen die Kreise uebereinander
     local best, bv, bx0, by0 = nil, -99, 0, 0
     local nowc = os.clock()
     local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
@@ -2186,22 +2242,26 @@ local function paintTherm(w, W, H, top)
         if inClip(ax, ay) then rect(ax - 2, ay - 2, 4, 4) end
       end
     end
+    local ax0, ay0 = P(f.x, f.y)
     if best and bv > 0.3 then
       local bx, by = P(bx0, by0)
       lcd.color(C_RED)
       if inClip(bx, by) then ring(bx, by, 7) end
-      line(cx, cy, bx, by)
+      line(ax0, ay0, bx, by)
     end
     CLIP = nil
-    planeSymbol(cx, cy, 8, C_WHITE)
+    planeSymbol(ax0, ay0, 8, C_WHITE)
     if T and w.state == S_STARTED then
-      local ni = w.tp % 3 + 1
       local nxt = T.tp[ni]
-      local rel = angDiff(bearingOf(nxt.x - f.x, nxt.y - f.y), f.crs or 0)
-      local ex, ey = dirVec(rel)
-      local r0 = math.min(mw, mh) / 2 - 10
-      lcd.color(C_GREEN)
-      disc(math.floor(cx + ex * r0), math.floor(cy - ey * r0), 5)
+      local tx, ty = P(nxt.x, nxt.y)
+      if not (tx >= mx0 and tx <= mx0 + mw - 1 and ty >= y and ty <= y + mh - 1) then
+        -- naechster TP ausserhalb: gruener Punkt am Rand in seiner Richtung
+        local rel = angDiff(bearingOf(nxt.x - f.x, nxt.y - f.y), f.crs or 0)
+        local ex, ey = dirVec(rel)
+        local k = math.min((mw / 2 - 8) / math.max(math.abs(ex), 1e-3), (mh / 2 - 8) / math.max(math.abs(ey), 1e-3))
+        lcd.color(C_GREEN)
+        disc(math.floor(mx0 + mw / 2 + ex * k), math.floor(y + mh / 2 - ey * k), 5)
+      end
       drawT(mx0 + 4, y + 2, mw, string.format("TP%d %d m", ni, math.floor(math.sqrt((nxt.x - f.x) ^ 2 + (nxt.y - f.y) ^ 2) + 0.5)), FONT_S, C_GREEN, "l")
     end
     local wind = w.windOk and string.format("Wind %d km/h aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: noch kein Fit"
