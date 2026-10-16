@@ -42,9 +42,9 @@ local LINE_HALF = 2000
 local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 local PI, TWO_PI = math.pi, 2 * math.pi
 
-local P_START, P_GLIDE, P_THERM, P_EVAL = 1, 2, 3, 4
-local PAGE_NAMES = {"START", "GLEITEN", "THERMIK", "AUSWERTUNG"}
-local PAGE_SHORT = {"START", "GLEIT", "THERM", "WERT"}
+local P_OVER, P_START, P_GLIDE, P_THERM, P_EVAL = 1, 2, 3, 4, 5
+local PAGE_NAMES = {"ÜBERSICHT", "START", "GLEITEN", "THERMIK", "WERTUNG"}
+local PAGE_SHORT = {"ÜBER", "START", "GLEIT", "THERM", "WERT"}
 local S_IDLE, S_ARMED, S_STARTED, S_STOPPED = 0, 1, 2, 3
 
 local TASK_PATHS = {"/scripts/skynav/aufgaben.lua", "scripts/skynav/aufgaben.lua", "aufgaben.lua"}
@@ -789,7 +789,7 @@ end
 
 -- ---------------------------------------------------------------- Zustand
 
-local SOURCE_KEYS = {"gps", "gpsSpd", "gpsAlt", "relAlt", "vario", "swStart", "swGlide", "swTherm", "swEval", "armSw", "soundSw", "mcSrc", "gpsTime"}
+local SOURCE_KEYS = {"gps", "gpsSpd", "gpsAlt", "relAlt", "vario", "swOver", "swStart", "swGlide", "swTherm", "swEval", "armSw", "soundSw", "mcSrc", "gpsTime"}
 local NUM_DEFS = {
   {key = "taskIdx",   def = 0},     -- 0 = in der App als aktiv markierte Aufgabe
   {key = "altMode",   def = 1},     -- 1 = GPS minus Platzhoehe, 2 = relative Hoehe (Sensor)
@@ -859,6 +859,7 @@ local function resetFlight(w)
   w.entry, w.penalty, w.zoneHit, w.altHit = nil, 0, false, false
   w.lastFix, w.lastInStart, w.stopReason = nil, nil, nil
   w.trail, w.ring = {}, {}
+  w.track, w.marks = {}, {}
   w.ref, w.tpT, w.tpPrev = nil, nil, nil
   w.therm = nil
   w.evalScroll = 0
@@ -866,7 +867,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_START, mcValue = 1.0}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1045,6 +1046,11 @@ end
 
 local function event(w, code, f, now)
   w.lastEvent, w.lastEventT = code, now
+  -- Marken fuer die Uebersicht (Start, Wendepunkte, Ziel)
+  if f and f.x and (code == "STA" or code == "TPC" or code == "FIN") then
+    w.marks = w.marks or {}
+    w.marks[#w.marks + 1] = {x = f.x, y = f.y, k = code}
+  end
   if code == "STP" then w.endClk = f and f.clk end
   if code == "PEV" or code == "STA" or code == "TPC" or code == "FIN" or code == "STP" then igcEvent(w, code, f) end
 end
@@ -1081,6 +1087,17 @@ local function assess(w, f, now)
   end
   w.trail[#w.trail + 1] = {x = f.x, y = f.y, v = w.vFast or f.vz, t = now}
   while #w.trail > 0 and now - w.trail[1].t > 70 do table.remove(w.trail, 1) end
+  -- ganzer Flugweg fuer die Uebersicht (ausgeduennt)
+  w.track = w.track or {}
+  local lt = w.track[#w.track]
+  if not lt or now - lt.t > 2 or (f.x - lt.x) ^ 2 + (f.y - lt.y) ^ 2 > 400 then
+    w.track[#w.track + 1] = {x = f.x, y = f.y, t = now, on = w.state == S_STARTED}
+    if #w.track > 3000 then
+      local k = {}
+      for i = 1, #w.track, 2 do k[#k + 1] = w.track[i] end
+      w.track = k
+    end
+  end
   if not T then w.lastFix = f; return end
   local s = f.x * T.ux + f.y * T.uy
   local lat = f.x * T.px + f.y * T.py
@@ -1394,7 +1411,7 @@ end
 
 -- Ein Schalter (mit Stellung) je Seite. Die Seite, deren Schalter zuletzt eingeschaltet wurde, gilt, solange er
 -- eingeschaltet bleibt. Ist keiner ein, waehlt die Automatik bzw. das Tippen auf die Kopfzeile.
-local PAGE_SW = {"swStart", "swGlide", "swTherm", "swEval"}
+local PAGE_SW = {"swOver", "swStart", "swGlide", "swTherm", "swEval"}
 
 local function pageFromSwitch(w, now)
   w.swState = w.swState or {}
@@ -1412,7 +1429,7 @@ local function pageFromSwitch(w, now)
   if any then
     if not (w.swPage and w.swState[w.swPage]) then
       w.swPage = nil
-      for p = 1, 4 do if w.swState[p] then w.swPage = p; break end end
+      for p = 1, #PAGE_SW do if w.swState[p] then w.swPage = p; break end end
     end
     if w.swPage then return w.manual or w.swPage end
   end
@@ -1607,13 +1624,14 @@ local function header(w, W)
   lcd.color(rgb(25, 25, 25))
   rect(0, 0, W, th + 4)
   -- Seiten-Reiter
-  local tabW = math.floor(W * 0.5 / 4)
-  for i = 1, 4 do
+  local NP = #PAGE_NAMES
+  local tabW = math.floor(W * 0.5 / NP)
+  for i = 1, NP do
     local on = (i == w.page)
     if on then lcd.color(rgb(0, 90, 160)); rect((i - 1) * tabW, 0, tabW - 2, th + 4) end
     drawT((i - 1) * tabW, 2, tabW - 2, (W < 600 and PAGE_SHORT or PAGE_NAMES)[i], FONT_XS, on and C_WHITE or C_DIM, "c")
   end
-  w.hdrBox = {x = 0, y = 0, w = tabW * 4, h = th + 4}
+  w.hdrBox = {x = 0, y = 0, w = tabW * NP, h = th + 4}
   -- Status rechts: Zustand, Uhr
   local st, col = "BEREIT", C_DIM
   if not w.task then st, col = "KEINE AUFGABE", C_RED
@@ -1638,7 +1656,7 @@ local function header(w, W)
   if rest then
     local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
     if running and rest < 0 then rest = 0 end
-    drawT(tabW * 4 + 4, 1, W, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+    drawT(tabW * NP + 4, 1, W, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
   end
   return th + 6
 end
@@ -1653,6 +1671,210 @@ local function footerMsg(w, W, H, now)
     lcd.color(rgb(120, 0, 0))
     rect(0, H - h, W, h)
     drawT(0, H - h + 2, W, msg, FONT_S, C_WHITE, "c")
+  end
+end
+
+local fillHP
+-- Sektor eines TP fuellen (Kanten +-45 Grad zur Halbierenden), im Kasten x0,y0,bw,bh
+local function fillSector(P, c, bd, x0, y0, bw, bh)
+  local vx0, vy0 = P(c.x, c.y)
+  local HP = {}
+  local bxs, bys = P(c.x + c.bx * 100, c.y + c.by * 100)
+  for _, off in ipairs({-45, 45}) do
+    local ex, ey = dirVec(bd + off)
+    local qx, qy = P(c.x + ex * 100, c.y + ey * 100)
+    local dx, dy = qx - vx0, qy - vy0
+    -- Halbebene a*X + b*Y + k >= 0 auf der Seite der Halbierenden
+    local a, b = -dy, dx
+    local k = -(a * vx0 + b * vy0)
+    if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
+    HP[#HP + 1] = {a, b, k}
+  end
+  lcd.color(rgb(0, 55, 25))
+  fillHP(HP, x0, y0, bw, bh)
+end
+
+-- Schnittmenge von Halbebenen a*X + b*Y + k >= 0 (Bildschirm) im Kasten fuellen, Farbe vorher setzen
+function fillHP(HP, x0, y0, bw, bh)
+  for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
+    local lo, hi = x0, x0 + bw - 1
+    for _, h in ipairs(HP) do
+      local rhs = -(h[2] * yr + h[3])
+      if math.abs(h[1]) < 1e-9 then
+        if rhs > 0 then lo = hi + 1 end
+      elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
+      else hi = math.min(hi, rhs / h[1]) end
+    end
+    if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
+  end
+end
+
+-- Seite UEBERSICHT: ganzes Dreieck mit Flugweg, TP1 oben (wie auf der Startseite). Vor dem Start ist die
+-- TP1-Seite der Linie rot, danach ist der Sektor des naechsten TP gefuellt wie in der Eckansicht.
+local function paintOver(w, W, H, top)
+  local T, f = w.task, w.cur
+  local m = 6
+  local y = top
+  local mw = SMALL and (W - 2 * m) or math.floor(W * 0.64)
+  local mh = H - y - m
+  local mx0 = m
+  lcd.color(rgb(15, 15, 15))
+  rect(mx0, y, mw, mh)
+  if not T then
+    drawT(mx0, y + mh / 2 - 10, mw, "Keine Aufgabe", FONT_L, C_RED, "c")
+    return
+  end
+  local hr = math.rad(T.dir)
+  local cs, sn = math.cos(hr), math.sin(hr)
+  local function R(x, yv) return x * cs - yv * sn, -(x * sn + yv * cs) end
+  -- Ausschnitt: Dreieck, Linie im Bereich des Dreiecks und das Modell
+  local pts = {{0, 0}, {T.tp[1].x, T.tp[1].y}, {T.tp[2].x, T.tp[2].y}, {T.tp[3].x, T.tp[3].y}}
+  for i = 1, 3 do local c = T.tp[i]; pts[#pts + 1] = {c.x + c.bx * T.dist * 0.25, c.y + c.by * T.dist * 0.25} end
+  if f then pts[#pts + 1] = {f.x, f.y} end
+  local x1, y1, x2, y2 = math.huge, math.huge, -math.huge, -math.huge
+  for _, q in ipairs(pts) do
+    local rx, ry = R(q[1], q[2])
+    x1, y1, x2, y2 = math.min(x1, rx), math.min(y1, ry), math.max(x2, rx), math.max(y2, ry)
+  end
+  local pad = 18
+  local sc = math.min((mw - 2 * pad) / math.max(x2 - x1, 50), (mh - 2 * pad) / math.max(y2 - y1, 50))
+  local ccx, ccy = (x1 + x2) / 2, (y1 + y2) / 2
+  local cx, cy = mx0 + mw / 2, y + mh / 2
+  local function P(x, yv)
+    local rx, ry = R(x, yv)
+    return cx + (rx - ccx) * sc, cy + (ry - ccy) * sc
+  end
+  CLIP = {mx0, y, mx0 + mw - 1, y + mh - 1}
+  local before = w.state ~= S_STARTED and w.state ~= S_STOPPED
+  local ni = w.tp + 1
+  -- Vor dem Start: TP1-Seite der Linie rot (dort darf man nicht herkommen)
+  if before then
+    local ax, ay = P(T.px * 100, T.py * 100)
+    local bx, by = P(-T.px * 100, -T.py * 100)
+    local tx, ty = P(T.ux * 100, T.uy * 100)
+    local a, b = -(by - ay), bx - ax
+    local k = -(a * ax + b * ay)
+    if a * tx + b * ty + k < 0 then a, b, k = -a, -b, -k end
+    lcd.color(rgb(60, 14, 14))
+    fillHP({{a, b, k}}, mx0, y, mw, mh)
+  elseif w.state == S_STARTED and ni <= 3 then
+    fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
+  end
+  -- Sektorkanten aller TP, Schenkel
+  for i = 1, 3 do
+    local c = T.tp[i]
+    local bd = bearingOf(c.bx, c.by)
+    lcd.color((w.state == S_STARTED and i == ni) and rgb(0, 140, 60) or rgb(0, 70, 35))
+    for _, off in ipairs({-45, 45}) do
+      local ex, ey = dirVec(bd + off)
+      local ax, ay = P(c.x, c.y)
+      local bx, by = P(c.x + ex * T.dist * 0.4, c.y + ey * T.dist * 0.4)
+      line(ax, ay, bx, by)
+    end
+  end
+  lcd.color(rgb(90, 90, 90))
+  for i = 1, 3 do
+    local a, b = T.tp[i], T.tp[i % 3 + 1]
+    local ax, ay = P(a.x, a.y)
+    local bx, by = P(b.x, b.y)
+    line(ax, ay, bx, by)
+  end
+  -- Start-/Ziellinie; ist sie das naechste Ziel, doppelt und hell
+  local lineNext = before or (w.state == S_STARTED and ni > 3)
+  local l1x, l1y = P(T.px * LINE_HALF, T.py * LINE_HALF)
+  local l2x, l2y = P(-T.px * LINE_HALF, -T.py * LINE_HALF)
+  lcd.color(lineNext and C_YELLOW or rgb(140, 125, 0))
+  line(l1x, l1y, l2x, l2y)
+  if lineNext then line(l1x, l1y + 1, l2x, l2y + 1) end
+  -- Flugweg: vor dem Start grau, in der Aufgabe weiss
+  local tr = w.track or {}
+  for k = 2, #tr do
+    local a, b = tr[k - 1], tr[k]
+    lcd.color(b.on and C_WHITE or rgb(100, 100, 100))
+    local ax, ay = P(a.x, a.y)
+    local bx, by = P(b.x, b.y)
+    line(ax, ay, bx, by)
+  end
+  -- Marken: Start gelb, Wendepunkt gruen, Runde fertig blau
+  for _, mk in ipairs(w.marks or {}) do
+    local ax, ay = P(mk.x, mk.y)
+    if inClip(ax, ay) then
+      lcd.color(mk.k == "STA" and C_YELLOW or (mk.k == "TPC" and C_GREEN or C_BLUE))
+      disc(ax, ay, 3)
+    end
+  end
+  -- Wendepunkte mit Nummer: naechster gruen, in dieser Runde erledigt dunkelgruen
+  for i = 1, 3 do
+    local tx, ty = P(T.tp[i].x, T.tp[i].y)
+    if inClip(tx, ty) then
+      local nextOne = w.state == S_STARTED and i == ni
+      local done = w.state == S_STARTED and i < ni
+      local col = nextOne and C_GREEN or (done and rgb(0, 120, 50) or C_DIM)
+      lcd.color(col)
+      disc(tx, ty, nextOne and 5 or 3)
+      drawT(tx + 7, ty - 7, 60, "TP" .. i, FONT_XS, col, "l")
+    end
+  end
+  -- Modell in Flugrichtung
+  if f then
+    local px, py = P(f.x, f.y)
+    px, py = clamp(px, mx0 + 6, mx0 + mw - 6), clamp(py, y + 6, y + mh - 6)
+    local rel = math.rad((f.crs or T.dir) - T.dir)
+    local s = 8
+    local function rot(dx, dy) return px + dx * math.cos(rel) - dy * math.sin(rel), py + dx * math.sin(rel) + dy * math.cos(rel) end
+    local ax, ay = rot(0, -s)
+    local bx, by = rot(-s * 0.7, s * 0.7)
+    local qx, qy = rot(s * 0.7, s * 0.7)
+    lcd.color(C_WHITE)
+    tri(ax, ay, bx, by, qx, qy)
+  end
+  CLIP = nil
+  -- Wind (wohin er blaest), im Bild mit TP1 oben
+  local wx0, wy0 = mx0 + mw - 26, y + 26
+  if w.windOk then
+    local sx, sy = R(w.wx, w.wy)
+    local n = math.sqrt(sx * sx + sy * sy)
+    lcd.color(C_BLUE)
+    if n > 0.3 then arrow(wx0 - sx / n * 16, wy0 - sy / n * 16, sx / n, sy / n, 32, 4, 8) end
+    drawT(mx0, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - mx0, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
+  end
+  drawT(mx0 + 4, y + 2, mw, "TP1 ^", FONT_XS, C_DIM, "l")
+  -- Rechts: was als naechstes kommt und wie der Start war
+  local nxtTxt, nxtCol
+  if before then nxtTxt, nxtCol = (w.state == S_ARMED and "Start über Linie" or "Scharf stellen"), C_ORANGE
+  elseif w.state == S_STOPPED then nxtTxt, nxtCol = "Beendet", C_BLUE
+  elseif ni > 3 then nxtTxt, nxtCol = "Ziellinie", C_GREEN
+  else
+    local c = T.tp[ni]
+    nxtTxt, nxtCol = string.format("TP%d  %d m", ni, f and math.floor(math.sqrt((c.x - f.x) ^ 2 + (c.y - f.y) ^ 2) + 0.5) or 0), C_GREEN
+  end
+  if SMALL then
+    drawT(mx0 + 4, y + mh - textH(FONT_S) - 2, mw - 8, nxtTxt .. string.format("   Runden %d", #w.laps), FONT_S, nxtCol, "l")
+    return
+  end
+  local x0 = mx0 + mw + m
+  local cw = W - x0 - m
+  local yy = y
+  yy = yy + valBox(x0, yy, cw, "NÄCHSTES ZIEL", nxtTxt, nxtCol, F_L) + 4
+  local stTxt, stCol = "noch nicht", C_DIM
+  if w.startT then
+    local su = w.startUtc and (math.floor(w.startUtc + (w.utcOffset or 0) * 60) % 86400) or nil
+    stTxt = su and string.format("%02d:%02d:%02d", math.floor(su / 3600), math.floor(su / 60) % 60, su % 60) or "ok"
+    stCol = C_GREEN
+  elseif w.badStartT then stTxt, stCol = "ungültig", C_RED end
+  yy = yy + valBox(x0, yy, cw, "START", stTxt, stCol, FONT_STD) + 4
+  if w.entry then
+    yy = yy + valBox(x0, yy, cw, "EINFLUG", string.format("%d m  %d km/h", math.floor(w.entry.agl + 0.5), math.floor(w.entry.v3d + 0.5)), (w.penalty or 0) > 0 and C_RED or C_WHITE, FONT_STD) + 4
+  end
+  if w.state == S_STARTED or w.state == S_STOPPED then
+    yy = yy + valBox(x0, yy, cw, "STRAFE", tostring(w.penalty or 0), (w.penalty or 0) > 0 and C_RED or C_GREEN, FONT_STD) + 4
+  end
+  local last = w.laps[#w.laps]
+  yy = yy + valBox(x0, yy, cw, "RUNDEN", tostring(#w.laps) .. (last and last.idx and string.format("   Index %.1f %%", last.idx) or ""), C_WHITE, FONT_STD) + 4
+  if w.state == S_STARTED then
+    local tps = {}
+    for i = 1, 3 do tps[#tps + 1] = (i < ni) and ("TP" .. i .. " ok") or ("TP" .. i) end
+    valBox(x0, yy, cw, "DIESE RUNDE", table.concat(tps, "  "), C_WHITE, FONT_S)
   end
 end
 
@@ -1857,35 +2079,6 @@ local function paintStart(w, W, H, top)
 end
 
 -- Eckansicht (Kurs oben), zentriert zwischen Ecke und Flugzeug
--- Sektor eines TP fuellen (Kanten +-45 Grad zur Halbierenden), im Kasten x0,y0,bw,bh
-local function fillSector(P, c, bd, x0, y0, bw, bh)
-  local vx0, vy0 = P(c.x, c.y)
-  local HP = {}
-  local bxs, bys = P(c.x + c.bx * 100, c.y + c.by * 100)
-  for _, off in ipairs({-45, 45}) do
-    local ex, ey = dirVec(bd + off)
-    local qx, qy = P(c.x + ex * 100, c.y + ey * 100)
-    local dx, dy = qx - vx0, qy - vy0
-    -- Halbebene a*X + b*Y + k >= 0 auf der Seite der Halbierenden
-    local a, b = -dy, dx
-    local k = -(a * vx0 + b * vy0)
-    if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
-    HP[#HP + 1] = {a, b, k}
-  end
-  lcd.color(rgb(0, 55, 25))
-  for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
-    local lo, hi = x0, x0 + bw - 1
-    for _, h in ipairs(HP) do
-      local rhs = -(h[2] * yr + h[3])
-      if math.abs(h[1]) < 1e-9 then
-        if rhs > 0 then lo = hi + 1 end
-      elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
-      else hi = math.min(hi, rhs / h[1]) end
-    end
-    if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
-  end
-end
-
 local function paintCorner(w, g, x0, y0, bw, bh)
   local T, f = w.task, w.cur
   local i = g.corner
@@ -2332,7 +2525,8 @@ local function paint(w)
   rect(0, 0, W, H)
   local top = header(w, W)
   w.armBox, w.resetBox, w.mcBox = nil, nil, nil
-  if w.page == P_START then paintStart(w, W, H, top)
+  if w.page == P_OVER then paintOver(w, W, H, top)
+  elseif w.page == P_START then paintStart(w, W, H, top)
   elseif w.page == P_GLIDE then paintGlide(w, W, H, top)
   elseif w.page == P_THERM then paintTherm(w, W, H, top)
   else paintEval(w, W, H, top) end
@@ -2348,8 +2542,8 @@ end
 local function eventHandler(w, category, value, x, y)
   if EVT_TOUCH and category == EVT_TOUCH and (TOUCH_START == nil or value == TOUCH_START) then
     if inside(w.hdrBox, x, y) then
-      local tabW = w.hdrBox.w / 4
-      local p = clamp(math.floor(x / tabW) + 1, 1, 4)
+      local tabW = w.hdrBox.w / #PAGE_NAMES
+      local p = clamp(math.floor(x / tabW) + 1, 1, #PAGE_NAMES)
       w.manual, w.manualFrom, w.page = p, w.autoTarget, p
       lcd.invalidate(); return true
     end
@@ -2427,6 +2621,7 @@ local function configure(w)
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addSource(w, "Vario", "vario")
   -- Seiten
+  addSwitch(w, "Schalter Seite Übersicht", "swOver")
   addSwitch(w, "Schalter Seite Start", "swStart")
   addSwitch(w, "Schalter Seite Gleiten", "swGlide")
   addSwitch(w, "Schalter Seite Thermik", "swTherm")
