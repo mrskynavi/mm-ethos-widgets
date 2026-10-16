@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.2
+-- @version 1.3
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -53,6 +53,7 @@
 
 local KMH = 3.6
 local G = 9.81
+local REDRAW_MIN = 0.3  -- s, kuerzester Abstand zwischen zwei Bildern
 local HEAD_TAU = 2.0   -- s, Glaettung der Gegenwindkomponente (unabhaengig von der Netto-Glaettung)
 local STORE_VER = 5   -- gpsSpd wird am Ende gelesen/geschrieben, deshalb unveraendert
 
@@ -797,6 +798,20 @@ local function inputsStep(w, now, dt)
   return te, tas, air and air.head or nil, note
 end
 
+-- Alles, was paint() anzeigt, gerundet wie angezeigt. Aendert sich davon nichts, bleibt das Bild.
+local function viewSignature(w)
+  local function f(x, fmt) return x and string.format(fmt, x) or "-" end
+  local a = w.air and w.air.wind
+  return table.concat({
+    tostring(w.valid), tostring(w.cruise), tostring(w.toneState), tostring(w.toneErr), tostring(w.announceErr),
+    tostring(w.dataNote), f(w.netto, "%.1f"), f(w.teFast, "%.1f"), f(w.vstf and w.vstf * KMH, "%.0f"),
+    f(w.vSlow and w.vSlow * KMH, "%.0f"), f(w.dv, "%.0f"), tostring(w.stfLimited), f(w.mcValue, "%.1f"),
+    f(w.headwind and w.headwind * KMH, "%.0f"), f(a and a.spd * KMH, "%.0f"), f(a and a.from, "%.0f"),
+    tostring(a and a.meas), f(w.lossM, "%.0f"), tostring(w.lossArmed), tostring(w.mcAnnounced),
+    tostring(w.announceCount), (w.trend and math.abs(w.trend) > 0.5) and (w.trend > 0 and "+" or "v") or "0",
+  }, "|")
+end
+
 local function wakeup(w)
   local now = os.clock()
   local dt = w.lastT and (now - w.lastT) or 0
@@ -889,9 +904,15 @@ local function wakeup(w)
   end
   w.toneState = toneReason(w, now, soundOn)
 
-  if now - w.lastInvalidate >= 0.1 then
-    w.lastInvalidate = now
-    lcd.invalidate()
+  -- Neu zeichnen nur, wenn sich etwas Sichtbares geaendert hat, hoechstens alle REDRAW_MIN s
+  -- (spaetestens alle 2 s). Vorher 10x pro Sekunde, das belastet den Sender unnoetig.
+  if now - w.lastInvalidate >= REDRAW_MIN then
+    local sig = viewSignature(w)
+    if sig ~= w.viewSig or now - w.lastInvalidate >= 2 then
+      w.viewSig = sig
+      w.lastInvalidate = now
+      lcd.invalidate()
+    end
   end
 end
 
