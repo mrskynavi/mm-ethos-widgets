@@ -370,12 +370,21 @@ local function planPath(px, py, wx, wy, V, R, C)
   local acc = 0
   local lx, ly = px, py
   for k = 1, n do
-    acc = acc + math.sqrt((C[k].ax - lx) ^ 2 + (C[k].ay - ly) ^ 2)
-    ts[k] = acc / V
+    -- Startwert mit Grundgeschwindigkeit, damit die Iteration auch bei starkem Wind konvergiert
+    local sx, sy = C[k].ax - lx, C[k].ay - ly
+    local sl = math.sqrt(sx * sx + sy * sy)
+    local gs = V
+    if sl > 1 then
+      local wu = (wx * sx + wy * sy) / sl
+      local disc = wu * wu - (wx * wx + wy * wy) + V * V
+      if disc > 0 then gs = math.max(wu + math.sqrt(disc), 3) end
+    end
+    acc = acc + sl / gs
+    ts[k] = acc
     lx, ly = C[k].ax, C[k].ay
   end
   local res
-  for _ = 1, 3 do
+  for _ = 1, 6 do
     res = {pts = {}}
     local L = 0
     local Z = {}
