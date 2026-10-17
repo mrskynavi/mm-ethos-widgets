@@ -1735,6 +1735,21 @@ local function planeFlat(T, px, py, crs, s, color)
     px - hx * s * 0.7 - nx * s * 0.7, py - hy * s * 0.7 - ny * s * 0.7)
 end
 
+-- Vektor vor dem Flugzeug: wo es mit Kurs und Tempo ueber Grund in PRED_S s ist (Punkt jede Sekunde)
+local function predFlat(P, f, color)
+  if not (f and f.ve and f.vn) then return end
+  local ax, ay = P(f.x, f.y)
+  local bx, by = P(f.x + f.ve * PRED_S, f.y + f.vn * PRED_S)
+  lcd.color(color)
+  line(ax, ay, bx, by)
+  line(ax + 1, ay, bx + 1, by)
+  for k = 1, PRED_S - 1 do
+    local kx, ky = ax + (bx - ax) * k / PRED_S, ay + (by - ay) * k / PRED_S
+    rect(math.floor(kx) - 1, math.floor(ky) - 1, 3, 3)
+  end
+  disc(bx, by, 5)
+end
+
 -- Windpfeil (wohin er blaest) mit Staerke links daneben, im Kartenbild
 local function windFlat(w, T, wx0, wy0, x0)
   if not w.windOk then return end
@@ -1987,6 +2002,8 @@ local function paintOver(w, W, H, top)
   if f then
     local px, py = P(f.x, f.y)
     px, py = clamp(px, mx0 + 6, mx0 + mw - 6), clamp(py, y + 6, y + mh - 6)
+    local fx, fy = P(f.x, f.y)
+    predFlat(function(x, yv) local qx, qy = P(x, yv); return qx + px - fx, qy + py - fy end, f, C_ORANGE)
     planeFlat(T, px, py, f.crs, 8, C_WHITE)
   end
   CLIP = nil
@@ -2275,7 +2292,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   lcd.color(C_YELLOW)
   if inClip(vx, vy) then disc(vx, vy, 4) end
   local ax, ay = P(f.x, f.y)
-  if inClip(ax, ay) then planeFlat(T, ax, ay, f.crs, 8, C_WHITE) end
+  if inClip(ax, ay) then predFlat(P, f, C_ORANGE); planeFlat(T, ax, ay, f.crs, 8, C_WHITE) end
   CLIP = nil
   -- Wind: Pfeil (wohin er blaest), Staerke daneben
   windFlat(w, T, x0 + bw - 24, y0 + 24, x0)
