@@ -1410,15 +1410,54 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
   local c = T.tp[j]
   local ax, ay = c.x + w.margin * c.bx, c.y + w.margin * c.by
   local nxt = T.tp[j % 3 + 1]
-  local outBrg = bearingOf(nxt.x - ax, nxt.y - ay)
   local om = math.deg(V / R)                                       -- Grad pro Sekunde
-  local dt = 10 / om                                               -- Schritt: 10 Grad Kurve
+  local STEP = 5
+  local dt = STEP / om
+  -- Restzeit ab einem Punkt im Sektor mit Steuerkurs h: Kurve (kuerzere Seite, mit Wind) bis auf Kurs zur
+  -- naechsten Ecke, dann gerade bis dorthin. Liefert Zeit und die Punkte der Ausflugkurve.
+  local function exitCost(x, y, h)
+    local t, pts = 0, {}
+    local d = angDiff(bearingOf(nxt.x - x, nxt.y - y), h) > 0 and -1 or 1   -- -1 = rechts
+    for _ = 0, 360 / STEP do
+      local brg = bearingOf(nxt.x - x, nxt.y - y)
+      if math.abs(angDiff(brg, h)) <= STEP then break end
+      local vx, vy = dirVec(h - d * STEP / 2)
+      x, y, t, h = x + (V * vx + wx) * dt, y + (V * vy + wy) * dt, t + dt, h - d * STEP
+      pts[#pts + 1] = {x = x, y = y}
+    end
+    local hx, hy = dirVec(h)
+    local gs = math.max(math.sqrt((V * hx + wx) ^ 2 + (V * hy + wy) ^ 2), 3)
+    return t + math.sqrt((nxt.x - x) ^ 2 + (nxt.y - y) ^ 2) / gs, pts
+  end
+  local function inSec(x, y)
+    local rx, ry = x - c.x, y - c.y
+    local rl = math.sqrt(rx * rx + ry * ry)
+    local dep = rx * c.bx + ry * c.by
+    return rl > 0.1 and dep >= w.margin and dep / rl >= 0.7071
+  end
   local best
+  local function offer(t0, dir, pts, n, ex, ey, h, tTurn)
+    local sx, sy = ex or pts[n].x, ey or pts[n].y
+    local te, epts = exitCost(sx, sy, h)
+    local tt = t0 + te
+    if best and tt >= best.t then return end
+    local P = {}
+    for k = 1, n do P[k] = pts[k] end
+    if ex then P[#P + 1] = {x = ex, y = ey} end
+    for k = 1, #epts do P[#P + 1] = epts[k] end
+    local last = P[#P]
+    best = {t = tt, dir = dir, pts = P, tTurn = tTurn, ex = last.x, ey = last.y}
+  end
   for _, dir in ipairs({1, -1}) do                                 -- 1 = links, -1 = rechts
     local x, y, h, t = f.x, f.y, f.hdg, 0
     local pts = {{x = x, y = y}}
-    for _ = 0, 36 do
-      -- gerade zum Zielpunkt: Grundgeschwindigkeit s entlang u mit |s*u - W| = V
+    for _ = 0, 360 / STEP do
+      -- a) schon in der Kurve im Sektor: Wende hier fertig
+      if t > 0 and inSec(x, y) then
+        offer(t, dir, pts, #pts, nil, nil, h, t)
+        break
+      end
+      -- b) gerade zum Zielpunkt: Grundgeschwindigkeit s entlang u mit |s*u - W| = V
       local gx, gy = ax - x, ay - y
       local D = math.sqrt(gx * gx + gy * gy)
       if D > 1 then
@@ -1428,28 +1467,20 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
         if disc > 0 then
           local sg = wu + math.sqrt(disc)
           local hReq = bearingOf(sg * ux - wx, sg * uy - wy)       -- noetiger Steuerkurs in der Luft
-          if sg > 1 and math.abs(angDiff(hReq, h)) <= 10 then
-            local tt = t + D / sg + math.abs(angDiff(outBrg, bearingOf(ux, uy))) / om
-            if not best or tt < best.t then
-              local P = {}
-              for k = 1, #pts do P[k] = pts[k] end
-              P[#P + 1] = {x = ax, y = ay}
-              best = {t = tt, dir = dir, pts = P, tTurn = t}
-            end
+          if sg > 1 and math.abs(angDiff(hReq, h)) <= STEP then
+            offer(t + D / sg, dir, pts, #pts, ax, ay, hReq, t)
           end
         end
       end
-      -- 10 Grad weiter drehen (in der Luft), Bodenpunkt mit Wind
-      local h1 = h - dir * 10
-      local hm = h - dir * 5
-      local vx, vy = dirVec(hm)
-      x, y, t, h = x + (V * vx + wx) * dt, y + (V * vy + wy) * dt, t + dt, h1
+      -- STEP Grad weiter drehen (in der Luft), Bodenpunkt mit Wind
+      local vx, vy = dirVec(h - dir * STEP / 2)
+      x, y, t, h = x + (V * vx + wx) * dt, y + (V * vy + wy) * dt, t + dt, h - dir * STEP
       pts[#pts + 1] = {x = x, y = y}
     end
   end
   if not best then return nil end
   -- weiter zur naechsten Ecke wie sonst geplant
-  local rest = planPath(ax, ay, wx, wy, V, R, cornersFrom(T, j % 3 + 1, 2, radiusFn(w), w.margin))
+  local rest = planPath(best.ex, best.ey, wx, wy, V, R, cornersFrom(T, j % 3 + 1, 2, radiusFn(w), w.margin))
   for k = 2, #(rest.pts or {}) do best.pts[#best.pts + 1] = rest.pts[k] end
   return {pts = best.pts, inTurn = best.tTurn > 0, turnDir = best.dir, hdg = (f.hdg - best.dir * 90) % 360,
     tT = 0, dT = 0, t1 = best.t, tAll = best.t + (rest.tAll or 0), missed = true}
