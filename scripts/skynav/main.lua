@@ -926,6 +926,7 @@ local function resetFlight(w)
   w.state = S_IDLE
   w.flying, w.landedT, w.slowSince = false, nil, nil
   w.tp, w.laps, w.startT, w.startUtc, w.lapT = 0, {}, nil, nil, nil
+  w.cornerHold, w.badEntry = nil, nil
   w.entry, w.penalty, w.zoneHit, w.altHit = nil, 0, false, false
   w.lastFix, w.lastInStart, w.stopReason = nil, nil, nil
   w.trail, w.ring = {}, {}
@@ -1206,6 +1207,7 @@ local function event(w, code, f, now)
     w.marks = w.marks or {}
     w.marks[#w.marks + 1] = {x = f.x, y = f.y, k = code}
   end
+  if code == "STA" or code == "TPC" or code == "FIN" then w.cornerHold = nil end   -- Sektor erreicht
   if code == "STP" then w.endClk = f and f.clk end
   if code == "PEV" or code == "STA" or code == "TPC" or code == "FIN" or code == "STP" then igcEvent(w, code, f) end
 end
@@ -1401,6 +1403,58 @@ end
 
 -- ---------------------------------------------------------------- Seite GLEITEN: Sollfahrt + Weg
 
+-- Ecke geschnitten: schnellste Wende zurueck in den Sektor. Rechnet Links- und Rechtskurve (Radius R in der
+-- Luft, mit Wind versetzt) und je den geraden Weg zum Zielpunkt im Sektor; dazu die Kurve, die am Zielpunkt
+-- noch bis zum Kurs auf die naechste Ecke fehlt. Liefert einen Plan wie planPath (pts, hdg, inTurn, turnDir).
+local function missPlan(w, f, T, j, wx, wy, V, R)
+  local c = T.tp[j]
+  local ax, ay = c.x + w.margin * c.bx, c.y + w.margin * c.by
+  local nxt = T.tp[j % 3 + 1]
+  local outBrg = bearingOf(nxt.x - ax, nxt.y - ay)
+  local om = math.deg(V / R)                                       -- Grad pro Sekunde
+  local dt = 10 / om                                               -- Schritt: 10 Grad Kurve
+  local best
+  for _, dir in ipairs({1, -1}) do                                 -- 1 = links, -1 = rechts
+    local x, y, h, t = f.x, f.y, f.hdg, 0
+    local pts = {{x = x, y = y}}
+    for _ = 0, 36 do
+      -- gerade zum Zielpunkt: Grundgeschwindigkeit s entlang u mit |s*u - W| = V
+      local gx, gy = ax - x, ay - y
+      local D = math.sqrt(gx * gx + gy * gy)
+      if D > 1 then
+        local ux, uy = gx / D, gy / D
+        local wu = wx * ux + wy * uy
+        local disc = wu * wu - (wx * wx + wy * wy) + V * V
+        if disc > 0 then
+          local sg = wu + math.sqrt(disc)
+          local hReq = bearingOf(sg * ux - wx, sg * uy - wy)       -- noetiger Steuerkurs in der Luft
+          if sg > 1 and math.abs(angDiff(hReq, h)) <= 10 then
+            local tt = t + D / sg + math.abs(angDiff(outBrg, bearingOf(ux, uy))) / om
+            if not best or tt < best.t then
+              local P = {}
+              for k = 1, #pts do P[k] = pts[k] end
+              P[#P + 1] = {x = ax, y = ay}
+              best = {t = tt, dir = dir, pts = P, tTurn = t}
+            end
+          end
+        end
+      end
+      -- 10 Grad weiter drehen (in der Luft), Bodenpunkt mit Wind
+      local h1 = h - dir * 10
+      local hm = h - dir * 5
+      local vx, vy = dirVec(hm)
+      x, y, t, h = x + (V * vx + wx) * dt, y + (V * vy + wy) * dt, t + dt, h1
+      pts[#pts + 1] = {x = x, y = y}
+    end
+  end
+  if not best then return nil end
+  -- weiter zur naechsten Ecke wie sonst geplant
+  local rest = planPath(ax, ay, wx, wy, V, R, cornersFrom(T, j % 3 + 1, 2, radiusFn(w), w.margin))
+  for k = 2, #(rest.pts or {}) do best.pts[#best.pts + 1] = rest.pts[k] end
+  return {pts = best.pts, inTurn = best.tTurn > 0, turnDir = best.dir, hdg = (f.hdg - best.dir * 90) % 360,
+    tT = 0, dT = 0, t1 = best.t, tAll = best.t + (rest.tAll or 0), missed = true}
+end
+
 local function glideCalc(w, f, now, dt)
   local T = w.task
   local g = {}
@@ -1425,6 +1479,16 @@ local function glideCalc(w, f, now, dt)
   local C = cornersFrom(T, w.tp + 1, 3, radiusFn(w), w.margin)
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
   local plan = planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C, f.hdg)
+  -- Ecke geschnitten (Eckansicht lief, Zielpunkt liegt jetzt hinter dem Modell): schnellste Wende rechnen
+  local j = w.tp + 1
+  if w.tp < 3 and w.cornerHold == j and f.hdg and f.ve then
+    local c = T.tp[j]
+    local ax, ay = c.x + w.margin * c.bx, c.y + w.margin * c.by
+    local dd = math.sqrt((ax - f.x) ^ 2 + (ay - f.y) ^ 2)
+    if dd < 400 and (ax - f.x) * f.ve + (ay - f.y) * f.vn < 0 then
+      plan = missPlan(w, f, T, j, wx, wy, w.tasF or f.tas or 20, radius(w, j)) or plan
+    end
+  end
   g.plan, g.R, g.C = plan, R, C
   if f.hdg then g.err = angDiff(plan.hdg, f.hdg) end   -- positiv = rechts drehen
   if w.ref then
@@ -1461,7 +1525,10 @@ local function glideCalc(w, f, now, dt)
   -- zaehlt die naechste Ecke, die Seite ist sofort wieder Gleiten.
   local gs = math.max(f.gs or V, 5)
   g.tCorner = plan.t1 or (g.dV / gs)
-  if g.tCorner < w.zoomSec then g.corner = g.next end
+  if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
+  -- Ecke geschnitten (Sektor verpasst): Eckansicht bleibt, bis der Sektor erreicht ist (dann wechselt g.next)
+  -- oder man sich mehr als 400 m vom TP entfernt hat
+  if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
   return g
 end
 
@@ -2399,6 +2466,10 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   -- Wind: Pfeil (wohin er blaest), Staerke daneben
   windFlat(w, T, x0 + bw - 24, y0 + 24, x0)
   drawT(x0 + 4, y0 + 2, bw, "TP" .. i .. (done and "  INNEN" or string.format("  %d m", math.floor(d + 0.5))), FONT_STD, done and C_GREEN or C_WHITE, "l")
+  if g.plan and g.plan.turnDir then
+    -- Ecke geschnitten: schnellste Wende zurueck in den Sektor
+    drawT(x0 + 4, y0 + 2 + textH(FONT_STD), bw, g.plan.turnDir > 0 and "VERPASST: < LINKS WENDEN" or "VERPASST: RECHTS WENDEN >", FONT_STD, C_ORANGE, "l")
+  end
   drawT(x0, y0 + bh - textH(FONT_XS) - 2, bw - 4, string.format("%d m Raster", math.floor(span)), FONT_XS, C_DIM, "r")
 end
 
@@ -2467,7 +2538,8 @@ local function paintGlide(w, W, H, top)
     local err = g.err or 0
     local a = math.abs(err)
     local cmd, col
-    if g.plan.inTurn then cmd, col = "KURVE", C_BLUE
+    if g.plan.turnDir then cmd, col = g.plan.turnDir > 0 and "< KURVE LINKS" or "KURVE RECHTS >", C_ORANGE
+    elseif g.plan.inTurn then cmd, col = "KURVE", C_BLUE
     elseif a < 5 then cmd, col = "KURS OK", C_GREEN
     elseif err > 0 then cmd, col = string.format("%d° RECHTS >", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE
     else cmd, col = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE end
