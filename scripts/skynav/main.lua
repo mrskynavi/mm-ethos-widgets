@@ -1654,15 +1654,6 @@ local function header(w, W)
   local th = math.max(textH(FONT_S), textH(FONT_STD))
   lcd.color(rgb(25, 25, 25))
   rect(0, 0, W, th + 4)
-  -- Seiten-Reiter
-  local NP = #PAGE_NAMES
-  local tabW = math.floor(W * 0.5 / NP)
-  for i = 1, NP do
-    local on = (i == w.page)
-    if on then lcd.color(rgb(0, 90, 160)); rect((i - 1) * tabW, 0, tabW - 2, th + 4) end
-    drawT((i - 1) * tabW, 2, tabW - 2, (W < 600 and PAGE_SHORT or PAGE_NAMES)[i], FONT_XS, on and C_WHITE or C_DIM, "c")
-  end
-  w.hdrBox = {x = 0, y = 0, w = tabW * NP, h = th + 4}
   -- Status rechts: Zustand, Uhr
   local st, col = "BEREIT", C_DIM
   if not w.task then st, col = "KEINE AUFGABE", C_RED
@@ -1681,15 +1672,32 @@ local function header(w, W)
     clock = string.format("%02d:%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60, ls % 60)
   end
   clock = clock .. (gpsClock(w) and "" or "*")
-  drawT(W * 0.5, 2, W * 0.5 - 6, st .. "  " .. clock, FONT_S, col, "r")
-  -- Restzeit prominent gleich nach den Reitern
+  drawT(W * 0.4, 2, W * 0.6 - 6, st .. "  " .. clock, FONT_S, col, "r")
+  -- Restzeit prominent links
   local rest, running = restTime(w)
   if rest then
     local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
     if rest < 0 then rest = 0 end
-    drawT(tabW * NP + 4, 1, W, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+    drawT(6, 1, W * 0.5, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
   end
   return th + 6
+end
+
+-- Seiten-Reiter am unteren Rand (wie im Jeti-Entwurf). Liefert die nutzbare Hoehe darueber.
+local function tabBar(w, W, H)
+  local tb = textH(FONT_S) + 8
+  local y0 = H - tb
+  lcd.color(rgb(25, 25, 25))
+  rect(0, y0, W, tb)
+  local NP = #PAGE_NAMES
+  local tabW = math.floor(W / NP)
+  for i = 1, NP do
+    local on = (i == w.page)
+    if on then lcd.color(rgb(0, 90, 160)); rect((i - 1) * tabW, y0, tabW - 2, tb) end
+    drawT((i - 1) * tabW, y0 + 4, tabW - 2, (W < 600 and PAGE_SHORT or PAGE_NAMES)[i], FONT_S, on and C_WHITE or C_DIM, "c")
+  end
+  w.hdrBox = {x = 0, y = y0, w = tabW * NP, h = tb}
+  return y0 - 2
 end
 
 local function footerMsg(w, W, H, now)
@@ -2535,6 +2543,7 @@ local function paint(w)
   lcd.color(C_BG)
   rect(0, 0, W, H)
   local top = header(w, W)
+  H = tabBar(w, W, H)
   w.armBox, w.resetBox, w.mcBox = nil, nil, nil
   if w.page == P_OVER then paintOver(w, W, H, top)
   elseif w.page == P_START then paintStart(w, W, H, top)
