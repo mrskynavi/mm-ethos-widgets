@@ -1486,9 +1486,7 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
     tT = 0, dT = 0, t1 = best.t, tAll = best.t + (rest.tAll or 0), missed = true}
 end
 
-local function glideCalc(w, f, now, dt)
-  local T = w.task
-  local g = {}
+local function nettoCalc(w, f, dt)
   -- Sollfahrt wie Widget Sollfahrt (gleiche Glaettung wie dessen Standard: Vario und Fahrt 2 s,
   -- Netto 8 s), damit beide Widgets bei gleichem MC und Wind dieselbe Sollfahrt zeigen
   if w.polar and f and f.tas and f.tas * KMH > 15 and w.varioRaw ~= nil then
@@ -1505,7 +1503,23 @@ local function glideCalc(w, f, now, dt)
   end
   -- mittleres Sinken im Geradeausflug (Ersatz, wenn keine Polare da ist)
   if f and f.vz and not w.therm and (w.omega or 0) < math.rad(8) then w.sinkAvg = lpf(w.sinkAvg, -f.vz, dt, 20) end
+end
+
+-- Weg, Querablage, Ankunftshoehe. Laeuft nur bei einem neuen GPS-Fix. full = eine sichtbare Seite zeigt den
+-- Weg (Gleiten, Uebersicht, Start nach dem Start); sonst nur Distanz und Zeit zur Ecke fuer die Eckansicht.
+local function glideCalc(w, f, full)
+  local T = w.task
+  local g = {}
   if not T or not f or w.state ~= S_STARTED then return g end
+  if not full then
+    g.next = w.tp % 3 + 1
+    local nxt = T.tp[g.next]
+    g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
+    g.tCorner = g.dV / math.max(f.gs or w.tasF or f.tas or 20, 5)
+    if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
+    if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
+    return g
+  end
   local R = radius(w, w.tp + 1)
   local C = cornersFrom(T, w.tp + 1, 3, radiusFn(w), w.margin)
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
@@ -1789,8 +1803,20 @@ local function wakeup(w)
   if w.closeAt and now >= w.closeAt then w.closeAt = nil; igcClose(w) end
 
   w.page = pageFromSwitch(w, now)
-  w.sc = startCalc(w, cur)
-  w.gc = glideCalc(w, cur, now, dt)
+  -- Schwere Rechnung nur bei neuem GPS-Fix (oder Seitenwechsel) und nur fuer die sichtbare Seite.
+  -- Wertung, IGC, Ereignistoene, Kreiserkennung und Netto laufen immer.
+  local pg = w.page
+  local redo = f ~= nil or not cur or pg ~= w.calcPage
+  w.calcPage = pg
+  if pg == P_START then
+    if redo then w.sc = startCalc(w, cur) end
+  else
+    w.sc = nil
+  end
+  nettoCalc(w, cur, dt)
+  if redo then
+    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START)
+  end
   thermCalc(w, cur, now, dt)
 
   -- Ereignistoene (nur auf der passenden Seite, ausser "Ereignisse immer melden")
