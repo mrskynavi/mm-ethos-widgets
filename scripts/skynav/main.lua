@@ -2086,6 +2086,77 @@ function fillHP(HP, x0, y0, bw, bh)
   end
 end
 
+-- Sicherheitszonen: Rahmen, gefuellt wenn das Modell mit dem jetzigen Steigen/Sinken beim Erreichen der Zone
+-- (gerade, mit Grundgeschwindigkeit) in ihrem Hoehenband ist. P = Kartenprojektion, Kasten fuer die Fuellung.
+local function drawZones(w, T, P, x0, y0, bw, bh)
+  if not T or #T.zones == 0 then return end
+  local f = w.cur
+  for _, z in ipairs(T.zones) do
+    local hot = false
+    if f then
+      local d
+      if z.t == "C" then d = math.max(math.sqrt((f.x - z.x) ^ 2 + (f.y - z.y) ^ 2) - z.r, 0)
+      else
+        local ux, uy = dirVec(z.dir)
+        local dx, dy = f.x - z.x, f.y - z.y
+        local a = math.max(math.abs(dx * ux + dy * uy) - z.len / 2, 0)
+        local b = math.max(math.abs(dx * uy - dy * ux) - z.wid / 2, 0)
+        d = math.sqrt(a * a + b * b)
+      end
+      local t = math.min(d / math.max(f.gs or 10, 5), 120)
+      local h = f.agl + (f.vz or 0) * t
+      hot = h >= z.lo and h <= z.hi
+    end
+    if z.t == "C" then
+      local zx, zy = P(z.x, z.y)
+      local ex, ey = P(z.x + z.r, z.y)
+      local r = math.sqrt((ex - zx) ^ 2 + (ey - zy) ^ 2)
+      if hot then
+        lcd.color(rgb(120, 20, 20))
+        for yr = math.floor(math.max(zy - r, y0)), math.floor(math.min(zy + r, y0 + bh - 1)), 2 do
+          local hw = math.sqrt(math.max(r * r - (yr - zy) ^ 2, 0))
+          local lo, hi = math.max(zx - hw, x0), math.min(zx + hw, x0 + bw - 1)
+          if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
+        end
+      end
+      lcd.color(rgb(230, 60, 60))
+      local n = 28
+      local px, py = zx + r, zy
+      for k = 1, n do
+        local a = 2 * math.pi * k / n
+        local qx, qy = zx + r * math.cos(a), zy + r * math.sin(a)
+        line(px, py, qx, qy)
+        px, py = qx, qy
+      end
+    else
+      local ux, uy = dirVec(z.dir)
+      local vx, vy = uy, -ux
+      local L, Wd = z.len / 2, z.wid / 2
+      local c = {}
+      for _, sgn in ipairs({{1, 1}, {1, -1}, {-1, -1}, {-1, 1}}) do
+        local qx, qy = P(z.x + ux * L * sgn[1] + vx * Wd * sgn[2], z.y + uy * L * sgn[1] + vy * Wd * sgn[2])
+        c[#c + 1] = {qx, qy}
+      end
+      if hot then
+        local mxs, mys = 0, 0
+        for _, q in ipairs(c) do mxs, mys = mxs + q[1] / 4, mys + q[2] / 4 end
+        local HP = {}
+        for k = 1, 4 do
+          local a1, a2 = c[k], c[k % 4 + 1]
+          local a, b = -(a2[2] - a1[2]), a2[1] - a1[1]
+          local kk = -(a * a1[1] + b * a1[2])
+          if a * mxs + b * mys + kk < 0 then a, b, kk = -a, -b, -kk end
+          HP[#HP + 1] = {a, b, kk}
+        end
+        lcd.color(rgb(120, 20, 20))
+        fillHP(HP, x0, y0, bw, bh)
+      end
+      lcd.color(rgb(230, 60, 60))
+      for k = 1, 4 do local a1, a2 = c[k], c[k % 4 + 1]; line(a1[1], a1[2], a2[1], a2[2]) end
+    end
+  end
+end
+
 -- Seite UEBERSICHT: ganzes Dreieck mit Flugweg, flach wie im Reglement (Hypotenuse unten, TP3 links, TP1 rechts,
 -- TP2 oben, Linie senkrecht durch den Ursprung). Vor dem Start ist die
 -- TP1-Seite der Linie rot, danach ist der Sektor des naechsten TP gefuellt wie in der Eckansicht.
@@ -2152,6 +2223,7 @@ local function paintOver(w, W, H, top)
   elseif w.state == S_STARTED and ni <= 3 then
     fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
   end
+  drawZones(w, T, P, mx0, y, mw, mh)
   -- Sektorkanten aller TP, Schenkel
   for i = 1, 3 do
     local c = T.tp[i]
@@ -2309,6 +2381,7 @@ local function paintStart(w, W, H, top)
   local scale = (cx - m - 4) / w.startSpan
   CLIP = {m, y, m + mapW - 1, y + mapH - 1}
   if T then
+    drawZones(w, T, function(x, yv) local a, b = flatXY(T, x, yv); return cx + a * scale, cy + b * scale end, m, y, mapW, mapH)
     local d = T.dist * scale
     lcd.color(C_GRID)
     line(cx - d, cy, cx + d, cy)
@@ -2514,6 +2587,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   local bd = bearingOf(c.bx, c.by)
   local done = w.tp > 0 and i <= w.tp
   if not done then fillSector(P, c, bd, x0, y0, bw, bh) end
+  drawZones(w, T, P, x0, y0, bw, bh)
   lcd.color(rgb(0, 110, 50))
   for _, off in ipairs({-45, 45}) do
     local ex, ey = dirVec(bd + off)
@@ -2812,6 +2886,7 @@ local function paintTherm(w, W, H, top)
       -- Schenkel, Startlinie, Sektorkanten des naechsten TP, Wendepunkte (erledigt grau, naechster gruen)
       -- aktiver Sektor gefuellt wie in der Eckansicht
       fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
+      drawZones(w, T, P, mx0, y, mw, mh)
       lcd.color(rgb(90, 90, 90))
       for i = 1, 3 do
         local a, b = T.tp[i], T.tp[i % 3 + 1]
