@@ -1872,6 +1872,19 @@ end
 -- Seite UEBERSICHT: ganzes Dreieck mit Flugweg, flach wie im Reglement (Hypotenuse unten, TP3 links, TP1 rechts,
 -- TP2 oben, Linie senkrecht durch den Ursprung). Vor dem Start ist die
 -- TP1-Seite der Linie rot, danach ist der Sektor des naechsten TP gefuellt wie in der Eckansicht.
+-- Optimale Runde vor dem Start (Ursprung -> TP1 -> TP2 -> TP3 -> Ursprung), alle 2 s neu gerechnet
+local function lapRoute(w, T)
+  local nowc = os.clock()
+  if not w.ovPlan or nowc - (w.ovPlanT or 0) > 2 then
+    local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w, 1), cornersFrom(T, 1, 3, radiusFn(w), w.margin))
+    local pts = {}
+    for _, q in ipairs(pr.pts or {}) do pts[#pts + 1] = q end
+    pts[#pts + 1] = {x = 0, y = 0}
+    w.ovPlan, w.ovPlanT = pts, nowc
+  end
+  return w.ovPlan
+end
+
 local function paintOver(w, W, H, top)
   local T, f = w.task, w.cur
   local m = 6
@@ -1951,15 +1964,7 @@ local function paintOver(w, W, H, top)
   local route
   if w.state == S_STARTED and w.gc and w.gc.plan then route = w.gc.plan.pts
   elseif before then
-    local nowc = os.clock()
-    if not w.ovPlan or nowc - (w.ovPlanT or 0) > 2 then
-      local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w, 1), cornersFrom(T, 1, 3, radiusFn(w), w.margin))
-      local pts = {}
-      for _, q in ipairs(pr.pts or {}) do pts[#pts + 1] = q end
-      pts[#pts + 1] = {x = 0, y = 0}
-      w.ovPlan, w.ovPlanT = pts, nowc
-    end
-    route = w.ovPlan
+    route = lapRoute(w, T)
   end
   if route then
     lcd.color(C_BLUE)
@@ -2072,7 +2077,7 @@ local function paintStart(w, W, H, top)
   local mapH = H - y - m
   -- Draufsicht im festen Kartenbild (Hypotenuse waagrecht): Linie senkrecht, Startsektor (TP3-Seite) links,
   -- TP1-Seite rechts, TP2 oben
-  local cx, cy = m + mapW * 0.62, y + mapH / 2
+  local cx, cy = m + mapW * 0.5, y + mapH * 0.72
   lcd.color(rgb(20, 20, 20))
   rect(m, y, mapW, mapH)
   -- Vor dem Start: TP1-Seite der Linie ist die falsche Seite (rot)
@@ -2081,16 +2086,25 @@ local function paintStart(w, W, H, top)
     lcd.color(rgb(60, 14, 14))
     rect(math.floor(cx), y, math.max(1, math.floor(m + mapW - cx)), mapH)
   end
-  local scale = (mapH / 2 - 4) / 1200           -- +-1200 m entlang der Linie sichtbar
-  if c and c.dist then scale = math.min(scale, (cx - m - 8) / math.max(math.abs(c.dist) * 1.15, 200)) end
+  -- Massstab: das ganze Dreieck fuellt die Karte (Modell weiter weg bleibt am Rand)
+  local scale = T and math.min((mapW / 2 - 10) / (T.dist * 1.08), (cy - y - 10) / (T.dist * 1.05)) or ((mapH / 2 - 4) / 1200)
   CLIP = {m, y, m + mapW - 1, y + mapH - 1}
-  -- Dreieck zur Orientierung
   if T then
     local d = T.dist * scale
     lcd.color(C_GRID)
     line(cx - d, cy, cx + d, cy)
     line(cx - d, cy, cx, cy - d)
     line(cx, cy - d, cx + d, cy)
+    -- optimale Runde (blau): zeigt vor dem Start, wo man von TP3 her durch die Linie zu TP1 fliegt
+    local route = before and lapRoute(w, T) or (w.gc and w.gc.plan and w.gc.plan.pts)
+    if route then
+      lcd.color(C_BLUE)
+      for k = 2, #route do
+        local ax, ay = flatXY(T, route[k - 1].x, route[k - 1].y)
+        local bx, by = flatXY(T, route[k].x, route[k].y)
+        line(cx + ax * scale, cy + ay * scale, cx + bx * scale, cy + by * scale)
+      end
+    end
   end
   -- Linie +-2 km
   lcd.color(C_YELLOW)
@@ -2118,7 +2132,10 @@ local function paintStart(w, W, H, top)
       disc(math.floor(cx), math.floor(qy), 4)
     end
     planeFlat(T, px, py, f.crs, 8, C_WHITE)
-    local dTxt = c.dist >= 0 and string.format("%d m vor Linie", math.floor(c.dist + 0.5)) or string.format("%d m hinter Linie", math.floor(-c.dist + 0.5))
+    -- Zeit bis zur Linie mit der aktuellen Geschwindigkeit (beim Anflug die Annaeherung an die Linie)
+    local secs = (c.dist >= 0 and c.tLine) or math.abs(c.dist) / math.max(f.gs or 0, 1)
+    local dTxt = c.dist >= 0 and (c.tLine and string.format("%d s bis Linie", math.floor(secs + 0.5)) or "fliegt weg")
+      or string.format("%d s hinter Linie", math.floor(secs + 0.5))
     local dF = SMALL and FONT_S or FONT_L
     drawT(m + 2, y + mapH - textH(dF) - 2, mapW - 4, dTxt, dF, C_WHITE, "l")
     if before and c.dist < 0 then
