@@ -49,6 +49,9 @@ local S_IDLE, S_ARMED, S_STARTED, S_STOPPED = 0, 1, 2, 3
 
 local TASK_PATHS = {"/scripts/skynav/aufgaben.lua", "scripts/skynav/aufgaben.lua", "aufgaben.lua"}
 local POLAR_PATHS = {"/scripts/maccready/polaren.lua", "scripts/maccready/polaren.lua", "../maccready/polaren.lua"}
+local RADIUS_PATHS = {"/scripts/skynav/radien.lua", "scripts/skynav/radien.lua", "radien.lua"}
+local PRED_S = 5      -- s, Vorhersage in der Kursgrafik (Seite Gleiten)
+local R_DEFAULT = 30   -- m, bis das Widget den ersten Wenderadius des Modells gelernt hat
 local FLIGHT_DIRS = {"/scripts/skynav/fluege/", "fluege/", "/scripts/skynav/", ""}
 local AUDIO_DIRS = {"/scripts/skynav/audio/", "audio/"}
 
@@ -354,8 +357,9 @@ local function cornersFrom(T, i, n, R, margin)
     local j = (i - 1 + k) % 3 + 1
     local c = T.tp[j]
     local ax, ay = c.x + margin * c.bx, c.y + margin * c.by
-    out[#out + 1] = {i = j, ax = ax, ay = ay, zx = ax - R * c.bx, zy = ay - R * c.by,
-      thA = atan2(c.by, c.bx), s = c.s}
+    local r = (type(R) == "function") and R(j) or R                 -- Radius je Ecke (gelernt pro TP)
+    out[#out + 1] = {i = j, ax = ax, ay = ay, zx = ax - r * c.bx, zy = ay - r * c.by,
+      thA = atan2(c.by, c.bx), s = c.s, R = r}
   end
   return out
 end
@@ -390,12 +394,13 @@ local function planPath(px, py, wx, wy, V, R, C)
     local Z = {}
     for k = 1, n do Z[k] = {x = C[k].zx - wx * ts[k], y = C[k].zy - wy * ts[k]} end
     local s1 = C[1].s
+    local R1 = C[1].R or R
     local dx, dy = px - Z[1].x, py - Z[1].y
     local d = math.sqrt(dx * dx + dy * dy)
     local thIn
     local function addPt(ax, ay, t) res.pts[#res.pts + 1] = {x = ax + wx * t, y = ay + wy * t} end
     addPt(px, py, 0)
-    if d <= R * 1.02 then
+    if d <= R1 * 1.02 then
       res.inTurn = true
       thIn = atan2(dy, dx)
       res.dT, res.tT = 0, 0
@@ -403,10 +408,10 @@ local function planPath(px, py, wx, wy, V, R, C)
       res.hdg = bearingOf(tx, ty)
     else
       local phi = atan2(dy, dx)
-      local beta = math.acos(clamp(R / d, -1, 1))
+      local beta = math.acos(clamp(R1 / d, -1, 1))
       thIn = phi + s1 * beta
-      local tx, ty = Z[1].x + R * math.cos(thIn), Z[1].y + R * math.sin(thIn)
-      L = math.sqrt(math.max(d * d - R * R, 0))
+      local tx, ty = Z[1].x + R1 * math.cos(thIn), Z[1].y + R1 * math.sin(thIn)
+      L = math.sqrt(math.max(d * d - R1 * R1, 0))
       res.dT, res.tT = L, L / V
       res.hdg = bearingOf(tx - px, ty - py)
       addPt(tx, ty, L / V)
@@ -414,6 +419,7 @@ local function planPath(px, py, wx, wy, V, R, C)
     end
     for k = 1, n do
       local s = C[k].s
+      local R = C[k].R or R
       local arcA = arcAngle(thIn, C[k].thA, s)
       if arcA > 1.75 * PI then arcA = 0 end                         -- Zielpunkt eben ueberflogen
       -- Bogen bis zum Zielpunkt (fuer die Zeichnung in Schritten)
@@ -432,6 +438,11 @@ local function planPath(px, py, wx, wy, V, R, C)
       if el < 1e-6 then el = 1e-6 end
       ex, ey = ex / el, ey / el
       local rx, ry = ey * s, -ex * s                               -- Radius-Richtung: e um -s*90 Grad
+      -- verschiedene Radien: Aussentangente kippt um asin((R1 - R2) / Abstand)
+      local R2 = C[k + 1].R or R
+      local cg = clamp((R - R2) / el, -0.95, 0.95)
+      local sg = math.sqrt(1 - cg * cg)
+      rx, ry = rx * sg + ex * cg, ry * sg + ey * cg
       local thOut = atan2(ry, rx)
       local arcB = arcAngle(C[k].thA, thOut, s)
       local stepsB = math.max(1, math.floor(arcB * R / 8))
@@ -444,9 +455,9 @@ local function planPath(px, py, wx, wy, V, R, C)
         local qx, qy = Z[1].x + R * math.cos(thOut), Z[1].y + R * math.sin(thOut)
         res.exit = {x = qx + wx * L / V, y = qy + wy * L / V}
       end
-      L = L + el
+      L = L + el * sg
       thIn = thOut
-      addPt(Z[k + 1].x + R * rx, Z[k + 1].y + R * ry, L / V)
+      addPt(Z[k + 1].x + R2 * rx, Z[k + 1].y + R2 * ry, L / V)
     end
     res.L, res.tAll = L, L / V
   end
@@ -803,8 +814,8 @@ local NUM_DEFS = {
   {key = "taskIdx",   def = 0},     -- 0 = in der App als aktiv markierte Aufgabe
   {key = "altMode",   def = 1},     -- 1 = GPS minus Platzhoehe, 2 = relative Hoehe (Sensor)
   {key = "varioType", def = 1},     -- 1 = TE, 2 = barometrisch
-  {key = "radMode",   def = 1},     -- 1 = gemessen, 2 = fest
-  {key = "radFix",    def = 30},    -- m
+  {key = "radMode",   def = 1},     -- ungenutzt (Wenderadius wird pro Modell gelernt), Platz fuer die Storage-Reihenfolge
+  {key = "radFix",    def = 30},    -- ungenutzt
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
   {key = "warnSec",   def = 3},     -- Piepse vor dem Wenden (s)
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
@@ -841,7 +852,7 @@ local TEXT_DEFS = {
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
-  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, radMode = {1, 2}, radFix = {5, 200},
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
 }
@@ -924,9 +935,76 @@ local function refreshTasks(w, now, force)
   w.utcOffset = (w.utcOver ~= -999) and w.utcOver or (w.utcFile or 0)
 end
 
+-- Wenderadius pro Modell: aus den Wenden ausserhalb der Thermik gelernt und in radien.lua gespeichert
+local function loadRadii(w)
+  local t, path = loadLuaTable(RADIUS_PATHS)
+  w.radii, w.radiiPath = {}, path
+  if type(t) == "table" then
+    for k, v in pairs(t) do
+      if type(k) == "string" and type(v) == "table" then
+        local m = {}
+        for _, key in ipairs({"all", "tp1", "tp2", "tp3"}) do
+          local r = v[key]
+          if type(r) == "number" and r >= 5 and r <= 200 then m[key] = r end
+        end
+        w.radii[k] = m
+      end
+    end
+  end
+end
+
+local function saveRadii(w)
+  local keys = {}
+  for k in pairs(w.radii) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\nreturn {\n"}
+  for _, k in ipairs(keys) do
+    local m, parts = w.radii[k], {}
+    for _, key in ipairs({"all", "tp1", "tp2", "tp3"}) do
+      if m[key] then parts[#parts + 1] = string.format("%s = %.1f", key, m[key]) end
+    end
+    out[#out + 1] = string.format("  [%q] = {%s},\n", k, table.concat(parts, ", "))
+  end
+  out[#out + 1] = "}\n"
+  local text = table.concat(out)
+  local paths = w.radiiPath and {w.radiiPath} or RADIUS_PATHS
+  for _, path in ipairs(paths) do
+    if writeFile(path, "w", text) then w.radiiPath = path; return true end
+  end
+  return false
+end
+
+-- Neue Wende mit Radius r bei (x, y): fliesst in den Modellwert und, nahe an einem TP, in dessen Wert
+local function learnRadius(w, r, x, y)
+  if not w.radii then return end
+  local name = w.modelName or "?"
+  local m = w.radii[name] or {}
+  w.radii[name] = m
+  local function mix(key)
+    local old = m[key]
+    m[key] = math.floor(((old and (0.7 * old + 0.3 * r)) or r) * 10 + 0.5) / 10
+  end
+  -- nur Wenden an einem TP zaehlen (nicht Kurven beim Anflug oder vor dem Start irgendwo)
+  local T = w.task
+  if not (T and x) then return end
+  local best, bj = 150, nil
+  for j = 1, 3 do
+    local d = math.sqrt((x - T.tp[j].x) ^ 2 + (y - T.tp[j].y) ^ 2)
+    if d < best then best, bj = d, j end
+  end
+  if not bj then return end
+  mix("all")
+  mix("tp" .. bj)
+  w.radiiDirty = true
+end
+
 local function refreshPolar(w, now, force)
   local name = currentModelName()
-  w.modelName = name
+  if name ~= w.modelName or not w.radii then w.modelName = name; loadRadii(w) end
+  if w.radiiDirty and (not w.radiiSaveT or now - w.radiiSaveT > 20) then
+    w.radiiDirty, w.radiiSaveT = false, now
+    saveRadii(w)
+  end
   if not force and name == w.polarModel and w.polarT and now - w.polarT < 30 then return end
   w.polarModel, w.polarT = name, now
   local all = loadLuaTable(POLAR_PATHS)
@@ -1022,6 +1100,22 @@ local function readInputs(w, now, dt)
     if w.omega > math.rad(25) and omega > 0.8 * w.omega and tas > 3 and not w.therm then
       local r = clamp(tas / omega, 8, 200)
       w.rMeas = lpf(w.rMeas, r, dtFix, 3)
+      -- Radius der Wende = geflogene Luftstrecke / gedrehter Winkel (weniger anfaellig fuer Ausreisser)
+      local a = w.turnAcc or {len = 0, core = 0, n = 0, ang = 0, sx = 0, sy = 0}
+      a.len, a.core = a.len + tas * dtFix, a.core + omega * dtFix
+      a.n, a.sx, a.sy = a.n + 1, a.sx + x, a.sy + y
+      w.turnAcc = a
+    end
+    if w.turnAcc then
+      w.turnAcc.ang = w.turnAcc.ang + omega * dtFix
+      -- Wende fertig: mindestens 60 Grad gedreht, dann gilt der mittlere Radius dieser Wende
+      if w.omega < math.rad(12) or w.therm then
+        local a = w.turnAcc
+        if not w.therm and a.ang >= math.rad(60) and a.n >= 2 then
+          learnRadius(w, clamp(a.len / a.core, 8, 200), a.sx / a.n, a.sy / a.n)
+        end
+        w.turnAcc = nil
+      end
     end
   end
   w.hdgPrev = hdg
@@ -1038,16 +1132,18 @@ end
 
 -- ---------------------------------------------------------------- Wertung
 
-local function radius(w)
-  if w.radMode == 2 then return w.radFix end
-  return w.rMeas or w.radFix
+-- Wenderadius fuer TP j (nil = allgemein): gelernt pro Modell und TP, sonst Modell, sonst Messung
+local function radius(w, j)
+  local m = w.radii and w.radii[w.modelName or "?"]
+  return (m and ((j and m["tp" .. j]) or m.all)) or w.rMeas or R_DEFAULT
 end
+local function radiusFn(w) return function(j) return radius(w, j) end end
 
 -- Referenzlinie fuer die Querablage: vom aktuellen Punkt zur Tangente an die naechste Ecke
 local function setRef(w, f)
   local T = w.task
   if not T then return end
-  local C = cornersFrom(T, w.tp + 1, 1, radius(w), w.margin)
+  local C = cornersFrom(T, w.tp + 1, 1, radiusFn(w), w.margin)
   local p = planPath(f.x, f.y, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w), C)
   local e = p.entry or {x = C[1].ax, y = C[1].ay}
   w.ref = {ax = f.x, ay = f.y, bx = e.x, by = e.y}
@@ -1264,13 +1360,21 @@ local function glideCalc(w, f, now, dt)
   -- mittleres Sinken im Geradeausflug (Ersatz, wenn keine Polare da ist)
   if f and f.vz and not w.therm and (w.omega or 0) < math.rad(8) then w.sinkAvg = lpf(w.sinkAvg, -f.vz, dt, 20) end
   if not T or not f or w.state ~= S_STARTED then return g end
-  local R = radius(w)
-  local C = cornersFrom(T, w.tp + 1, 3, R, w.margin)
+  local R = radius(w, w.tp + 1)
+  local C = cornersFrom(T, w.tp + 1, 3, radiusFn(w), w.margin)
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
   local plan = planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C)
   g.plan, g.R, g.C = plan, R, C
   if f.hdg then g.err = angDiff(plan.hdg, f.hdg) end   -- positiv = rechts drehen
-  if w.ref then g.xt = crossTrack(w.ref.ax, w.ref.ay, w.ref.bx, w.ref.by, f.x, f.y) end
+  if w.ref then
+    g.xt = crossTrack(w.ref.ax, w.ref.ay, w.ref.bx, w.ref.by, f.x, f.y)
+    -- Vorhersage: Querablage in PRED_S s mit dem jetzigen Kurs und Tempo ueber Grund
+    if f.ve and f.vn then
+      local dx, dy = w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay
+      local l = math.sqrt(dx * dx + dy * dy)
+      if l >= 1 then g.xtPred = g.xt + (f.ve * dy - f.vn * dx) / l * PRED_S end
+    end
+  end
   g.next = w.tp % 3 + 1
   local nxt = T.tp[g.next]
   g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
@@ -1285,7 +1389,7 @@ local function glideCalc(w, f, now, dt)
   local tRem
   local gsU = math.max(V + wx * T.ux + wy * T.uy, 3)                -- Grundgeschwindigkeit Richtung TP1
   if nRem > 0 then
-    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, R, w.margin))
+    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin))
     tRem = (pr.tAll or 0) + T.dist / gsU
   else
     tRem = math.max(-(f.x * T.ux + f.y * T.uy), 0) / gsU
@@ -1832,8 +1936,7 @@ local function paintOver(w, W, H, top)
   elseif before then
     local nowc = os.clock()
     if not w.ovPlan or nowc - (w.ovPlanT or 0) > 2 then
-      local R = radius(w)
-      local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, R, cornersFrom(T, 1, 3, R, w.margin))
+      local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w, 1), cornersFrom(T, 1, 3, radiusFn(w), w.margin))
       local pts = {}
       for _, q in ipairs(pr.pts or {}) do pts[#pts + 1] = q end
       pts[#pts + 1] = {x = 0, y = 0}
@@ -2249,21 +2352,10 @@ local function paintGlide(w, W, H, top)
     else cmd, col = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE end
     local th = drawT(nx, y, nw, cmd, F_XL, col, "c")
     local yy = y + th + 4
-    -- Kursgrafik: links Steuerpfeil (Soll-Kurs relativ zur Nase, oben = geradeaus), rechts Querablage mit Seitenwind
-    local cdiH = SMALL and 38 or 78
-    local sq = cdiH
-    lcd.color(rgb(25, 25, 25))
-    rect(nx, yy, sq, cdiH)
-    do
-      local acx, acy = nx + sq / 2, yy + cdiH / 2
-      local ang = math.rad(err)
-      local L = sq / 2 - 5
-      local ux, uy = math.sin(ang), -math.cos(ang)              -- Bildschirm: oben = -y
-      local acol = a < 5 and C_GREEN or (a >= w.cmdMin and C_ORANGE or C_WHITE)
-      lcd.color(acol)
-      arrow(acx - ux * L * 0.75, acy - uy * L * 0.75, ux, uy, L * 1.75, math.max(4, sq / 9), math.max(7, sq / 5))
-    end
-    local cx0, cw = nx + sq + 4, nw - sq - 4
+    -- Kursgrafik: Blick in Flugrichtung, oben = entlang der Soll-Linie (blau). Das Flugzeug steht bei der
+    -- aktuellen Querablage, der Punkt zeigt, wo es in PRED_S Sekunden mit dem jetzigen Kurs ueber Grund ist.
+    local cdiH = SMALL and 44 or 86
+    local cx0, cw = nx, nw
     lcd.color(rgb(25, 25, 25))
     rect(cx0, yy, cw, cdiH)
     local xt = g.xt or 0
@@ -2274,31 +2366,45 @@ local function paintGlide(w, W, H, top)
       drawT(cx0, yy + 2, cw, string.format("WEIT DANEBEN  %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_S, C_ORANGE, "c")
       drawT(cx0, yy + 2 + textH(FONT_S), cw, string.format("TP%d direkt %03d°  %.1f km", g.next, math.floor(g.brgTP + 0.5), g.dV / 1000), SMALL and FONT_STD or FONT_L, C_WHITE, "c")
     else
-      local rng = (math.abs(xt) > 100) and 300 or 100
+      local xp = g.xtPred or xt
+      local rng = (math.max(math.abs(xt), math.abs(xp)) > 100) and 300 or 100
+      local half = cw / 2 - 14
       lcd.color(C_GRID)
-      for k = -2, 2 do local tx = ccx + k * (cw / 2 - 8) / 2; line(tx, yy + 4, tx, yy + cdiH - 4) end
+      for k = -2, 2 do local tx = ccx + k * half / 2; line(tx, yy + 4, tx, yy + cdiH - 4) end
       lcd.color(C_BLUE)
       line(ccx, yy, ccx, yy + cdiH)
       line(ccx + 1, yy, ccx + 1, yy + cdiH)
-      -- Flugzeug relativ zur Linie (rechts der Linie = rechts gezeichnet)
-      local ppx = ccx + clamp(xt / rng, -1, 1) * (cw / 2 - 12)
-      planeSymbol(ppx, yy + cdiH * 0.62, SMALL and 9 or 13, math.abs(xt) < 20 and C_GREEN or C_WHITE)
-      local scTxt = SMALL and string.format("%d m %s  (+-%d)", math.floor(math.abs(xt) + 0.5), xt > 0 and "R" or "L", rng) or string.format("+-%d m", rng)
-      drawT(cx0 + 3, yy + cdiH - textH(FONT_XS) - 1, cw, scTxt, FONT_XS, C_DIM, "l")
+      local py0, py1 = yy + cdiH * 0.78, yy + cdiH * 0.2
+      local ppx = ccx + clamp(xt / rng, -1, 1) * half
+      local qx = ccx + clamp(xp / rng, -1, 1) * half
+      local okP = math.abs(xp) < 20
+      local pcol = okP and C_GREEN or C_ORANGE
+      -- Weg bis zur Vorhersage (gestrichelt) und Punkt
+      lcd.color(pcol)
+      local nSeg = 8
+      for k = 0, nSeg - 1, 2 do
+        local t0, t1 = k / nSeg, (k + 1) / nSeg
+        line(ppx + (qx - ppx) * t0, py0 + (py1 - py0) * t0, ppx + (qx - ppx) * t1, py0 + (py1 - py0) * t1)
+      end
+      local rr = SMALL and 5 or 8
+      disc(qx, py1, rr)
+      -- Flugzeug zeigt zur Vorhersage
+      local dx, dy = qx - ppx, py1 - py0
+      local dl = math.sqrt(dx * dx + dy * dy)
+      local hx, hy = dx / dl, dy / dl
+      local nx2, ny2 = -hy, hx
+      local ps = SMALL and 9 or 13
+      lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
+      tri(ppx + hx * ps, py0 + hy * ps, ppx - hx * ps * 0.7 + nx2 * ps * 0.7, py0 - hy * ps * 0.7 + ny2 * ps * 0.7,
+        ppx - hx * ps * 0.7 - nx2 * ps * 0.7, py0 - hy * ps * 0.7 - ny2 * ps * 0.7)
+      local pTxt = string.format("in %d s: %d m %s", PRED_S, math.floor(math.abs(xp) + 0.5), math.abs(xp) < 3 and "auf Linie" or (xp > 0 and "rechts" or "links"))
+      local lx = (qx > ccx) and (cx0 + 4) or (ccx + 8)
+      drawT(lx, yy + 2, cw / 2 - 12, pTxt, FONT_S, pcol, "l")
+      drawT(cx0 + 4, yy + cdiH - textH(FONT_XS) - 1, cw, string.format("+-%d m", rng), FONT_XS, C_DIM, "l")
     end
-    -- Seitenwind: Pfeil oben in der Grafik, von der Luvseite her, Laenge nach Staerke
+    -- Seitenwind nur klein unten rechts
     if g.cross and math.abs(g.cross) >= 2 then
-      local sgn = g.cross > 0 and 1 or -1
-      local Lw = clamp(math.abs(g.cross) / 30, 0.25, 1) * (cw / 2 - 20)
-      local wy0 = far and (yy + cdiH - 8) or (yy + 9)
-      local x1 = ccx - sgn * (cw / 2 - 8)
-      local x2 = x1 + sgn * Lw
-      lcd.color(C_BLUE)
-      rect(math.min(x1, x2), wy0 - 1, math.abs(x2 - x1), 3)
-      tri(x2 + sgn * 7, wy0, x2, wy0 - 6, x2, wy0 + 6)
-      local wt = string.format("SW %d", math.floor(math.abs(g.cross) + 0.5))
-      if sgn > 0 then drawT(x2 + 10, wy0 - textH(FONT_S) / 2, cw, wt, FONT_S, C_BLUE, "l")
-      else drawT(cx0, wy0 - textH(FONT_S) / 2, x2 - 10 - cx0, wt, FONT_S, C_BLUE, "r") end
+      drawT(cx0, yy + cdiH - textH(FONT_XS) - 1, cw - 4, string.format("Seitenwind %d von %s", math.floor(math.abs(g.cross) + 0.5), g.cross > 0 and "links" or "rechts"), FONT_XS, C_DIM, "r")
     end
     yy = yy + cdiH + 2
     if not far and not SMALL then
@@ -2314,14 +2420,16 @@ local function paintGlide(w, W, H, top)
       -- kleiner Bildschirm: Zielhoehe statt Radius, Gegen-/Rueckenwind in der Infozeile
       yy = yy + valBox(nx + 2 * col3, yy, col3, "ZIEL-HÖHE", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, F_L) + 4
     else
-      yy = yy + valBox(nx + 2 * col3, yy, col3, "RADIUS", string.format("%d m", math.floor(g.R + 0.5)), w.radMode == 1 and w.rMeas and C_WHITE or C_DIM, F_L) + 4
+      local hw = g.head
+      local hwTxt = hw and string.format("%d km/h", math.floor(math.abs(hw) + 0.5)) or "--"
+      yy = yy + valBox(nx + 2 * col3, yy, col3, hw and (hw >= 0 and "GEGENWIND" or "RÜCKENWIND") or "WIND", hwTxt,
+        hw and (hw >= 0 and C_ORANGE or C_GREEN) or C_DIM, F_L) + 4
     end
     local lapNow = (f.clk or 0) - (w.lapT or f.clk)
     if not SMALL and yy + textH(FONT_XS) + textH(FONT_STD) < H - m - infoH then
       valBox(nx, yy, col3, "HÖHE AM ZIEL", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, FONT_STD)
       valBox(nx + col3, yy, col3, "RUNDE " .. (#w.laps + 1), fmtMS(lapNow), C_WHITE, FONT_STD)
-      local hw = g.head
-      valBox(nx + 2 * col3, yy, col3, hw and (hw >= 0 and "GEGENWIND" or "RÜCKENWIND") or "WIND", hw and string.format("%d km/h", math.floor(math.abs(hw) + 0.5)) or "--", hw and (hw >= 0 and C_ORANGE or C_GREEN) or C_DIM, SMALL and FONT_STD or F_L)
+      valBox(nx + 2 * col3, yy, col3, "RADIUS", string.format("%d m", math.floor(g.R + 0.5)), (w.radii and w.radii[w.modelName or "?"]) and C_WHITE or C_DIM, FONT_STD)
     end
   end
   -- Infozeile unten
