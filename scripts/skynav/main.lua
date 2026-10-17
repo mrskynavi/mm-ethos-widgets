@@ -359,7 +359,7 @@ local function cornersFrom(T, i, n, R, margin)
     local ax, ay = c.x + margin * c.bx, c.y + margin * c.by
     local r = (type(R) == "function") and R(j) or R                 -- Radius je Ecke (gelernt pro TP)
     out[#out + 1] = {i = j, ax = ax, ay = ay, zx = ax - r * c.bx, zy = ay - r * c.by,
-      thA = atan2(c.by, c.bx), s = c.s, R = r}
+      thA = atan2(c.by, c.bx), s = c.s, R = r, tx = c.x, ty = c.y, bx = c.bx, by = c.by, margin = margin}
   end
   return out
 end
@@ -367,7 +367,9 @@ end
 -- Plant den Weg ab Position (px,py) im Luftmassen-System. W = Wind (wx,wy), V = Fahrt, R = Radius.
 -- Liefert: hdg (Soll-Steuerkurs Grad), dT (Luft-Strecke bis Kurvenbeginn m), tT (s), inTurn,
 -- t1 (Ankunft an der ersten Ecke s), pts (Boden-Punkte fuer die Zeichnung), entry/exit (Boden).
-local function planPath(px, py, wx, wy, V, R, C)
+-- hdgNow (optional, Grad, Steuerkurs in der Luft): liegt die Tangente zum ersten Kreis hinter dem Modell
+-- (Kurvenbeginn verpasst), fliegt der Plan erst geradeaus weiter und wendet spaeter durch denselben Zielpunkt.
+local function planPath(px, py, wx, wy, V, R, C, hdgNow)
   V = math.max(V, 3)
   local n = #C
   local ts = {}
@@ -398,9 +400,55 @@ local function planPath(px, py, wx, wy, V, R, C)
     local dx, dy = px - Z[1].x, py - Z[1].y
     local d = math.sqrt(dx * dx + dy * dy)
     local thIn
+    local thA = {}
+    for k = 1, n do thA[k] = C[k].thA end
     local function addPt(ax, ay, t) res.pts[#res.pts + 1] = {x = ax + wx * t, y = ay + wy * t} end
     addPt(px, py, 0)
-    if d <= R1 * 1.02 then
+    -- Kurvenbeginn verpasst? Dann Kreis, der in Flugrichtung beruehrt und durch den Zielpunkt geht
+    local forced = false
+    if hdgNow and d < 200 then                                        -- nur nahe an der Ecke (nicht beim Ausflug)
+      local hx, hy = dirVec(hdgNow)
+      local late = d <= R1 * 1.02                                     -- schon im Kreis: Kurvenbeginn verpasst
+      if not late then
+        local phi = atan2(dy, dx)
+        local th0 = phi + s1 * math.acos(clamp(R1 / d, -1, 1))
+        local tx, ty = Z[1].x + R1 * math.cos(th0) - px, Z[1].y + R1 * math.sin(th0) - py
+        local tl = math.sqrt(tx * tx + ty * ty)
+        late = tl > 1 and (tx * hx + ty * hy) / tl < 0.87             -- mehr als ~30 Grad abdrehen noetig
+      end
+      if late then
+        -- geradeaus weiter (ueber Grund mit Wind), bis der Punkt margin tief im Sektor liegt, dann wenden
+        local c1 = C[1]
+        local gvx, gvy = V * hx + wx, V * hy + wy
+        local gv = math.sqrt(gvx * gvx + gvy * gvy)
+        if gv > 1 then
+          for Lg = 0, 300, 2 do
+            local t = Lg / gv
+            local gx, gy = px + gvx * t, py + gvy * t
+            local rx, ry = gx - c1.tx, gy - c1.ty
+            local rl = math.sqrt(rx * rx + ry * ry)
+            local dep = rx * c1.bx + ry * c1.by
+            if rl > 0.1 and dep >= c1.margin and dep / rl >= 0.7071 then
+              forced = true
+              local sx, sy = px + V * hx * t, py + V * hy * t       -- Luftpunkt des Kurvenbeginns
+              local nxm, nym = -hy * s1, hx * s1                      -- Kreismitte auf der Kurvenseite
+              Z[1] = {x = sx + R1 * nxm, y = sy + R1 * nym}
+              thIn = atan2(sy - Z[1].y, sx - Z[1].x)
+              thA[1] = thIn
+              L = V * t
+              res.dT, res.tT = L, t
+              res.hdg = hdgNow % 360
+              addPt(sx, sy, t)
+              res.entry = {x = gx, y = gy}
+              break
+            end
+          end
+        end
+      end
+    end
+    if forced then
+      res.late = true
+    elseif d <= R1 * 1.02 then
       res.inTurn = true
       thIn = atan2(dy, dx)
       res.dT, res.tT = 0, 0
@@ -420,7 +468,7 @@ local function planPath(px, py, wx, wy, V, R, C)
     for k = 1, n do
       local s = C[k].s
       local R = C[k].R or R
-      local arcA = arcAngle(thIn, C[k].thA, s)
+      local arcA = arcAngle(thIn, thA[k], s)
       if arcA > 1.75 * PI then arcA = 0 end                         -- Zielpunkt eben ueberflogen
       -- Bogen bis zum Zielpunkt (fuer die Zeichnung in Schritten)
       local steps = math.max(1, math.floor(arcA * R / 8))
@@ -444,10 +492,10 @@ local function planPath(px, py, wx, wy, V, R, C)
       local sg = math.sqrt(1 - cg * cg)
       rx, ry = rx * sg + ex * cg, ry * sg + ey * cg
       local thOut = atan2(ry, rx)
-      local arcB = arcAngle(C[k].thA, thOut, s)
+      local arcB = arcAngle(thA[k], thOut, s)
       local stepsB = math.max(1, math.floor(arcB * R / 8))
       for j = 1, stepsB do
-        local th = C[k].thA + s * arcB * j / stepsB
+        local th = thA[k] + s * arcB * j / stepsB
         addPt(Z[k].x + R * math.cos(th), Z[k].y + R * math.sin(th), (L + arcB * R * j / stepsB) / V)
       end
       L = L + arcB * R
@@ -834,6 +882,7 @@ local NUM_DEFS = {
   {key = "slotM",     def = 0},
   {key = "slotLen",   def = 10},
   {key = "startToneLogic", def = 1}, -- 1 = zu tief gibt hohe Toene, 2 = zu hoch gibt hohe Toene
+  {key = "startSpan", def = 400},   -- m, Start-Seite: Karte von der Linie bis zum linken Rand (fester Massstab)
 }
 local BOOL_DEFS = {
   {key = "sound", def = true},
@@ -853,7 +902,7 @@ local TEXT_DEFS = {
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
-  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2},
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
 }
@@ -1365,7 +1414,7 @@ local function glideCalc(w, f, now, dt)
   local R = radius(w, w.tp + 1)
   local C = cornersFrom(T, w.tp + 1, 3, radiusFn(w), w.margin)
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
-  local plan = planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C)
+  local plan = planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C, f.hdg)
   g.plan, g.R, g.C = plan, R, C
   if f.hdg then g.err = angDiff(plan.hdg, f.hdg) end   -- positiv = rechts drehen
   if w.ref then
@@ -1391,7 +1440,7 @@ local function glideCalc(w, f, now, dt)
   local tRem
   local gsU = math.max(V + wx * T.ux + wy * T.uy, 3)                -- Grundgeschwindigkeit Richtung TP1
   if nRem > 0 then
-    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin))
+    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin), f.hdg)
     tRem = (pr.tAll or 0) + T.dist / gsU
   else
     tRem = math.max(-(f.x * T.ux + f.y * T.uy), 0) / gsU
@@ -1873,13 +1922,15 @@ end
 -- TP2 oben, Linie senkrecht durch den Ursprung). Vor dem Start ist die
 -- TP1-Seite der Linie rot, danach ist der Sektor des naechsten TP gefuellt wie in der Eckansicht.
 -- Optimale Runde vor dem Start (Ursprung -> TP1 -> TP2 -> TP3 -> Ursprung), alle 2 s neu gerechnet
+-- Ideale Runde mit Wind, unabhaengig von der Position des Modells: geplant ab dem Ursprung ueber
+-- TP1, TP2, TP3 und nochmals TP1; gezeichnet ab dem Kurvenbeginn an TP1, also ohne den Anflug vom Ursprung.
+-- Das Stueck von TP3 zu TP1 zeigt, wo man ideal durch die Startlinie fliegt.
 local function lapRoute(w, T)
   local nowc = os.clock()
   if not w.ovPlan or nowc - (w.ovPlanT or 0) > 2 then
-    local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w, 1), cornersFrom(T, 1, 3, radiusFn(w), w.margin))
+    local pr = planPath(0, 0, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w, 1), cornersFrom(T, 1, 4, radiusFn(w), w.margin))
     local pts = {}
-    for _, q in ipairs(pr.pts or {}) do pts[#pts + 1] = q end
-    pts[#pts + 1] = {x = 0, y = 0}
+    for k = 2, #(pr.pts or {}) do pts[#pts + 1] = pr.pts[k] end
     w.ovPlan, w.ovPlanT = pts, nowc
   end
   return w.ovPlan
@@ -2077,7 +2128,7 @@ local function paintStart(w, W, H, top)
   local mapH = H - y - m
   -- Draufsicht im festen Kartenbild (Hypotenuse waagrecht): Linie senkrecht, Startsektor (TP3-Seite) links,
   -- TP1-Seite rechts, TP2 oben
-  local cx, cy = m + mapW * 0.5, y + mapH * 0.72
+  local cx, cy = m + mapW * 0.6, y + mapH * 0.7
   lcd.color(rgb(20, 20, 20))
   rect(m, y, mapW, mapH)
   -- Vor dem Start: TP1-Seite der Linie ist die falsche Seite (rot)
@@ -2086,8 +2137,8 @@ local function paintStart(w, W, H, top)
     lcd.color(rgb(60, 14, 14))
     rect(math.floor(cx), y, math.max(1, math.floor(m + mapW - cx)), mapH)
   end
-  -- Massstab: das ganze Dreieck fuellt die Karte (Modell weiter weg bleibt am Rand)
-  local scale = T and math.min((mapW / 2 - 10) / (T.dist * 1.08), (cy - y - 10) / (T.dist * 1.05)) or ((mapH / 2 - 4) / 1200)
+  -- fester Massstab aus der App: startSpan Meter von der Linie bis zum linken Rand (Modell weiter weg bleibt am Rand)
+  local scale = (cx - m - 4) / w.startSpan
   CLIP = {m, y, m + mapW - 1, y + mapH - 1}
   if T then
     local d = T.dist * scale
@@ -2103,6 +2154,7 @@ local function paintStart(w, W, H, top)
         local ax, ay = flatXY(T, route[k - 1].x, route[k - 1].y)
         local bx, by = flatXY(T, route[k].x, route[k].y)
         line(cx + ax * scale, cy + ay * scale, cx + bx * scale, cy + by * scale)
+        line(cx + ax * scale, cy + ay * scale + 1, cx + bx * scale, cy + by * scale + 1)
       end
     end
   end
@@ -2309,7 +2361,8 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   lcd.color(C_YELLOW)
   if inClip(vx, vy) then disc(vx, vy, 4) end
   local ax, ay = P(f.x, f.y)
-  if inClip(ax, ay) then predFlat(P, f, C_ORANGE); planeFlat(T, ax, ay, f.crs, 8, C_WHITE) end
+  if inClip(ax, ay) then predFlat(P, f, C_ORANGE); planeFlat(T, ax, ay, f.crs, 8, C_WHITE)
+  else planeFlat(T, clamp(ax, x0 + 8, x0 + bw - 8), clamp(ay, y0 + 8, y0 + bh - 8), f.crs, 8, C_WHITE) end
   CLIP = nil
   -- Wind: Pfeil (wohin er blaest), Staerke daneben
   windFlat(w, T, x0 + bw - 24, y0 + 24, x0)
