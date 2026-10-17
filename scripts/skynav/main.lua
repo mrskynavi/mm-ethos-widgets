@@ -1255,6 +1255,10 @@ local function assess(w, f, now)
   end
   if not T then w.lastFix = f; return end
   local s = f.x * T.ux + f.y * T.uy
+  if w.badEntry and (w.state ~= S_STARTED or w.tp > 0 or s > T.dist * 0.66) then
+    w.badEntry = nil
+    if w.autoPage and w.state == S_STARTED then w.autoTarget = P_GLIDE end
+  end
   local lat = f.x * T.px + f.y * T.py
   f.s, f.lat_ = s, lat
   local prev = w.lastFix
@@ -1279,7 +1283,13 @@ local function assess(w, f, now)
         w.startedAt = now
         event(w, "STA", e, now)
         setRef(w, f)
-        if w.autoPage then w.autoTarget = P_GLIDE end
+        -- Einflug mit Strafe (zu hoch/zu schnell): Start-Seite bleibt, damit man sieht, was falsch war,
+        -- und gleich neu scharf stellen kann. Erst nach 2/3 des Wegs zu TP1 geht es zur Seite Gleiten.
+        w.badEntry = w.penalty > 0 or nil
+        if w.badEntry then
+          note(w, string.format("EINFLUG %s, Strafe %d", e.agl > T.maxH and "ZU HOCH" or "ZU SCHNELL", w.penalty), now)
+          if w.autoPage then w.autoTarget = P_START end
+        elseif w.autoPage then w.autoTarget = P_GLIDE end
       end
     elseif w.state == S_STARTED and w.tp == 3 then
       if f.v3d >= T.minF and f.clk - w.startT <= T.work * 60 then
@@ -1545,7 +1555,7 @@ local function thermCalc(w, f, now, dt)
     w.therm, w.circSince = nil, nil
     -- abgetrieben: Querablage ab hier neu messen (Linie vom Ausstieg zur naechsten Ecke)
     if w.state == S_STARTED and f then setRef(w, f) end
-    if w.autoPage and w.state == S_STARTED then w.autoTarget = P_GLIDE end
+    if w.autoPage and w.state == S_STARTED then w.autoTarget = w.badEntry and P_START or P_GLIDE end
   end
   if w.therm and f then
     w.therm.hMax = math.max(w.therm.hMax, f.agl)
@@ -1613,7 +1623,7 @@ local function armOrRestart(w, now)
   elseif w.state == S_STARTED and #w.laps == 0 then
     w.state, w.armedAt, w.armPending = S_ARMED, now, true
     w.startT, w.startUtc, w.lapT, w.entry, w.penalty, w.tp, w.lapAgl = nil, nil, nil, nil, 0, 0, nil
-    w.zoneHit, w.altHit = nil, nil
+    w.zoneHit, w.altHit, w.badEntry = nil, nil, nil
     w.restarts = (w.restarts or 0) + 1
     note(w, "Neustart: wieder scharf", now)
   elseif w.state == S_STARTED then
@@ -2173,6 +2183,19 @@ local function paintStart(w, W, H, top)
     if w.windOk then windFlat(w, T, m + mapW - 26, y + 26, m)
     else drawT(m, y + 20, mapW - 4, "Wind ?", FONT_S, C_DIM, "r") end
   end
+  -- Flugweg der letzten 90 s (zeigt den Anflug, auch nach einem misslungenen Einflug)
+  if T and w.track then
+    CLIP = {m, y, m + mapW - 1, y + mapH - 1}
+    local tNow = os.clock()
+    for _, p in ipairs(w.track) do
+      if tNow - (p.t or 0) < 90 then
+        local ax, ay = flatXY(T, p.x, p.y)
+        ax, ay = cx + ax * scale, cy + ay * scale
+        if inClip(ax, ay) then lcd.color(p.on and C_WHITE or C_DIM); rect(math.floor(ax) - 1, math.floor(ay) - 1, 2, 2) end
+      end
+    end
+    CLIP = nil
+  end
   if c and f and c.lat then
     local px, py = cx - c.dist * scale, cy - c.lat * scale
     px, py = clamp(px, m + 4, m + mapW - 4), clamp(py, y + 4, y + mapH - 4)
@@ -2288,18 +2311,27 @@ local function paintStart(w, W, H, top)
   -- Strafe nur nach dem Ueberqueren der Linie, und nur wenn es eine gibt
   local started = w.state == S_STARTED and w.entry
   if started and (w.penalty or 0) > 0 then row("STRAFE", tostring(w.penalty), C_RED) end
-  if started then
+  if started and not w.badEntry then
     local sTxt = string.format("Start: %d m %d km/h", math.floor(w.entry.agl + 0.5), math.floor(w.entry.v3d + 0.5))
     if (w.penalty or 0) > 0 then sTxt = sTxt .. string.format("  Strafe %d", w.penalty) end
     drawT(rx, yy, rw, sTxt, FONT_XS, (w.penalty or 0) > 0 and C_RED or C_GREEN, "l")
     yy = yy + textH(FONT_XS) + 2
   end
+  if started and w.badEntry then
+    local over = w.entry.agl - T.maxH
+    local vOver = w.entry.v3d - T.maxV
+    local why = over > 0 and string.format("%d m, ZU HOCH +%d", math.floor(w.entry.agl + 0.5), math.floor(over + 0.5)) or ""
+    if vOver > 0 then why = why .. (why ~= "" and "  " or "") .. string.format("ZU SCHNELL +%d", math.floor(vOver + 0.5)) end
+    drawT(rx, yy, rw, why, FONT_STD, C_RED, "l")
+    yy = yy + textH(FONT_STD) + 4
+  end
   local canRestart = w.state == S_STARTED and #w.laps == 0
   if w.state == S_IDLE or w.state == S_STOPPED or canRestart then
-    w.armBox = {x = rx, y = yy, w = rw, h = textH(FONT_STD) + 8}
-    lcd.color(rgb(70, 50, 0))
+    local bf = (canRestart and w.badEntry) and F_L or FONT_STD
+    w.armBox = {x = rx, y = yy, w = rw, h = textH(bf) + 8}
+    lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
-    drawT(rx, yy + 4, rw, canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)", FONT_STD, C_ORANGE, "c")
+    drawT(rx, yy + 4, rw, canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)", bf, C_ORANGE, "c")
   end
 end
 
