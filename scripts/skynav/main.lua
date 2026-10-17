@@ -1690,7 +1690,12 @@ local function pageFromSwitch(w, now)
     if validSource(w[key]) then
       any = true
       local on = (readNumber(w[key]) or -1024) > 0
-      if on and not w.swState[p] then w.swPage, w.manual = p, nil end
+      if on and not w.swState[p] then
+        if not (w.swPage and w.swState[w.swPage]) then
+          w.swRestore = {page = w.page, manual = w.manual, manualFrom = w.manualFrom}
+        end
+        w.swPage, w.manual = p, nil
+      end
       w.swState[p] = on
     else
       w.swState[p] = nil
@@ -1702,6 +1707,17 @@ local function pageFromSwitch(w, now)
       for p = 1, #PAGE_SW do if w.swState[p] then w.swPage = p; break end end
     end
     if w.swPage then return w.manual or w.swPage end
+    -- Alle Seitenschalter aus: die Ansicht von vor dem Einschalten zurueckholen. Sie bleibt, bis die Automatik
+    -- ein neues Ziel hat oder der Pilot tippt.
+    local r = w.swRestore
+    if r then
+      w.swRestore = nil
+      w.manual, w.manualFrom = r.manual, r.manualFrom
+      if not w.manual and r.page and r.page ~= (w.autoPage and w.autoTarget or r.page) then
+        w.manual, w.manualFrom = r.page, w.autoTarget
+      end
+      if not w.manual and r.page then return r.page end
+    end
   end
   if w.manual then
     if w.autoTarget and w.autoTarget ~= w.manualFrom then w.manual = nil else return w.manual end
