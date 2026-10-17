@@ -2352,10 +2352,22 @@ local function paintGlide(w, W, H, top)
     else cmd, col = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE end
     local th = drawT(nx, y, nw, cmd, F_XL, col, "c")
     local yy = y + th + 4
-    -- Kursgrafik: Blick in Flugrichtung, oben = entlang der Soll-Linie (blau). Das Flugzeug steht bei der
-    -- aktuellen Querablage, der Punkt zeigt, wo es in PRED_S Sekunden mit dem jetzigen Kurs ueber Grund ist.
-    local cdiH = SMALL and 44 or 86
-    local cx0, cw = nx, nw
+    -- Kursgrafik: links Steuerpfeil, rechts Querablage zur Soll-Linie (blau) mit Flugzeug und oben einem
+    -- Balken fuer die erwartete Ablage in PRED_S Sekunden (jetziger Kurs ueber Grund).
+    local cdiH = SMALL and 38 or 78
+    local sq = cdiH
+    lcd.color(rgb(25, 25, 25))
+    rect(nx, yy, sq, cdiH)
+    do
+      -- Steuerpfeil: Soll-Kurs relativ zur Nase, oben = geradeaus
+      local acx, acy = nx + sq / 2, yy + cdiH / 2
+      local ang = math.rad(err)
+      local L = sq / 2 - 5
+      local ux, uy = math.sin(ang), -math.cos(ang)
+      lcd.color(a < 5 and C_GREEN or (a >= w.cmdMin and C_ORANGE or C_WHITE))
+      arrow(acx - ux * L * 0.75, acy - uy * L * 0.75, ux, uy, L * 1.75, math.max(4, sq / 9), math.max(7, sq / 5))
+    end
+    local cx0, cw = nx + sq + 4, nw - sq - 4
     lcd.color(rgb(25, 25, 25))
     rect(cx0, yy, cw, cdiH)
     local xt = g.xt or 0
@@ -2374,32 +2386,19 @@ local function paintGlide(w, W, H, top)
       lcd.color(C_BLUE)
       line(ccx, yy, ccx, yy + cdiH)
       line(ccx + 1, yy, ccx + 1, yy + cdiH)
-      local py0, py1 = yy + cdiH * 0.78, yy + cdiH * 0.2
       local ppx = ccx + clamp(xt / rng, -1, 1) * half
       local qx = ccx + clamp(xp / rng, -1, 1) * half
-      local okP = math.abs(xp) < 20
-      local pcol = okP and C_GREEN or C_ORANGE
-      -- Weg bis zur Vorhersage (gestrichelt) und Punkt
+      local pcol = math.abs(xp) < 20 and C_GREEN or C_ORANGE
+      -- Balken oben: erwartete Ablage in PRED_S s, von der Soll-Linie bis dorthin
+      local bh = SMALL and 6 or 10
+      local by = yy + 4
       lcd.color(pcol)
-      local nSeg = 8
-      for k = 0, nSeg - 1, 2 do
-        local t0, t1 = k / nSeg, (k + 1) / nSeg
-        line(ppx + (qx - ppx) * t0, py0 + (py1 - py0) * t0, ppx + (qx - ppx) * t1, py0 + (py1 - py0) * t1)
-      end
-      local rr = SMALL and 5 or 8
-      disc(qx, py1, rr)
-      -- Flugzeug zeigt zur Vorhersage
-      local dx, dy = qx - ppx, py1 - py0
-      local dl = math.sqrt(dx * dx + dy * dy)
-      local hx, hy = dx / dl, dy / dl
-      local nx2, ny2 = -hy, hx
-      local ps = SMALL and 9 or 13
-      lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
-      tri(ppx + hx * ps, py0 + hy * ps, ppx - hx * ps * 0.7 + nx2 * ps * 0.7, py0 - hy * ps * 0.7 + ny2 * ps * 0.7,
-        ppx - hx * ps * 0.7 - nx2 * ps * 0.7, py0 - hy * ps * 0.7 - ny2 * ps * 0.7)
+      rect(math.min(ccx, qx), by, math.max(math.abs(qx - ccx), 2), bh)
+      -- Flugzeug wie bisher bei der aktuellen Ablage
+      planeSymbol(ppx, yy + cdiH * 0.62, SMALL and 9 or 13, math.abs(xt) < 20 and C_GREEN or C_WHITE)
       local pTxt = string.format("in %d s: %d m %s", PRED_S, math.floor(math.abs(xp) + 0.5), math.abs(xp) < 3 and "auf Linie" or (xp > 0 and "rechts" or "links"))
       local lx = (qx > ccx) and (cx0 + 4) or (ccx + 8)
-      drawT(lx, yy + 2, cw / 2 - 12, pTxt, FONT_S, pcol, "l")
+      drawT(lx, by + bh + 2, cw / 2 - 12, pTxt, FONT_S, pcol, "l")
       drawT(cx0 + 4, yy + cdiH - textH(FONT_XS) - 1, cw, string.format("+-%d m", rng), FONT_XS, C_DIM, "l")
     end
     -- Seitenwind nur klein unten rechts
