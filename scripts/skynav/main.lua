@@ -833,6 +833,7 @@ local NUM_DEFS = {
   {key = "slotH",     def = -1},    -- Startfenster von Hand: Stunde (Senderuhr), -1 = aus der Aufgabe
   {key = "slotM",     def = 0},
   {key = "slotLen",   def = 10},
+  {key = "startToneLogic", def = 1}, -- 1 = zu tief gibt hohe Toene, 2 = zu hoch gibt hohe Toene
 }
 local BOOL_DEFS = {
   {key = "sound", def = true},
@@ -852,7 +853,7 @@ local TEXT_DEFS = {
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
-  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60},
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
 }
@@ -1320,19 +1321,20 @@ local function startTones(w, c, now)
   if (c.predV or 0) > T.maxV - w.speedMargin or (w.lastFix and w.lastFix.v3d > T.maxV - w.speedMargin) then
     if not w.hapT or now - w.hapT > 1.0 then w.hapT = now; haptic(w, P_START, 250) end
   end
-  -- Gleitwinkel-Ton: hoch = zu hoch (mehr sinken), tief = zu tief, im Fenster ein leiser Takt
+  -- Gleitwinkel-Ton: Standard hoch = zu tief (Hoehe sparen), tief = zu hoch (mehr sinken); startToneLogic 2
+  -- dreht das um. Im Fenster ein leiser Takt.
   if w.startBeepT and now < w.startBeepT then return end
   local e = c.err
   local half = w.winLo / 2
   if math.abs(e) <= half then
     tone(w, P_START, 700, 40)
     w.startBeepT = now + 1.0
-  elseif e > 0 then
-    local x = clamp(e - half, 0, 60)
+  elseif (e < 0) == (w.startToneLogic ~= 2) then
+    local x = clamp(math.abs(e) - half, 0, 60)
     tone(w, P_START, 900 + x * 15, 70)
     w.startBeepT = now + math.max(0.12, 0.5 - x * 0.007)
   else
-    local x = clamp(-e - half, 0, 60)
+    local x = clamp(math.abs(e) - half, 0, 60)
     tone(w, P_START, math.max(250, 450 - x * 3), 220)
     w.startBeepT = now + math.max(0.3, 0.6 - x * 0.004)
   end
