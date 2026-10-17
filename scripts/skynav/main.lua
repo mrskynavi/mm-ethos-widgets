@@ -1247,11 +1247,13 @@ end
 local function glideCalc(w, f, now, dt)
   local T = w.task
   local g = {}
-  -- Sollfahrt (wie Widget Sollfahrt, vereinfacht): Netto, Soll, Abweichung
-  if w.polar and f and f.tas and f.tas * KMH > 15 and w.vFast ~= nil then
+  -- Sollfahrt wie Widget Sollfahrt (gleiche Glaettung wie dessen Standard: Vario und Fahrt 2 s,
+  -- Netto 8 s), damit beide Widgets bei gleichem MC und Wind dieselbe Sollfahrt zeigen
+  if w.polar and f and f.tas and f.tas * KMH > 15 and w.varioRaw ~= nil then
     local p = w.polar
-    local te = w.vFast
-    w.netto = lpf(w.netto, te + polarSink(p, f.tas), dt, 6)
+    w.teN = lpf(w.teN, w.varioRaw, dt, 2)
+    w.tasN = lpf(w.tasN, f.tas, dt, 2)
+    w.netto = lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8)
     local head = nil
     if w.windOk and f.hdg then local hx, hy = dirVec(f.hdg); head = -(w.wx * hx + w.wy * hy) end
     w.vstf = speedToFly(p, w.mcValue, clamp(w.netto, -5, 5), head)
