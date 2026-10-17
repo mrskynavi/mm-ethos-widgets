@@ -1646,14 +1646,13 @@ local function thermCalc(w, f, now, dt)
   else w.straightSince = w.straightSince or now end
   if w.circSince and now - w.circSince > 8 and not w.therm and f then
     w.therm = {t0 = now, h0 = f.agl, hMax = f.agl}
-    if w.autoPage and w.state == S_STARTED then w.autoTarget = P_THERM end
+    -- keine automatische Umschaltung auf Thermik: nur ueber den Schalter oder den Reiter
   end
   if w.therm and w.straightSince and now - w.straightSince > 8 then
     w.lastTherm = w.therm
     w.therm, w.circSince = nil, nil
     -- abgetrieben: Querablage ab hier neu messen (Linie vom Ausstieg zur naechsten Ecke)
     if w.state == S_STARTED and f then setRef(w, f) end
-    if w.autoPage and w.state == S_STARTED then w.autoTarget = w.badEntry and P_START or P_GLIDE end
   end
   if w.therm and f then
     w.therm.hMax = math.max(w.therm.hMax, f.agl)
