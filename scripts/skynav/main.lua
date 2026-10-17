@@ -865,7 +865,7 @@ local NUM_DEFS = {
   {key = "radMode",   def = 1},     -- ungenutzt (Wenderadius wird pro Modell gelernt), Platz fuer die Storage-Reihenfolge
   {key = "radFix",    def = 30},    -- ungenutzt
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
-  {key = "warnSec",   def = 3},     -- Piepse vor dem Wenden (s)
+  {key = "warnSec",   def = 2},     -- Wendeton: Laenge (s), endet am Wendepunkt
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
   {key = "cmdMin",    def = 10},    -- Kommando ab x Grad
   {key = "cmdGap",    def = 8},     -- Kommando höchstens alle x s
@@ -1581,18 +1581,17 @@ local function glideTones(w, g, now)
   if not g.plan then
     -- vor dem Start: nur Sollfahrt
   else
-    -- Vorwarnung vor dem Wenden: Piepse bei warnSec..1 s, langer Ton bei 0 (mit Vorhalt)
+    -- Wendeton: ein langer Ton (warnSec), der am Wendepunkt (mit Vorhalt) endet. Ist er fertig, wenden.
     local tT = (g.plan.tT or 99) - w.lead / 10
-    local slot = math.ceil(tT)
-    if not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
-      if slot ~= w.warnSlot then
-        w.warnSlot = slot
-        if slot <= 0 then tone(w, P_GLIDE, 1600, 450) else tone(w, P_GLIDE, 1250, 80) end
+    if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
+      if not w.warnOn then
+        w.warnOn = true
+        tone(w, P_GLIDE, 1700, math.max(tT, 0.4) * 1000)
       end
-      w.quietUntil = now + 4
+      w.quietUntil = now + 3
       return
     end
-    if tT > w.warnSec + 1 then w.warnSlot = nil end
+    if tT > w.warnSec + 1 then w.warnOn = nil end
     -- Kurs-Kommandos: "x Grad links/rechts"
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
@@ -1827,7 +1826,9 @@ local function wakeup(w)
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
       elseif e == "STA" then tone(w, nil, 1000, 150); tone(w, nil, 1400, 250)
         if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0) end
-      elseif e == "TPC" then tone(w, nil, 1500, 90); tone(w, nil, 1500, 90); tone(w, nil, 1800, 150)
+      elseif e == "TPC" then
+        -- Sektor erreicht: deutlicher Dreiklang aufwaerts und Vibration
+        tone(w, nil, 1000, 180); tone(w, nil, 1400, 180); tone(w, nil, 2000, 500); haptic(w, nil, 300)
       elseif e == "FIN" then tone(w, nil, 1200, 150); tone(w, nil, 1600, 300); sayNumber(w, nil, #w.laps, UNIT_RAW, 0)
       elseif e == "STP" then tone(w, nil, 600, 400) end
       w.quietUntil = now + 1.5
