@@ -2896,6 +2896,7 @@ local function paintTherm(w, W, H, top)
         drawT(mx0 + 4, y + 2, mw, string.format("%s %d m", name, dist), FONT_S, C_GREEN, "l")
       end
     end
+    if T then windFlat(w, T, mx0 + mw - 26, y + 24, mx0 + math.floor(mw / 2)) end
     local wind = w.windOk and string.format("Wind %d km/h aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: noch kein Fit"
     drawT(mx0, y + mh - textH(FONT_XS) - 2, mw - 4, wind .. string.format("  R %d m", math.floor(R + 0.5)), FONT_XS, C_DIM, "r")
   end
