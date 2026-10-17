@@ -1577,21 +1577,28 @@ local function glideCalc(w, f, full)
   return g
 end
 
+-- Wendeton: ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet. Ist er fertig,
+-- wenden. Kommt auf Gleiten und Uebersicht. Liefert true, solange der Ton laeuft.
+local function turnTone(w, g, now, page)
+  if not g.plan then return false end
+  local tT = (g.plan.tT or 99) - w.lead / 10
+  if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
+    if not w.warnOn then
+      w.warnOn = true
+      tone(w, page, 1700, math.max(tT, 0.4) * 1000)
+    end
+    w.quietUntil = now + 3
+    return true
+  end
+  if tT > w.warnSec + 1 then w.warnOn = nil end
+  return false
+end
+
 local function glideTones(w, g, now)
   if not g.plan then
     -- vor dem Start: nur Sollfahrt
   else
-    -- Wendeton: ein langer Ton (warnSec), der am Wendepunkt (mit Vorhalt) endet. Ist er fertig, wenden.
-    local tT = (g.plan.tT or 99) - w.lead / 10
-    if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
-      if not w.warnOn then
-        w.warnOn = true
-        tone(w, P_GLIDE, 1700, math.max(tT, 0.4) * 1000)
-      end
-      w.quietUntil = now + 3
-      return
-    end
-    if tT > w.warnSec + 1 then w.warnOn = nil end
+    if turnTone(w, g, now, P_GLIDE) then return end
     -- Kurs-Kommandos: "x Grad links/rechts"
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
@@ -1822,7 +1829,8 @@ local function wakeup(w)
   if w.lastEvent and w.lastEventT == now then
     local e = w.lastEvent
     local pg = (e == "STA" or e == "PEV") and P_START or P_GLIDE
-    if w.eventsAlways or w.page == pg or (e == "STA" and w.page == P_GLIDE) then
+    -- Sektor-Bestaetigung (TPC) auch auf der Uebersicht
+    if w.eventsAlways or w.page == pg or (e == "STA" and w.page == P_GLIDE) or (e == "TPC" and w.page == P_OVER) then
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
       elseif e == "STA" then tone(w, nil, 1000, 150); tone(w, nil, 1400, 250)
         if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0) end
@@ -1839,6 +1847,7 @@ local function wakeup(w)
   if cur then
     if w.page == P_START then startTones(w, w.sc, now)
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now)
+    elseif w.page == P_OVER then turnTone(w, w.gc or {}, now, P_OVER)
     elseif w.page == P_THERM then thermTones(w, now) end
   end
 
