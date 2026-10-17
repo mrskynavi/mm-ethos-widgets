@@ -1657,6 +1657,15 @@ local function thermCalc(w, f, now, dt)
   if w.therm and f then
     w.therm.hMax = math.max(w.therm.hMax, f.agl)
     w.therm.h = f.agl
+    -- Netto-Steigen der Luft ueber die ganze Thermik: Vario plus Eigensinken, im Kreis mit Lastvielfachem
+    -- n = 1/cos(Querlage) korrigiert (Sinken ~ n^1.5), tan(Querlage) = omega * v / g
+    if w.polar and w.teN ~= nil and w.tasN and w.tasN * KMH > 15 then
+      local tb = (w.omega or 0) * w.tasN / 9.81
+      local n15 = (1 + tb * tb) ^ 0.75
+      local tm = w.therm
+      tm.nSum = (tm.nSum or 0) + (w.teN + polarSink(w.polar, w.tasN) * n15) * dt
+      tm.nT = (tm.nT or 0) + dt
+    end
   end
 end
 
@@ -2707,6 +2716,10 @@ local function paintTherm(w, W, H, top)
   yy = yy + valBox(m + half, yy, half, "Ø THERMIK", thAvg and string.format("%+.1f", thAvg) or "--", C_WHITE, F_L) + 4
   valBox(m, yy, half, "GEWINN", gain and string.format("%+d m", math.floor(gain + 0.5)) or "--", C_WHITE, F_L)
   yy = yy + valBox(m + half, yy, half, "HÖHE", f and string.format("%d m", math.floor(f.agl + 0.5)) or "--", C_WHITE, F_L) + 4
+  local tmN = tm or w.lastTherm
+  local nAvg = tmN and tmN.nT and tmN.nT > 5 and tmN.nSum / tmN.nT or nil
+  yy = yy + valBox(m, yy, lw, tm and "NETTO LUFT Ø THERMIK" or "NETTO LUFT Ø LETZTE THERMIK", nAvg and string.format("%+.1f", nAvg) or "--",
+    nAvg and (nAvg >= 0.1 and C_GREEN or (nAvg <= -0.1 and C_RED or C_WHITE)) or C_WHITE, F_L) + 4
   if T and f then
     local rest = T.maxAlt - f.agl
     valBox(m, yy, half, SMALL and "RESERVE" or ("RESERVE ZU " .. T.maxAlt), string.format("%d m", math.floor(rest + 0.5)), rest < 30 and C_RED or (rest < 80 and C_ORANGE or C_WHITE), FONT_STD)
@@ -2723,24 +2736,30 @@ local function paintTherm(w, W, H, top)
     local R = radius(w)
     local function Rf(x, yv) if T then return flatXY(T, x, yv) end return x, -yv end
     local cx, cy = mx0 + mw / 2, y + mh / 2
-    -- Ausschnitt: ganzes Dreieck (Massstab bleibt beim Kreisen gleich). Liegt das Modell
-    -- ausserhalb, rutscht das Dreieck ueber den Rand, das Modell bleibt im Bild.
-    local ox, oy, sc = f.x, f.y, math.min(mw, mh) / 2 / clamp(R * 2.2, 50, 300)
-    if T then
-      ox = (T.tp[1].x + T.tp[2].x + T.tp[3].x) / 3
-      oy = (T.tp[1].y + T.tp[2].y + T.tp[3].y) / 3
-      local span = 0
-      for i = 1, 3 do span = math.max(span, math.sqrt((T.tp[i].x - ox) ^ 2 + (T.tp[i].y - oy) ^ 2)) end
-      sc = math.min(mw, mh) / 2 / (span * 1.1 + 20)
-      -- weit weg: so weit herauszoomen, dass vom Dreieck noch ein Stueck im Bild bleibt
-      local dNear = math.huge
-      for i = 1, 3 do
-        local a, b = T.tp[i], T.tp[i % 3 + 1]
-        local vx, vy = b.x - a.x, b.y - a.y
-        local u = clamp(((f.x - a.x) * vx + (f.y - a.y) * vy) / (vx * vx + vy * vy), 0, 1)
-        dNear = math.min(dNear, math.sqrt((a.x + u * vx - f.x) ^ 2 + (a.y + u * vy - f.y) ^ 2))
+    -- Ausschnitt: fest um den Kreis gezoomt (Massstab nach Wenderadius), Mitte = Schwerpunkt der Kreise der
+    -- letzten 20 s im Luftmassen-System. Das Dreieck darf aus dem Bild fallen, dann zeigt ein Pfeil am Rand
+    -- zum naechsten Ziel.
+    local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
+    local nowc = os.clock()
+    local half = clamp(R * 3.5, 35, 150)
+    local sx, sy, sn = 0, 0, 0
+    for _, p in ipairs(w.trail) do
+      local age = nowc - p.t
+      if age < 20 then sx, sy, sn = sx + p.x + wx * age, sy + p.y + wy * age, sn + 1 end
+    end
+    local ox, oy = f.x, f.y
+    if sn >= 10 and (w.therm or w.circSince) then
+      ox, oy = sx / sn, sy / sn
+      -- Kreise fuellen das Bild: Massstab nach dem gemessenen Kreis statt nach dem gelernten Radius
+      local rMax = 0
+      for _, p in ipairs(w.trail) do
+        local age = nowc - p.t
+        if age < 20 then rMax = math.max(rMax, math.sqrt((p.x + wx * age - ox) ^ 2 + (p.y + wy * age - oy) ^ 2)) end
       end
-      if dNear > 1 then sc = math.min(sc, 0.8 * math.min(mw, mh) / dNear) end
+      half = clamp(rMax * 1.5, 25, 150)
+    end
+    local sc = math.min(mw, mh) / 2 / half
+    do
       local pad = 16
       local fx, fy = Rf(f.x - ox, f.y - oy)
       fx, fy = fx * sc, fy * sc
@@ -2790,8 +2809,6 @@ local function paintTherm(w, W, H, top)
     end
     -- Spur im Luftmassen-System (um den Wind zurueckversetzt), dann liegen die Kreise uebereinander
     local best, bv, bx0, by0 = nil, -99, 0, 0
-    local nowc = os.clock()
-    local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
     for _, p in ipairs(w.trail) do
       if nowc - p.t < 35 then
         local age = nowc - p.t
@@ -2813,19 +2830,35 @@ local function paintTherm(w, W, H, top)
     end
     CLIP = nil
     if T then planeFlat(T, ax0, ay0, f.crs, 8, C_WHITE) else planeSymbol(ax0, ay0, 8, C_WHITE) end
-    if T and w.state == S_STARTED then
-      local nxt = T.tp[ni]
-      local tx, ty = P(nxt.x, nxt.y)
-      if not (tx >= mx0 and tx <= mx0 + mw - 1 and ty >= y and ty <= y + mh - 1) then
-        -- naechster TP ausserhalb: gruener Punkt am Rand in seiner Richtung
-        local ex, ey = tx - (mx0 + mw / 2), ty - (y + mh / 2)
+    if T then
+      -- Ziel: naechster TP, vor dem Start die Startlinie
+      local started = w.state == S_STARTED
+      local gx, gy = 0, 0
+      if started then gx, gy = T.tp[ni].x, T.tp[ni].y end
+      local name = started and ("TP" .. ni) or "Start"
+      local dist = math.floor(math.sqrt((gx - f.x) ^ 2 + (gy - f.y) ^ 2) + 0.5)
+      local tx, ty = P(gx, gy)
+      if not (tx >= mx0 + 6 and tx <= mx0 + mw - 7 and ty >= y + 6 and ty <= y + mh - 7) then
+        -- Ziel ausserhalb: Pfeil am Rand in seiner Richtung, mit Distanz
+        local ccx, ccy = mx0 + mw / 2, y + mh / 2
+        local ex, ey = tx - ccx, ty - ccy
         local n = math.max(math.sqrt(ex * ex + ey * ey), 1e-3)
         ex, ey = ex / n, ey / n
-        local k = math.min((mw / 2 - 8) / math.max(math.abs(ex), 1e-3), (mh / 2 - 8) / math.max(math.abs(ey), 1e-3))
+        -- unten bleibt die Windzeile frei
+        local k = math.min((mw / 2 - 6) / math.max(math.abs(ex), 1e-3), (mh / 2 - (ey > 0 and 26 or 6)) / math.max(math.abs(ey), 1e-3))
+        local L = 34
+        local hx, hy = ccx + ex * k, ccy + ey * k
         lcd.color(C_GREEN)
-        disc(math.floor(mx0 + mw / 2 + ex * k), math.floor(y + mh / 2 + ey * k), 5)
+        arrow(hx - ex * L, hy - ey * L, ex, ey, L, 6, 9)
+        -- Beschriftung hinter dem Pfeilende, bei waagrechtem Pfeil darueber
+        local lx, ly = hx - ex * (L + 70), hy - ey * (L + 20)
+        if math.abs(ey) < 0.5 then lx, ly = hx - ex * (L / 2 + 60), hy - 30 end
+        lx = clamp(lx, mx0 + 64, mx0 + mw - 64)
+        ly = clamp(ly, y + 4, y + mh - 24)
+        drawT(lx - 60, ly, 120, string.format("%s %d m", name, dist), FONT_STD, C_GREEN, "c")
+      else
+        drawT(mx0 + 4, y + 2, mw, string.format("%s %d m", name, dist), FONT_S, C_GREEN, "l")
       end
-      drawT(mx0 + 4, y + 2, mw, string.format("TP%d %d m", ni, math.floor(math.sqrt((nxt.x - f.x) ^ 2 + (nxt.y - f.y) ^ 2) + 0.5)), FONT_S, C_GREEN, "l")
     end
     local wind = w.windOk and string.format("Wind %d km/h aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: noch kein Fit"
     drawT(mx0, y + mh - textH(FONT_XS) - 2, mw - 4, wind .. string.format("  R %d m", math.floor(R + 0.5)), FONT_XS, C_DIM, "r")
