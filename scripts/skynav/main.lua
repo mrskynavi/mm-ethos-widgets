@@ -369,7 +369,7 @@ end
 -- t1 (Ankunft an der ersten Ecke s), pts (Boden-Punkte fuer die Zeichnung), entry/exit (Boden).
 -- hdgNow (optional, Grad, Steuerkurs in der Luft): liegt die Tangente zum ersten Kreis hinter dem Modell
 -- (Kurvenbeginn verpasst), fliegt der Plan erst geradeaus weiter und wendet spaeter durch denselben Zielpunkt.
-local function planPath(px, py, wx, wy, V, R, C, hdgNow)
+local function planPath(px, py, wx, wy, V, R, C, hdgNow, noPts)
   V = math.max(V, 3)
   local n = #C
   local ts = {}
@@ -389,8 +389,15 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
     ts[k] = acc
     lx, ly = C[k].ax, C[k].ay
   end
+  -- Iteration der Ankunftszeiten (Kreise wandern mit dem Wind). Zeichenpunkte erst im letzten Durchgang,
+  -- sobald die Zeit steht (oder nach 6 Durchgaengen); spart viele Instruktionen.
   local res
-  for _ = 1, 6 do
+  local it, final, draw, prevAll = 0, false, false, nil
+  local lateT
+  while true do
+    it = it + 1
+    final = final or it >= 6
+    draw = final and not noPts
     res = {pts = {}}
     local L = 0
     local Z = {}
@@ -402,7 +409,7 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
     local thIn
     local thA = {}
     for k = 1, n do thA[k] = C[k].thA end
-    local function addPt(ax, ay, t) res.pts[#res.pts + 1] = {x = ax + wx * t, y = ay + wy * t} end
+    local function addPt(ax, ay, t) if draw then res.pts[#res.pts + 1] = {x = ax + wx * t, y = ay + wy * t} end end
     addPt(px, py, 0)
     -- Kurvenbeginn verpasst? Dann Kreis, der in Flugrichtung beruehrt und durch den Zielpunkt geht
     local forced = false
@@ -422,13 +429,21 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
         local gvx, gvy = V * hx + wx, V * hy + wy
         local gv = math.sqrt(gvx * gvx + gvy * gvy)
         if gv > 1 then
-          for Lg = 0, 300, 2 do
-            local t = Lg / gv
+          -- Suche des Punkts im Sektor haengt nicht von der Iteration ab: nur einmal rechnen
+          if lateT == nil then
+            lateT = false
+            for Lg = 0, 300, 2 do
+              local t = Lg / gv
+              local rx, ry = px + gvx * t - c1.tx, py + gvy * t - c1.ty
+              local rl = math.sqrt(rx * rx + ry * ry)
+              local dep = rx * c1.bx + ry * c1.by
+              if rl > 0.1 and dep >= c1.margin and dep / rl >= 0.7071 then lateT = t; break end
+            end
+          end
+          if lateT then
+            local t = lateT
             local gx, gy = px + gvx * t, py + gvy * t
-            local rx, ry = gx - c1.tx, gy - c1.ty
-            local rl = math.sqrt(rx * rx + ry * ry)
-            local dep = rx * c1.bx + ry * c1.by
-            if rl > 0.1 and dep >= c1.margin and dep / rl >= 0.7071 then
+            do
               forced = true
               local sx, sy = px + V * hx * t, py + V * hy * t       -- Luftpunkt des Kurvenbeginns
               local nxm, nym = -hy * s1, hx * s1                      -- Kreismitte auf der Kurvenseite
@@ -440,7 +455,6 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
               res.hdg = hdgNow % 360
               addPt(sx, sy, t)
               res.entry = {x = gx, y = gy}
-              break
             end
           end
         end
@@ -471,7 +485,7 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
       local arcA = arcAngle(thIn, thA[k], s)
       if arcA > 1.75 * PI then arcA = 0 end                         -- Zielpunkt eben ueberflogen
       -- Bogen bis zum Zielpunkt (fuer die Zeichnung in Schritten)
-      local steps = math.max(1, math.floor(arcA * R / 8))
+      local steps = draw and math.max(1, math.floor(arcA * R / 8)) or 0
       for j = 1, steps do
         local th = thIn + s * arcA * j / steps
         addPt(Z[k].x + R * math.cos(th), Z[k].y + R * math.sin(th), (L + arcA * R * j / steps) / V)
@@ -493,7 +507,7 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
       rx, ry = rx * sg + ex * cg, ry * sg + ey * cg
       local thOut = atan2(ry, rx)
       local arcB = arcAngle(thA[k], thOut, s)
-      local stepsB = math.max(1, math.floor(arcB * R / 8))
+      local stepsB = draw and math.max(1, math.floor(arcB * R / 8)) or 0
       for j = 1, stepsB do
         local th = thA[k] + s * arcB * j / stepsB
         addPt(Z[k].x + R * math.cos(th), Z[k].y + R * math.sin(th), (L + arcB * R * j / stepsB) / V)
@@ -508,6 +522,9 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow)
       addPt(Z[k + 1].x + R2 * rx, Z[k + 1].y + R2 * ry, L / V)
     end
     res.L, res.tAll = L, L / V
+    if final then break end
+    if prevAll and math.abs(res.tAll - prevAll) < 0.01 then final = true end
+    prevAll = res.tAll
   end
   return res
 end
@@ -1195,7 +1212,7 @@ local function setRef(w, f)
   local T = w.task
   if not T then return end
   local C = cornersFrom(T, w.tp + 1, 1, radiusFn(w), w.margin)
-  local p = planPath(f.x, f.y, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w), C)
+  local p = planPath(f.x, f.y, w.windOk and w.wx or 0, w.windOk and w.wy or 0, w.tasF or 20, radius(w), C, nil, true)
   local e = p.entry or {x = C[1].ax, y = C[1].ay}
   w.ref = {ax = f.x, ay = f.y, bx = e.x, by = e.y}
 end
@@ -1242,8 +1259,14 @@ local function assess(w, f, now)
   else
     w.slowSince = nil
   end
-  w.trail[#w.trail + 1] = {x = f.x, y = f.y, v = w.vFast or f.vz, t = now}
-  while #w.trail > 0 and now - w.trail[1].t > 70 do table.remove(w.trail, 1) end
+  -- Spur der letzten 70 s, hoechstens 4 Punkte pro Sekunde (haelt die Zeichenschleifen kurz)
+  local lp = w.trail[#w.trail]
+  if not lp or now - lp.t >= 0.25 then w.trail[#w.trail + 1] = {x = f.x, y = f.y, v = w.vFast or f.vz, t = now} end
+  if #w.trail > 0 and now - w.trail[1].t > 75 then
+    local k = {}
+    for _, p in ipairs(w.trail) do if now - p.t <= 70 then k[#k + 1] = p end end
+    w.trail = k
+  end
   -- ganzer Flugweg fuer die Uebersicht (ausgeduennt)
   w.track = w.track or {}
   local lt = w.track[#w.track]
@@ -1438,6 +1461,8 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
   local best
   local function offer(t0, dir, pts, n, ex, ey, h, tTurn)
     local sx, sy = ex or pts[n].x, ey or pts[n].y
+    -- untere Schranke (gerade mit Rueckenwind): aussichtslose Kandidaten nicht durchrechnen
+    if best and t0 + math.sqrt((nxt.x - sx) ^ 2 + (nxt.y - sy) ^ 2) / (V + math.sqrt(wx * wx + wy * wy)) >= best.t then return end
     local te, epts = exitCost(sx, sy, h)
     local tt = t0 + te
     if best and tt >= best.t then return end
@@ -1559,7 +1584,7 @@ local function glideCalc(w, f, full)
   local tRem
   local gsU = math.max(V + wx * T.ux + wy * T.uy, 3)                -- Grundgeschwindigkeit Richtung TP1
   if nRem > 0 then
-    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin), f.hdg)
+    local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin), f.hdg, true)
     tRem = (pr.tAll or 0) + T.dist / gsU
   else
     tRem = math.max(-(f.x * T.ux + f.y * T.uy), 0) / gsU
@@ -1873,20 +1898,19 @@ local function fl(v) return math.floor(v + 0.5) end
 -- Linien in Kartenansichten werden auf den Kasten CLIP beschnitten (Liang-Barsky)
 local CLIP = nil
 local function line(x1, y1, x2, y2)
-  if CLIP then
+  local C = CLIP
+  if C and not (x1 >= C[1] and x1 <= C[3] and y1 >= C[2] and y1 <= C[4] and x2 >= C[1] and x2 <= C[3] and y2 >= C[2] and y2 <= C[4]) then
+    -- Liang-Barsky ohne Hilfstabellen
     local dx, dy = x2 - x1, y2 - y1
     local t0, t1 = 0, 1
-    local p = {-dx, dx, -dy, dy}
-    local q = {x1 - CLIP[1], CLIP[3] - x1, y1 - CLIP[2], CLIP[4] - y1}
-    for k = 1, 4 do
-      if p[k] == 0 then
-        if q[k] < 0 then return end
-      else
-        local r = q[k] / p[k]
-        if p[k] < 0 then if r > t1 then return end; if r > t0 then t0 = r end
-        else if r < t0 then return end; if r < t1 then t1 = r end end
-      end
+    local function edge(p, q)
+      if p == 0 then return q >= 0 end
+      local r = q / p
+      if p < 0 then if r > t1 then return false end; if r > t0 then t0 = r end
+      else if r < t0 then return false end; if r < t1 then t1 = r end end
+      return true
     end
+    if not (edge(-dx, x1 - C[1]) and edge(dx, C[3] - x1) and edge(-dy, y1 - C[2]) and edge(dy, C[4] - y1)) then return end
     x1, y1, x2, y2 = x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy
   end
   lcd.drawLine(fl(x1), fl(y1), fl(x2), fl(y2))
@@ -2073,7 +2097,7 @@ end
 
 -- Schnittmenge von Halbebenen a*X + b*Y + k >= 0 (Bildschirm) im Kasten fuellen, Farbe vorher setzen
 function fillHP(HP, x0, y0, bw, bh)
-  for yr = math.floor(y0), math.floor(y0 + bh - 1), 2 do
+  for yr = math.floor(y0), math.floor(y0 + bh - 1), 3 do
     local lo, hi = x0, x0 + bw - 1
     for _, h in ipairs(HP) do
       local rhs = -(h[2] * yr + h[3])
@@ -2082,7 +2106,7 @@ function fillHP(HP, x0, y0, bw, bh)
       elseif h[1] > 0 then lo = math.max(lo, rhs / h[1])
       else hi = math.min(hi, rhs / h[1]) end
     end
-    if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, 2) end
+    if hi > lo then rect(math.floor(lo), yr, math.floor(hi - lo) + 1, math.min(3, y0 + bh - yr)) end
   end
 end
 
@@ -2265,14 +2289,36 @@ local function paintOver(w, W, H, top)
       line(ax, ay, bx, by)
     end
   end
-  -- Flugweg: vor dem Start grau, in der Aufgabe weiss
+  -- Flugweg: vor dem Start grau, in der Aufgabe weiss. Die Bildpunkte werden zwischengespeichert (der Massstab
+  -- haengt nur am Dreieck), neue Punkte nur ab 4 px Abstand, hoechstens die letzten 400 Stuecke.
   local tr = w.track or {}
-  for k = 2, #tr do
-    local a, b = tr[k - 1], tr[k]
-    lcd.color(b.on and C_WHITE or rgb(100, 100, 100))
-    local ax, ay = P(a.x, a.y)
-    local bx, by = P(b.x, b.y)
-    line(ax, ay, bx, by)
+  local key = string.format("%.4f %.1f %.1f %.1f %.1f %s", sc, ccx, ccy, cx, cy, tostring(T))
+  local oc = w.ovTrack
+  if not oc or oc.key ~= key or oc.n > #tr then oc = {key = key, n = 0, xs = {}, ys = {}, on = {}}; w.ovTrack = oc end
+  for k = oc.n + 1, #tr do
+    local p = tr[k]
+    local ax, ay = P(p.x, p.y)
+    local m0 = #oc.xs
+    if m0 == 0 or (ax - oc.xs[m0]) ^ 2 + (ay - oc.ys[m0]) ^ 2 >= 16 or p.on ~= oc.on[m0] then
+      oc.xs[m0 + 1], oc.ys[m0 + 1], oc.on[m0 + 1] = ax, ay, p.on
+    end
+  end
+  oc.n = #tr
+  if #oc.xs > 480 then
+    local xs, ys, on = {}, {}, {}
+    for k = #oc.xs - 400, #oc.xs do xs[#xs + 1], ys[#ys + 1], on[#on + 1] = oc.xs[k], oc.ys[k], oc.on[k] end
+    oc.xs, oc.ys, oc.on = xs, ys, on
+  end
+  local xs, ys, on = oc.xs, oc.ys, oc.on
+  local lastOn
+  for k = 2, #xs do
+    if on[k] ~= lastOn then lastOn = on[k]; lcd.color(on[k] and C_WHITE or rgb(100, 100, 100)) end
+    line(xs[k - 1], ys[k - 1], xs[k], ys[k])
+  end
+  -- das juengste Stueck bis zur aktuellen Position
+  if #tr > 0 and #xs > 0 then
+    local ax, ay = P(tr[#tr].x, tr[#tr].y)
+    line(xs[#xs], ys[#ys], ax, ay)
   end
   -- Marken: Start gelb, Wendepunkt gruen, Runde fertig blau
   for _, mk in ipairs(w.marks or {}) do
