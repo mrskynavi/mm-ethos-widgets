@@ -2190,17 +2190,17 @@ local function paintOver(w, W, H, top)
   end
   -- Bild: rechts = Richtung O -> TP1, oben = Richtung O -> TP2
   local function R(x, yv) return flatXY(T, x, yv) end
-  -- Ausschnitt: Dreieck, Linie im Bereich des Dreiecks und das Modell
+  -- Ausschnitt: nur das Dreieck (mit Sektorkanten), damit es bei jeder Schenkellaenge gleich gross ist.
+  -- Ein Modell ausserhalb steht am Rand, mit seiner Distanz zum naechsten Ziel.
   local pts = {{0, 0}, {T.tp[1].x, T.tp[1].y}, {T.tp[2].x, T.tp[2].y}, {T.tp[3].x, T.tp[3].y}}
   for i = 1, 3 do local c = T.tp[i]; pts[#pts + 1] = {c.x + c.bx * T.dist * 0.25, c.y + c.by * T.dist * 0.25} end
-  if f then pts[#pts + 1] = {f.x, f.y} end
   local x1, y1, x2, y2 = math.huge, math.huge, -math.huge, -math.huge
   for _, q in ipairs(pts) do
     local rx, ry = R(q[1], q[2])
     x1, y1, x2, y2 = math.min(x1, rx), math.min(y1, ry), math.max(x2, rx), math.max(y2, ry)
   end
   local pad = 18
-  local sc = math.min((mw - 2 * pad) / math.max(x2 - x1, 50), (mh - 2 * pad) / math.max(y2 - y1, 50))
+  local sc = math.min((mw - 2 * pad) / math.max(x2 - x1, 0.1), (mh - 2 * pad) / math.max(y2 - y1, 0.1))
   local ccx, ccy = (x1 + x2) / 2, (y1 + y2) / 2
   local cx, cy = mx0 + mw / 2, y + mh / 2
   local function P(x, yv)
@@ -2301,6 +2301,14 @@ local function paintOver(w, W, H, top)
     local fx, fy = P(f.x, f.y)
     predFlat(function(x, yv) local qx, qy = P(x, yv); return qx + px - fx, qy + py - fy end, f, C_ORANGE)
     planeFlat(T, px, py, f.crs, 8, C_WHITE)
+    if px ~= fx or py ~= fy then
+      local gx, gy = 0, 0
+      if w.state == S_STARTED and ni <= 3 then gx, gy = T.tp[ni].x, T.tp[ni].y end
+      local d = math.floor(math.sqrt((f.x - gx) ^ 2 + (f.y - gy) ^ 2) + 0.5)
+      local lx = clamp(px - 60, mx0 + 2, mx0 + mw - 122)
+      local ly = py < y + mh / 2 and py + 12 or py - 12 - textH(FONT_S)
+      drawT(lx, ly, 120, string.format("%s %d m", (w.state == S_STARTED and ni <= 3) and ("TP" .. ni) or "Linie", d), FONT_S, C_WHITE, "c")
+    end
   end
   CLIP = nil
   -- Wind (wohin er blaest), im Bild der Übersicht
