@@ -1160,6 +1160,7 @@ local function readInputs(w, now, dt)
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
     return nil
   end
+  if lat ~= w.lastLat or lon ~= w.lastLon then w.posMoveT = now end   -- fuer die Warnung "GPS steht"
   local dtFix = w.gSeen and (now - w.gSeen) or 1
   w.lastLat, w.lastLon, w.gSeen, w.gpsOk = lat, lon, now, true
   local T = w.task
@@ -2143,7 +2144,6 @@ local function header(w, W)
   elseif w.state == S_ARMED then st, col = ">> SCHARF <<", C_ORANGE
   elseif w.state == S_STARTED then st, col = string.format("RUNDE %d  %s", #w.laps + 1, w.tp == 3 and "ZIEL" or ("TP" .. (w.tp + 1))), C_GREEN
   elseif w.state == S_STOPPED then st, col = "BEENDET", C_BLUE end
-  if not w.gpsOk then st, col = st .. "  GPS?", C_RED end
   local ls = math.floor(localNow(w)) % 86400
   local clock
   if W < 600 then
@@ -2153,6 +2153,12 @@ local function header(w, W)
     if w.state == S_STOPPED then st = "ENDE" end
   else
     clock = string.format("%02d:%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60, ls % 60)
+  end
+  if not w.gpsOk then st, col = st .. "  GPS?", C_RED end
+  -- scharf oder in der Aufgabe, aber die Position aendert sich seit 8 s nicht: Sensor ohne Fix sendet oft
+  -- die letzte Position weiter
+  if w.gpsOk and (w.state == S_ARMED or w.state == S_STARTED) and w.posMoveT and os.clock() - w.posMoveT > 8 then
+    st, col = st .. "  GPS STEHT", C_RED
   end
   clock = clock .. (gpsClock(w) and "" or "*")
   drawT(W * 0.4, 2, W * 0.6 - 6, st .. "  " .. clock, FONT_S, col, "r")
