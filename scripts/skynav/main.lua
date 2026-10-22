@@ -2919,40 +2919,57 @@ end
 local function paintGlide(w, W, H, top)
   local T, f, g = w.task, w.cur, w.gc or {}
   local m = 6
-  -- Links: Sollfahrt, die vier Werte so gross, dass sie die ganze Hoehe fuellen
+  -- Links: Sollfahrt. Schrift wie die drei Felder unten (gemeinsame Groesse, siehe fitFont)
   local lw = math.floor(W * 0.24)
   local y = top
-  if w.polar then
-    local barW = SMALL and 22 or 48
-    stfBar(w, m, y, barW, H - y - m)
-    local tx = m + barW + 8
-    local tw = lw - barW - 8
+  local barW = SMALL and 22 or 48
+  local tx, tw = m + barW + 8, lw - barW - 8
+  local leftVals = w.polar and {
+    {"SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE},
+    {"IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE},
+    {"MC", string.format("%.1f", w.mcValue), C_WHITE},
+    {"NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE)},
+  } or nil
+  -- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen; alle gleich gross
+  local function fitFont(fields, fw, fh)
     local hL = textH(FONT_XS)
-    local vf = F_L
-    for _, fo in ipairs({FONT_XXL, FONT_XL, F_L}) do
-      if fo and 4 * (hL + textH(fo)) <= H - y - m then vf = fo; break end
+    for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L, FONT_STD}) do
+      lcd.font(fo)
+      local _, th = lcd.getTextSize("0")
+      local ok = true
+      if leftVals then
+        if 4 * (hL + th) > H - y - m then ok = false end
+        for _, v in ipairs(leftVals) do if ok and lcd.getTextSize(v[2]) > tw then ok = false end end
+      end
+      if ok and fields then
+        if textH(FONT_S) + th + 4 > fh then ok = false end
+        lcd.font(fo)
+        for _, v in ipairs(fields) do if ok and v[2] and lcd.getTextSize(v[2]) > fw - 14 then ok = false end end
+      end
+      if ok then return fo end
     end
-    local step = math.floor((H - y - m) / 4)
-    local yy = y
-    valBox(tx, yy, tw, "SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE, vf)
-    yy = yy + step
-    valBox(tx, yy, tw, "IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--",
-      (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE, vf)
-    yy = yy + step
-    valBox(tx, yy, tw, "MC", string.format("%.1f", w.mcValue), C_WHITE, vf)
-    w.mcBox = {x = tx, y = yy, w = tw, h = step}
-    yy = yy + step
-    valBox(tx, yy, tw, "NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE), vf)
-  else
-    drawT(m, y, lw, "Polare fehlt", FONT_S, C_ORANGE, "l")
-    drawT(m, y + textH(FONT_S), lw, "(Sollfahrt aus)", FONT_XS, C_DIM, "l")
-    valBox(m, y + 2 * textH(FONT_S) + 4, lw, "FAHRT", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", C_WHITE, F_L)
+    return FONT_STD
+  end
+  local function drawLeft(vf)
+    if leftVals then
+      stfBar(w, m, y, barW, H - y - m)
+      local step = math.floor((H - y - m) / 4)
+      for i, v in ipairs(leftVals) do
+        valBox(tx, y + (i - 1) * step, tw, v[1], v[2], v[3], vf)
+        if i == 3 then w.mcBox = {x = tx, y = y + 2 * step, w = tw, h = step} end
+      end
+    else
+      drawT(m, y, lw, "Polare fehlt", FONT_S, C_ORANGE, "l")
+      drawT(m, y + textH(FONT_S), lw, "(Sollfahrt aus)", FONT_XS, C_DIM, "l")
+      valBox(m, y + 2 * textH(FONT_S) + 4, lw, "FAHRT", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", C_WHITE, vf)
+    end
   end
   -- Rechts: Navigation
   local nx = lw + m * 2
   local nw = W - nx - m
-  if not T then drawT(nx, y, nw, "Keine Aufgabe", F_L, C_RED, "c"); return end
+  if not T then drawLeft(fitFont()); drawT(nx, y, nw, "Keine Aufgabe", F_L, C_RED, "c"); return end
   if w.state ~= S_STARTED or not g.plan or not f then
+    drawLeft(fitFont())
     drawT(nx, y + 10, nw, w.state == S_STOPPED and "Aufgabe beendet" or "Noch nicht gestartet", F_L, C_DIM, "c")
     if f then
       local dx, dy = -f.x, -f.y
@@ -2961,6 +2978,7 @@ local function paintGlide(w, W, H, top)
     return
   end
   if g.corner then
+    drawLeft(fitFont())
     local infoH = textH(FONT_S) + 2
     paintCorner(w, g, nx, y, nw, H - y - m - infoH)
     local sc = scoreOf(w)
@@ -3088,24 +3106,22 @@ local function paintGlide(w, W, H, top)
     return nil
   end
   local fh = H - m - yy
+  local fw = nw / 3
+  local vals = {}
+  for i, code in ipairs({w.glideF1, w.glideF2, w.glideF3}) do vals[i] = {field(code)} end
+  -- eine Schrift fuer alle sieben Werte (vier links, drei unten)
+  local vf = fitFont(fh > 20 and vals or nil, fw, fh)
+  drawLeft(vf)
   if fh > 20 then
-    local fw = nw / 3
     local hL = textH(FONT_S)
-    for i, code in ipairs({w.glideF1, w.glideF2, w.glideF3}) do
+    for i = 1, 3 do
       local x = nx + (i - 1) * fw
       lcd.color(rgb(17, 17, 17))
       rect(x + 2, yy, fw - 4, fh)
-      local lab, val, vc = field(code)
-      if lab then
-        drawT(x + 8, yy + 2, fw - 12, lab, FONT_S, C_DIM, "l")
-        -- groesste Schrift, die in Hoehe und Breite passt
-        local vf = FONT_STD
-        for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L}) do
-          lcd.font(fo)
-          local tw, th = lcd.getTextSize(val)
-          if hL + th + 4 <= fh and tw <= fw - 14 then vf = fo; break end
-        end
-        drawT(x + 8, yy + 2 + hL, fw - 12, val, vf, vc, "l")
+      local v = vals[i]
+      if v[1] then
+        drawT(x + 8, yy + 2, fw - 12, v[1], FONT_S, C_DIM, "l")
+        drawT(x + 8, yy + 2 + hL, fw - 12, v[2], vf, v[3], "l")
       end
     end
   end
