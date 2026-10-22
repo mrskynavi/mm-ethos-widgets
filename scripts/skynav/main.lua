@@ -2499,6 +2499,13 @@ local function paintOver(w, W, H, top)
       local lx = clamp(px - 60, mx0 + 2, mx0 + mw - 122)
       local ly = py < y + mh / 2 and py + 12 or py - 12 - textH(FONT_S)
       drawT(lx, ly, 120, string.format("%s %d m", (w.state == S_STARTED and ni <= 3) and ("TP" .. ni) or "Linie", d), FONT_S, C_WHITE, "c")
+      -- weit weg vom Dreieck: meist ist eine andere Aufgabe aktiv als die, an deren Ort man steht
+      local dO = math.sqrt(f.x * f.x + f.y * f.y)
+      if dO > math.max(200, 3 * T.dist) then
+        local txt = dO >= 1000 and string.format("%.1f km", dO / 1000) or string.format("%d m", math.floor(dO + 0.5))
+        drawT(mx0, y + mh / 2 - textH(FONT_STD), mw, "Modell " .. txt .. " vom Dreieck", FONT_STD, C_ORANGE, "c")
+        drawT(mx0, y + mh / 2 + 2, mw, "Aufgabe: " .. T.name, FONT_S, C_ORANGE, "c")
+      end
     end
   end
   CLIP = nil
