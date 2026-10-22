@@ -718,12 +718,25 @@ local function gpsSecs(w)
   return nil
 end
 
+-- Senderuhr (os.time). Ohne gueltige Uhr wirft os.time() auf dem Sender "time result cannot be represented":
+-- dann weiter ab dem letzten guten Wert (oder ab 0) mit os.clock(). Die GPS-Zeit korrigiert das ohnehin.
+local radioTime
+do
+  local base
+  function radioTime()
+    local ok, t = pcall(os.time)
+    if ok and type(t) == "number" then base = t - os.clock(); return t, true end
+    return math.floor((base or 0) + os.clock()), false
+  end
+end
+
 local function updateGpsClock(w, now)
   local v = gpsSecs(w)
   if not v or v <= 0 then return end
-  local radio = (os and os.time) and os.time() or 0
+  local radio = radioTime()
   local guess = radio - (w.utcOffset or 0) * 60
   local utc
+  w.gpsFull = v > 1e8                                          -- GPS liefert auch das Datum
   if v > 1e8 then utc = v
   elseif v < 86400 then
     utc = guess - guess % 86400 + v
@@ -739,7 +752,7 @@ end
 -- UTC-Zeit: vom GPS, wenn es eine Zeit liefert; sonst os.time() der Senderuhr minus Versatz (Minuten). Die App
 -- schreibt den Versatz ihres Rechners in aufgaben.lua; in der Konfiguration laesst er sich ueberschreiben.
 local function utcNow(w)
-  local t = (os and os.time) and os.time() or 0
+  local t = radioTime()
   if gpsClock(w) then return t + w.gpsDelta end
   return t - (w.utcOffset or 0) * 60
 end
@@ -1345,6 +1358,14 @@ local function assess(w, f, now)
     if w.state == S_ARMED then
       local a, b = slotWindow(w)
       local nowClock = utcNow(w)
+      -- ohne gueltige Uhr (Senderuhr kaputt, GPS ohne Zeit) laesst sich das Fenster nicht pruefen: Start gilt
+      -- Ohne gueltige Senderuhr ist das Datum unbekannt (GPS meist nur Tageszeit): dann nur die Tageszeit pruefen
+      local _, clockOk = radioTime()
+      if a and not clockOk and not (gpsClock(w) and w.gpsFull) then
+        local d = a % 86400
+        a, b, nowClock = d, d + (b - a), nowClock % 86400
+        if nowClock < a - 43200 then nowClock = nowClock + 86400 end
+      end
       if a and (nowClock < a or nowClock > b) then
         note(w, nowClock < a and "Start ungültig: Fenster noch zu" or "Start ungültig: Fenster vorbei", now)
         w.badStartT = now
@@ -2435,7 +2456,7 @@ local function paintOver(w, W, H, top)
     polyAff(route, cx - ccx * sc, T.ux * sc, T.uy * sc, cy - ccy * sc, -T.px * sc, -T.py * sc)
   end
   -- Flugweg: vor dem Start grau, in der Aufgabe weiss. Die Bildpunkte werden zwischengespeichert (der Massstab
-  -- haengt nur am Dreieck), neue Punkte nur ab 6 px Abstand, hoechstens die letzten 250 Stuecke.
+  -- haengt nur am Dreieck), neue Punkte nur ab 8 px Abstand, hoechstens die letzten ~150 Stuecke.
   local tr = w.track or {}
   local key = string.format("%.4f %.1f %.1f %.1f %.1f %s", sc, ccx, ccy, cx, cy, tostring(T))
   local oc = w.ovTrack
@@ -2444,14 +2465,14 @@ local function paintOver(w, W, H, top)
     local p = tr[k]
     local ax, ay = P(p.x, p.y)
     local m0 = #oc.xs
-    if m0 == 0 or (ax - oc.xs[m0]) ^ 2 + (ay - oc.ys[m0]) ^ 2 >= 36 or p.on ~= oc.on[m0] then
+    if m0 == 0 or (ax - oc.xs[m0]) ^ 2 + (ay - oc.ys[m0]) ^ 2 >= 64 or p.on ~= oc.on[m0] then
       oc.xs[m0 + 1], oc.ys[m0 + 1], oc.on[m0 + 1] = ax, ay, p.on
     end
   end
   oc.n = #tr
-  if #oc.xs > 300 then
+  if #oc.xs > 150 then
     local xs, ys, on = {}, {}, {}
-    for k = #oc.xs - 250, #oc.xs do xs[#xs + 1], ys[#ys + 1], on[#on + 1] = oc.xs[k], oc.ys[k], oc.on[k] end
+    for k = #oc.xs - 110, #oc.xs do xs[#xs + 1], ys[#ys + 1], on[#on + 1] = oc.xs[k], oc.ys[k], oc.on[k] end
     oc.xs, oc.ys, oc.on = xs, ys, on
   end
   local xs, ys, on = oc.xs, oc.ys, oc.on
