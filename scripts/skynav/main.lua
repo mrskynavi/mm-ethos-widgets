@@ -962,6 +962,9 @@ local NUM_DEFS = {
   {key = "startToneLogic", def = 1}, -- 1 = zu tief gibt hohe Toene, 2 = zu hoch gibt hohe Toene
   {key = "startSpan", def = 400},   -- m, Start-Seite: Karte von der Linie bis zum linken Rand (fester Massstab)
   {key = "trackMin",  def = 3},     -- Uebersicht: Flugweg der letzten x Minuten (0 = keiner)
+  {key = "glideF1",   def = 1},     -- Seite Gleiten, Felder unten (App): 0 leer, 1 TP, 2 Wenden in, 3 Hoehe,
+  {key = "glideF2",   def = 2},     -- 4 Hoehe Ziellinie, 5 Rest, 6 Runde, 7 letzte Runde, 8 Grund, 9 Gleitzahl,
+  {key = "glideF3",   def = 4},     -- 10 Vario 30 s, 11 Gegenwind, 12 Seitenwind, 13 Ablage, 14 Dreiecke, 15 Radius
 }
 local BOOL_DEFS = {
   {key = "sound", def = true},
@@ -981,7 +984,7 @@ local TEXT_DEFS = {
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
-  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000},
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000}, glideF1 = {0, 15}, glideF2 = {0, 15}, glideF3 = {0, 15},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
 }
@@ -2916,21 +2919,30 @@ end
 local function paintGlide(w, W, H, top)
   local T, f, g = w.task, w.cur, w.gc or {}
   local m = 6
-  -- Links: Sollfahrt
+  -- Links: Sollfahrt, die vier Werte so gross, dass sie die ganze Hoehe fuellen
   local lw = math.floor(W * 0.24)
   local y = top
   if w.polar then
-    local barW = 26
+    local barW = SMALL and 22 or 48
     stfBar(w, m, y, barW, H - y - m)
-    local tx = m + barW + 6
-    local tw = lw - barW - 6
+    local tx = m + barW + 8
+    local tw = lw - barW - 8
+    local hL = textH(FONT_XS)
+    local vf = F_L
+    for _, fo in ipairs({FONT_XXL, FONT_XL, F_L}) do
+      if fo and 4 * (hL + textH(fo)) <= H - y - m then vf = fo; break end
+    end
+    local step = math.floor((H - y - m) / 4)
     local yy = y
-    yy = yy + valBox(tx, yy, tw, "SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE, F_L)
-    yy = yy + valBox(tx, yy, tw, "IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--",
-      (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE, F_L)
-    yy = yy + valBox(tx, yy, tw, "MC", string.format("%.1f", w.mcValue), C_WHITE, F_L)
-    w.mcBox = {x = tx, y = yy - textH(F_L), w = tw, h = textH(F_L)}
-    valBox(tx, yy, tw, "NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE), FONT_STD)
+    valBox(tx, yy, tw, "SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE, vf)
+    yy = yy + step
+    valBox(tx, yy, tw, "IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--",
+      (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE, vf)
+    yy = yy + step
+    valBox(tx, yy, tw, "MC", string.format("%.1f", w.mcValue), C_WHITE, vf)
+    w.mcBox = {x = tx, y = yy, w = tw, h = step}
+    yy = yy + step
+    valBox(tx, yy, tw, "NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE), vf)
   else
     drawT(m, y, lw, "Polare fehlt", FONT_S, C_ORANGE, "l")
     drawT(m, y + textH(FONT_S), lw, "(Sollfahrt aus)", FONT_XS, C_DIM, "l")
@@ -2948,112 +2960,155 @@ local function paintGlide(w, W, H, top)
     end
     return
   end
-  local infoH = textH(FONT_S) + 2
   if g.corner then
+    local infoH = textH(FONT_S) + 2
     paintCorner(w, g, nx, y, nw, H - y - m - infoH)
-  else
-    -- Kommando gross
-    local err = g.err or 0
-    local a = math.abs(err)
-    local cmd, col
-    if g.plan.turnDir then cmd, col = g.plan.turnDir > 0 and "< KURVE LINKS" or "KURVE RECHTS >", C_ORANGE
-    elseif g.plan.inTurn then cmd, col = "KURVE", C_BLUE
-    elseif a < 5 then cmd, col = "KURS OK", C_GREEN
-    elseif err > 0 then cmd, col = string.format("%d° RECHTS >", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE
-    else cmd, col = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE end
-    local th = drawT(nx, y, nw, cmd, F_XL, col, "c")
-    local yy = y + th + 4
-    -- Kursgrafik: links Steuerpfeil, rechts Querablage zur Soll-Linie (blau) mit Flugzeug und oben einem
-    -- Balken fuer die erwartete Ablage in PRED_S Sekunden (jetziger Kurs ueber Grund).
-    local cdiH = SMALL and 38 or 78
-    local sq = cdiH
-    lcd.color(rgb(25, 25, 25))
-    rect(nx, yy, sq, cdiH)
-    do
-      -- Steuerpfeil: Soll-Kurs relativ zur Nase, oben = geradeaus
-      local acx, acy = nx + sq / 2, yy + cdiH / 2
-      local ang = math.rad(err)
-      local L = sq / 2 - 5
-      local ux, uy = math.sin(ang), -math.cos(ang)
-      lcd.color(a < 5 and C_GREEN or (a >= w.cmdMin and C_ORANGE or C_WHITE))
-      arrow(acx - ux * L * 0.75, acy - uy * L * 0.75, ux, uy, L * 1.75, math.max(4, sq / 9), math.max(7, sq / 5))
-    end
-    local cx0, cw = nx + sq + 4, nw - sq - 4
-    lcd.color(rgb(25, 25, 25))
-    rect(cx0, yy, cw, cdiH)
-    local xt = g.xt or 0
-    local far = math.abs(xt) > 300
-    local ccx = cx0 + cw / 2
-    if far then
-      -- weit daneben (z. B. abgetrieben): kein Massstab mehr, Peilung direkt zur naechsten Ecke
-      drawT(cx0, yy + 2, cw, string.format("WEIT DANEBEN  %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_S, C_ORANGE, "c")
-      drawT(cx0, yy + 2 + textH(FONT_S), cw, string.format("TP%d direkt %03d°  %.1f km", g.next, math.floor(g.brgTP + 0.5), g.dV / 1000), SMALL and FONT_STD or FONT_L, C_WHITE, "c")
-    else
-      local xp = g.xtPred or xt
-      local rng = (math.max(math.abs(xt), math.abs(xp)) > 100) and 300 or 100
-      local half = cw / 2 - 14
-      lcd.color(C_GRID)
-      for k = -2, 2 do local tx = ccx + k * half / 2; line(tx, yy + 4, tx, yy + cdiH - 4) end
-      lcd.color(C_BLUE)
-      line(ccx, yy, ccx, yy + cdiH)
-      line(ccx + 1, yy, ccx + 1, yy + cdiH)
-      local ppx = ccx + clamp(xt / rng, -1, 1) * half
-      local qx = ccx + clamp(xp / rng, -1, 1) * half
-      local pcol = math.abs(xp) < 20 and C_GREEN or C_ORANGE
-      -- Balken oben: erwartete Ablage in PRED_S s, von der Soll-Linie bis dorthin
-      local bh = SMALL and 6 or 10
-      local by = yy + 4
-      lcd.color(pcol)
-      rect(math.min(ccx, qx), by, math.max(math.abs(qx - ccx), 2), bh)
-      -- Flugzeug wie bisher bei der aktuellen Ablage
-      planeSymbol(ppx, yy + cdiH * 0.62, SMALL and 9 or 13, math.abs(xt) < 20 and C_GREEN or C_WHITE)
-      local pTxt = string.format("in %d s: %d m %s", PRED_S, math.floor(math.abs(xp) + 0.5), math.abs(xp) < 3 and "auf Linie" or (xp > 0 and "rechts" or "links"))
-      local lx = (qx > ccx) and (cx0 + 4) or (ccx + 8)
-      drawT(lx, by + bh + 2, cw / 2 - 12, pTxt, FONT_S, pcol, "l")
-      drawT(cx0 + 4, yy + cdiH - textH(FONT_XS) - 1, cw, string.format("+-%d m", rng), FONT_XS, C_DIM, "l")
-    end
-    -- Seitenwind nur klein unten rechts
-    if g.cross and math.abs(g.cross) >= 2 then
-      drawT(cx0, yy + cdiH - textH(FONT_XS) - 1, cw - 4, string.format("Seitenwind %d von %s", math.floor(math.abs(g.cross) + 0.5), g.cross > 0 and "links" or "rechts"), FONT_XS, C_DIM, "r")
-    end
-    yy = yy + cdiH + 2
-    if not far and not SMALL then
-      drawT(nx, yy, nw, string.format("Ablage %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_XS, C_DIM, "c")
-      yy = yy + textH(FONT_XS) + 4
-    else yy = yy + 2 end
-    local col3 = math.floor(nw / 3)
-    valBox(nx, yy, col3, "TP" .. g.next, string.format("%d m", math.floor(g.dV + 0.5)), C_WHITE, F_L)
-    valBox(nx + col3, yy, col3, "WENDEN IN", fmtMS(g.plan.tT), (g.plan.tT or 99) < 10 and C_ORANGE or C_WHITE, F_L)
-    local hf = g.hFin
-    local hfCol = hf and (hf < 30 and C_RED or (hf < 80 and C_ORANGE or C_WHITE)) or C_DIM
-    if SMALL then
-      -- kleiner Bildschirm: Zielhoehe statt Radius, Gegen-/Rueckenwind in der Infozeile
-      yy = yy + valBox(nx + 2 * col3, yy, col3, "ZIEL-HÖHE", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, F_L) + 4
-    else
-      local hw = g.head
-      local hwTxt = hw and string.format("%d km/h", math.floor(math.abs(hw) + 0.5)) or "--"
-      yy = yy + valBox(nx + 2 * col3, yy, col3, hw and (hw >= 0 and "GEGENWIND" or "RÜCKENWIND") or "WIND", hwTxt,
-        hw and (hw >= 0 and C_ORANGE or C_GREEN) or C_DIM, F_L) + 4
-    end
-    local lapNow = (f.clk or 0) - (w.lapT or f.clk)
-    if not SMALL and yy + textH(FONT_XS) + textH(FONT_STD) < H - m - infoH then
-      valBox(nx, yy, col3, "HÖHE AM ZIEL", hf and string.format("%d m", math.floor(hf + 0.5)) or "--", hfCol, FONT_STD)
-      valBox(nx + col3, yy, col3, "RUNDE " .. (#w.laps + 1), fmtMS(lapNow), C_WHITE, FONT_STD)
-      valBox(nx + 2 * col3, yy, col3, "RADIUS", string.format("%d m", math.floor(g.R + 0.5)), (w.radii and w.radii[w.modelName or "?"]) and C_WHITE or C_DIM, FONT_STD)
-    end
-  end
-  -- Infozeile unten
-  local sc = scoreOf(w)
-  local wind = w.windOk and string.format("Wind %d aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: kreisen"
-  local last = w.laps[#w.laps]
-  local lastTxt = last and string.format("  Letzte %.1f km/h%s", last.speed, last.idx and string.format(" %.1f%%", last.idx) or "") or ""
-  if SMALL and g.head then
-    local hw = g.head
-    drawT(nx, H - m - infoH + 2, nw, string.format("%s %d", hw >= 0 and "GEGENWIND" or "RÜCKENWIND", math.floor(math.abs(hw) + 0.5)), FONT_STD, hw >= 0 and C_ORANGE or C_GREEN, "l")
-    drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d", sc.n), FONT_S, C_DIM, "r")
+    local sc = scoreOf(w)
+    local wind = w.windOk and string.format("Wind %d aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: kreisen"
+    drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d  %s", sc.n, wind), FONT_S, C_DIM, "c")
     return
   end
-  drawT(nx, H - m - infoH + 2, nw, string.format("Dreiecke %d%s  %s", sc.n, lastTxt, wind), FONT_S, C_DIM, "c")
+  -- Gegen-/Rueckenwind links (Feld), daneben das Ablagefenster bis zum rechten Rand
+  local hb = SMALL and 26 or 46
+  local cx0, cw = nx + hb + 6, nw - hb - 6
+  local ccx = cx0 + cw / 2
+  -- Kommando gross; Rechts steht links der Mitte, Links rechts davon: > und < zeigen auf die Mitte
+  local err = g.err or 0
+  local a = math.abs(err)
+  local cmd, col, side
+  if g.plan.turnDir then cmd, col, side = g.plan.turnDir > 0 and "< KURVE LINKS" or "KURVE RECHTS >", C_ORANGE, g.plan.turnDir > 0 and 1 or -1
+  elseif g.plan.inTurn then cmd, col, side = "KURVE", C_BLUE, 0
+  elseif a < 5 then cmd, col, side = "KURS OK", C_GREEN, 0
+  elseif err > 0 then cmd, col, side = string.format("%d° RECHTS >", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, -1
+  else cmd, col, side = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, 1 end
+  local th
+  if side < 0 then th = drawT(nx, y, ccx - 12 - nx, cmd, F_XL, col, "r")
+  elseif side > 0 then th = drawT(ccx + 12, y, nx + nw - ccx - 12, cmd, F_XL, col, "l")
+  else th = drawT(ccx - nw, y, 2 * nw, cmd, F_XL, col, "c") end
+  local yy = y + th + 4
+  local cdiH = SMALL and 54 or 100
+  local k = cdiH / 100
+  lcd.color(rgb(25, 25, 25))
+  rect(nx, yy, hb, cdiH)
+  rect(cx0, yy, cw, cdiH)
+  -- Gegenwind: Pfeil vom oberen Rand nach unten (orange), Rueckenwind vom unteren Rand nach oben (gruen)
+  local hw = g.head
+  if hw and math.abs(hw) >= 1 then
+    local hcx = nx + hb / 2
+    local L = clamp(math.abs(hw) * 14 * k, 4, cdiH - 44 * k)
+    local hcol = hw > 0 and C_ORANGE or C_GREEN
+    lcd.color(hcol)
+    local sw, hh, hl = 6 * k, 17 * k, 18 * k
+    local num = string.format("%d", math.floor(math.abs(hw) + 0.5))
+    local nh = textH(FONT_S)
+    if hw > 0 then
+      rect(hcx - sw, yy + 2, 2 * sw, L)
+      tri(hcx, yy + 2 + L + hl, hcx - hh, yy + 2 + L, hcx + hh, yy + 2 + L)
+      drawT(nx, math.min(yy + 4 + L + hl, yy + cdiH - nh), hb, num, FONT_S, hcol, "c")
+    else
+      rect(hcx - sw, yy + cdiH - 2 - L, 2 * sw, L)
+      tri(hcx, yy + cdiH - 2 - L - hl, hcx - hh, yy + cdiH - 2 - L, hcx + hh, yy + cdiH - 2 - L)
+      drawT(nx, math.max(yy + cdiH - 4 - L - hl - nh, yy), hb, num, FONT_S, hcol, "c")
+    end
+  end
+  local xt = g.xt or 0
+  local far = math.abs(xt) > 300
+  if far then
+    -- weit daneben (z. B. abgetrieben): kein Massstab mehr, Peilung direkt zur naechsten Ecke
+    drawT(cx0, yy + 2, cw, string.format("WEIT DANEBEN  %d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "rechts" or "links"), FONT_S, C_ORANGE, "c")
+    drawT(cx0, yy + 2 + textH(FONT_S), cw, string.format("TP%d direkt %03d°  %.1f km", g.next, math.floor(g.brgTP + 0.5), g.dV / 1000), SMALL and FONT_STD or FONT_L, C_WHITE, "c")
+  else
+    local xp = g.xtPred or xt
+    local rng = (math.max(math.abs(xt), math.abs(xp)) > 100) and 300 or 100
+    local half = cw / 2 - 4
+    lcd.color(C_GRID)
+    for j = -3, 3 do if j ~= 0 then local tx = ccx + j * half / 4; line(tx, yy, tx, yy + cdiH) end end
+    -- Balken oben: erwartete Ablage in PRED_S s, von der Soll-Linie bis dorthin
+    local qx = ccx + clamp(xp / rng, -1, 1) * half
+    lcd.color(math.abs(xp) < 20 and C_GREEN or C_ORANGE)
+    rect(math.min(ccx, qx), yy + 4 * k, math.max(math.abs(qx - ccx), 2), 34 * k)
+    lcd.color(C_BLUE)
+    line(ccx, yy, ccx, yy + cdiH)
+    line(ccx + 1, yy, ccx + 1, yy + cdiH)
+    drawT(ccx + 4, yy + 40 * k, cw / 2, string.format("±%d m", rng), FONT_XS, C_DIM, "l")
+    -- Flugzeug (Dreieck) bei der aktuellen Ablage, zwischen Balken und Seitenwindpfeil
+    local ppx = ccx + clamp(xt / rng, -1, 1) * half
+    lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
+    tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k)
+  end
+  -- Seitenwind unten: Pfeil vom Rand her, von links nach rechts bei Wind von links und umgekehrt
+  local cr = g.cross
+  if cr and math.abs(cr) >= 1 then
+    local L = clamp(math.abs(cr) * 14 * k, 4, cw / 2 - 40)
+    local ay = yy + cdiH - 11 * k
+    local num = string.format("%d", math.floor(math.abs(cr) + 0.5))
+    lcd.color(C_BLUE)
+    if cr > 0 then
+      local x0 = cx0 + 2
+      rect(x0, ay - 3 * k, L, 6 * k)
+      tri(x0 + L + 14 * k, ay, x0 + L, ay - 10 * k, x0 + L, ay + 10 * k)
+      drawT(x0 + L + 18 * k, ay - textH(FONT_S) / 2, 60, num, FONT_S, C_BLUE, "l")
+    else
+      local x1 = cx0 + cw - 2
+      rect(x1 - L, ay - 3 * k, L, 6 * k)
+      tri(x1 - L - 14 * k, ay, x1 - L, ay - 10 * k, x1 - L, ay + 10 * k)
+      drawT(x1 - L - 18 * k - 60, ay - textH(FONT_S) / 2, 60, num, FONT_S, C_BLUE, "r")
+    end
+  end
+  yy = yy + cdiH + 8
+  -- Unten drei Felder, in der App waehlbar (glideF1..3)
+  local hf = g.hFin
+  local function field(code)
+    if code == 1 then return "TP" .. g.next, string.format("%d m", math.floor(g.dV + 0.5)), C_WHITE
+    elseif code == 2 then return "WENDEN IN", fmtMS(g.plan.tT), (g.plan.tT or 99) < 10 and C_ORANGE or C_WHITE
+    elseif code == 3 then return "HÖHE", string.format("%d m", math.floor(f.agl + 0.5)), C_WHITE
+    elseif code == 4 then
+      return "HÖHE ZIELLINIE", hf and string.format("%+d m", math.floor(hf + 0.5)) or "--",
+        hf and (hf < 30 and C_RED or (hf < 80 and C_ORANGE or C_GREEN)) or C_DIM
+    elseif code == 5 then local r = restTime(w); return "REST", r and fmtMS(math.max(r, 0)) or "--", C_WHITE
+    elseif code == 6 then return "RUNDE " .. (#w.laps + 1), fmtMS((f.clk or 0) - (w.lapT or f.clk)), C_WHITE
+    elseif code == 7 then local l = w.laps[#w.laps]; return "LETZTE RUNDE", l and string.format("%.1f", l.speed) or "--", C_WHITE
+    elseif code == 8 then return "GRUND km/h", string.format("%d", math.floor((w.gsF or f.gs or 0) * KMH + 0.5)), C_WHITE
+    elseif code == 9 then
+      local vz = f.vz or 0
+      return "GLEITZAHL", vz < -0.05 and string.format("%d", math.floor((w.gsF or f.gs or 0) / -vz + 0.5)) or "--", C_WHITE
+    elseif code == 10 then
+      local s, n = 0, w.avg30 and #w.avg30 or 0
+      for j = 1, n do s = s + w.avg30[j] end
+      local v = n > 0 and s / n or 0
+      return "VARIO Ø 30 s", string.format("%+.1f", v), v >= 0 and C_GREEN or C_RED
+    elseif code == 11 then
+      return hw and (hw >= 0 and "GEGENWIND" or "RÜCKENWIND") or "WIND", hw and string.format("%d km/h", math.floor(math.abs(hw) + 0.5)) or "--",
+        hw and (hw >= 0 and C_ORANGE or C_GREEN) or C_DIM
+    elseif code == 12 then
+      return "SEITENWIND", cr and string.format("%d %s", math.floor(math.abs(cr) + 0.5), cr > 0 and "v. li" or "v. re") or "--", C_WHITE
+    elseif code == 13 then return "ABLAGE", string.format("%d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "re" or "li"), C_WHITE
+    elseif code == 14 then return "DREIECKE", string.format("%d", scoreOf(w).n), C_WHITE
+    elseif code == 15 then return "RADIUS", string.format("%d m", math.floor((g.R or 0) + 0.5)), C_WHITE end
+    return nil
+  end
+  local fh = H - m - yy
+  if fh > 20 then
+    local fw = nw / 3
+    local hL = textH(FONT_S)
+    for i, code in ipairs({w.glideF1, w.glideF2, w.glideF3}) do
+      local x = nx + (i - 1) * fw
+      lcd.color(rgb(17, 17, 17))
+      rect(x + 2, yy, fw - 4, fh)
+      local lab, val, vc = field(code)
+      if lab then
+        drawT(x + 8, yy + 2, fw - 12, lab, FONT_S, C_DIM, "l")
+        -- groesste Schrift, die in Hoehe und Breite passt
+        local vf = FONT_STD
+        for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L}) do
+          lcd.font(fo)
+          local tw, th = lcd.getTextSize(val)
+          if hL + th + 4 <= fh and tw <= fw - 14 then vf = fo; break end
+        end
+        drawT(x + 8, yy + 2 + hL, fw - 12, val, vf, vc, "l")
+      end
+    end
+  end
 end
 
 local function paintTherm(w, W, H, top)
