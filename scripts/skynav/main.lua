@@ -961,6 +961,7 @@ local NUM_DEFS = {
   {key = "slotLen",   def = 10},
   {key = "startToneLogic", def = 1}, -- 1 = zu tief gibt hohe Toene, 2 = zu hoch gibt hohe Toene
   {key = "startSpan", def = 400},   -- m, Start-Seite: Karte von der Linie bis zum linken Rand (fester Massstab)
+  {key = "trackMin",  def = 3},     -- Uebersicht: Flugweg der letzten x Minuten (0 = keiner)
 }
 local BOOL_DEFS = {
   {key = "sound", def = true},
@@ -2456,35 +2457,57 @@ local function paintOver(w, W, H, top)
     polyAff(route, cx - ccx * sc, T.ux * sc, T.uy * sc, cy - ccy * sc, -T.px * sc, -T.py * sc)
   end
   -- Flugweg: vor dem Start grau, in der Aufgabe weiss. Die Bildpunkte werden zwischengespeichert (der Massstab
-  -- haengt nur am Dreieck), neue Punkte nur ab 8 px Abstand, hoechstens die letzten ~150 Stuecke.
+  -- haengt nur am Dreieck), neue Punkte ab 8 px Abstand, nur die letzten trackMin Minuten (Konfiguration).
   local tr = w.track or {}
+  local lim = (w.trackMin or 3) * 60
   local key = string.format("%.4f %.1f %.1f %.1f %.1f %s", sc, ccx, ccy, cx, cy, tostring(T))
   local oc = w.ovTrack
-  if not oc or oc.key ~= key or oc.n > #tr then oc = {key = key, n = 0, xs = {}, ys = {}, on = {}}; w.ovTrack = oc end
+  if not oc or oc.key ~= key or oc.n > #tr then oc = {key = key, n = 0, xs = {}, ys = {}, on = {}, ts = {}, gap = 64}; w.ovTrack = oc end
+  local xs, ys, on, ts = oc.xs, oc.ys, oc.on, oc.ts
   for k = oc.n + 1, #tr do
     local p = tr[k]
     local ax, ay = P(p.x, p.y)
-    local m0 = #oc.xs
-    if m0 == 0 or (ax - oc.xs[m0]) ^ 2 + (ay - oc.ys[m0]) ^ 2 >= 64 or p.on ~= oc.on[m0] then
-      oc.xs[m0 + 1], oc.ys[m0 + 1], oc.on[m0 + 1] = ax, ay, p.on
+    local m0 = #xs
+    if m0 == 0 or (ax - xs[m0]) ^ 2 + (ay - ys[m0]) ^ 2 >= oc.gap or p.on ~= on[m0] then
+      xs[m0 + 1], ys[m0 + 1], on[m0 + 1], ts[m0 + 1] = ax, ay, p.on, p.t or 0
     end
   end
   oc.n = #tr
-  if #oc.xs > 150 then
-    local xs, ys, on = {}, {}, {}
-    for k = #oc.xs - 110, #oc.xs do xs[#xs + 1], ys[#ys + 1], on[#on + 1] = oc.xs[k], oc.ys[k], oc.on[k] end
-    oc.xs, oc.ys, oc.on = xs, ys, on
+  -- vorne alles aelter als die eingestellte Spurlaenge abschneiden
+  local nowT, n = os.clock(), #xs
+  local i0 = 1
+  while i0 <= n and nowT - ts[i0] > lim do i0 = i0 + 1 end
+  if i0 > 1 then
+    for _, a in ipairs({xs, ys, on, ts}) do
+      table.move(a, i0, n, 1)
+      for k = n - i0 + 2, n do a[k] = nil end
+    end
+    n = #xs
   end
-  local xs, ys, on = oc.xs, oc.ys, oc.on
-  local lastOn
-  for k = 2, #xs do
-    if on[k] ~= lastOn then lastOn = on[k]; lcd.color(on[k] and C_WHITE or rgb(100, 100, 100)) end
-    line(xs[k - 1], ys[k - 1], xs[k], ys[k])
+  -- zu viele Stuecke (lange Spur, schneller Flug): jeden zweiten Punkt weglassen und den Abstand verdoppeln,
+  -- so bleibt die ganze Zeitspanne sichtbar und das Zeichnen unter der Instruktionsgrenze
+  if n > 160 then
+    local j = 0
+    for k = 1, n do
+      if k % 2 == 1 or k == n or on[k] ~= on[k - 1] then
+        j = j + 1
+        xs[j], ys[j], on[j], ts[j] = xs[k], ys[k], on[k], ts[k]
+      end
+    end
+    for k = j + 1, n do xs[k], ys[k], on[k], ts[k] = nil, nil, nil, nil end
+    oc.gap, n = oc.gap * 4, j
   end
-  -- das juengste Stueck bis zur aktuellen Position
-  if #tr > 0 and #xs > 0 then
-    local ax, ay = P(tr[#tr].x, tr[#tr].y)
-    line(xs[#xs], ys[#ys], ax, ay)
+  if lim > 0 then
+    local lastOn
+    for k = 2, n do
+      if on[k] ~= lastOn then lastOn = on[k]; lcd.color(on[k] and C_WHITE or rgb(100, 100, 100)) end
+      line(xs[k - 1], ys[k - 1], xs[k], ys[k])
+    end
+    -- das juengste Stueck bis zur aktuellen Position
+    if #tr > 0 and n > 0 then
+      local ax, ay = P(tr[#tr].x, tr[#tr].y)
+      line(xs[n], ys[n], ax, ay)
+    end
   end
   -- Marken: Start gelb, Wendepunkt gruen, Runde fertig blau
   for _, mk in ipairs(w.marks or {}) do
@@ -3374,6 +3397,7 @@ local function configure(w)
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
   addSwitch(w, "Ton-Schalter (optional)", "soundSw")
   addSource(w, "MC Poti (optional)", "mcSrc")
+  addNumber(w, "Übersicht: Spur der letzten x min (0 = aus)", "trackMin", 0, 5)
   -- Zeit
   addNumber(w, "Startfenster von Hand: Stunde (-1 = Aufgabe)", "slotH", -1, 23)
   addNumber(w, "Startfenster von Hand: Minute", "slotM", 0, 59)
