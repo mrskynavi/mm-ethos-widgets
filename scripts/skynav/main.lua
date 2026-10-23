@@ -1985,7 +1985,12 @@ function RZ.search(w, now)
   local best = 1e9
   for j = 1, nm do best = math.min(best, (ev(N + 1, j, dh0))) end
   r.N, r.mcz, r.behind = N, mi and RZ.M[mi], best * F - avail
+  local _, _, dhN = ev(N, mi or 1, dh0)
   r.slack = mi and rest - ev(N, mi, dh0) * F or nil
+  -- Hoehe reicht ohne Kreisen und der Zeit-MC liegt ueber dem Steigen: Hoehe wird gezielt in Fahrt umgesetzt
+  r.down = mi ~= nil and dhN <= dh0 and RZ.M[mi] > Vc
+  -- kein Dreieck mehr moeglich: bestes Gleiten (MC 0), ab jetzt zaehlt nur noch sicheres Landen
+  if not mi then r.mcz = 0 end
   -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
   r.hgo = nil
   if mi then
@@ -3093,7 +3098,7 @@ local function paintGlide(w, W, H, top)
   local leftVals = w.polar and {
     {"SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE},
     {"IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE},
-    rzM and {"ZEIT-MC", string.format("%.1f", rzM), C_BLUE} or {"MC", string.format("%.1f", w.mcValue), C_WHITE},
+    rzM and {"MC ZEIT", string.format("%.1f", rzM), C_BLUE} or {"MC", string.format("%.1f", w.mcValue), C_WHITE},
     {"NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE)},
   } or nil
   -- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen; alle gleich gross
@@ -3122,7 +3127,17 @@ local function paintGlide(w, W, H, top)
       local step = math.floor((H - y - m) / 4)
       for i, v in ipairs(leftVals) do
         valBox(tx, y + (i - 1) * step, tw, v[1], v[2], v[3], vf)
-        if i == 3 then w.mcBox = {x = tx, y = y + 2 * step, w = tw, h = step} end
+        if i == 3 then
+          w.mcBox = {x = tx, y = y + 2 * step, w = tw, h = step}
+          -- MC ZEIT mit Pfeil nach unten: Hoehe wird abgebaut
+          if rzM and rz.down then
+            lcd.font(FONT_XS)
+            local lw2, lh2 = lcd.getTextSize(v[1])
+            local ax, ay = tx + lw2 + 4 + lh2 * 0.3, y + 2 * step + lh2 * 0.5
+            lcd.color(C_BLUE)
+            tri(ax, ay + lh2 * 0.3, ax - lh2 * 0.3, ay - lh2 * 0.1, ax + lh2 * 0.3, ay - lh2 * 0.1)
+          end
+        end
       end
     else
       drawT(m, y, lw, "Polare fehlt", FONT_S, C_ORANGE, "l")
@@ -3268,15 +3283,16 @@ local function paintGlide(w, W, H, top)
       return "SEITENWIND", cr and string.format("%d %s", math.floor(math.abs(cr) + 0.5), cr > 0 and "v. li" or "v. re") or "--", C_WHITE
     elseif code == 13 then return "ABLAGE", string.format("%d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "re" or "li"), C_WHITE
     elseif code == 14 then
-      -- geflogen / erreichbar in der Arbeitszeit (~ bis die erste Runde den Lernfaktor geliefert hat)
-      local n = #w.laps
-      if not (rz and rz.N) then return "DREIECKE", string.format("%d", n), C_WHITE end
-      local b = rz.behind
-      local lb = (b and b > 0 and b < 60) and string.format("DREIECKE  +1: %d s", math.floor(b + 0.5))
-        or (rz.slack and string.format("DREIECKE  Rest %d s", math.floor(rz.slack + 0.5)) or "DREIECKE")
-      return lb, string.format("%d/%s%d", n, rz.f and "" or "~", n + rz.N), rz.N > 0 and C_WHITE or C_RED
+      -- Restzeit-Sollfahrt: Dreiecke, die noch in die Arbeitszeit passen (das laufende zaehlt mit), darunter
+      -- Reserve, was fuer eines mehr fehlt, Hoehenabbau oder "kein weiteres". Ohne Rechnung: geflogene Dreiecke.
+      if not (rz and rz.N) then return "DREIECKE", string.format("%d", #w.laps), C_WHITE end
+      local N, b = rz.N, rz.behind
+      if N == 0 then return "DREIECKE", "0", C_ORANGE, "kein weiteres", "", C_ORANGE end
+      if b and b > 0 and b < 30 then return "DREIECKE", string.format("%d", N), C_WHITE, string.format("%d", N + 1), string.format("fehlen %d s", math.floor(b + 0.5)), C_ORANGE end
+      if rz.down then return "DREIECKE", string.format("%d", N), C_WHITE, "Höhe wird abgebaut", nil, C_BLUE end
+      return "DREIECKE", string.format("%d", N), C_WHITE, rz.slack and string.format("Reserve %+d s", math.floor(rz.slack + 0.5)), nil, C_GREEN
     elseif code == 15 then return "RADIUS", string.format("%d m", math.floor((g.R or 0) + 0.5)), C_WHITE
-    elseif code == 16 then return "ZEIT-MC", rz and rz.mcz and string.format("%.1f", rz.mcz) or "--", C_BLUE
+    elseif code == 16 then return "MC ZEIT", rz and rz.mcz and string.format("%.1f", rz.mcz) or "--", C_BLUE
     elseif code == 17 then
       return "ENDANFLUG AB", rz and rz.hgo and string.format("%d m", math.floor(rz.hgo + 0.5)) or "--",
         rz and rz.hgo and (f.agl >= rz.hgo and C_GREEN or (rz.over and C_ORANGE or C_WHITE)) or C_DIM end
@@ -3298,7 +3314,26 @@ local function paintGlide(w, W, H, top)
       local v = vals[i]
       if v[1] then
         drawT(x + 8, yy + 2, fw - 12, v[1], FONT_S, C_DIM, "l")
-        drawT(x + 8, yy + 2 + hL, fw - 12, v[2], vf, v[3], "l")
+        local th, tw = drawT(x + 8, yy + 2 + hL, fw - 12, v[2], vf, v[3], "l")
+        if v[6] then
+          -- Feld der Restzeit-Sollfahrt: gestrichelter blauer Rahmen, Dreieck hinter der Zahl, Zeile darunter
+          lcd.color(C_BLUE)
+          for d = 0, fw - 14, 16 do rect(x + 3 + d, yy + 1, 8, 1); rect(x + 3 + d, yy + fh - 2, 8, 1) end
+          for d = 0, fh - 10, 16 do rect(x + 3, yy + 1 + d, 1, 8); rect(x + fw - 4, yy + 1 + d, 1, 8) end
+          local function triO(tx0, ty0, sz, col)
+            lcd.color(col)
+            line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
+          end
+          triO(x + 8 + tw + th * 0.15, yy + 2 + hL + th * 0.22, th * 0.55, v[3])
+          if v[4] and yy + 2 + hL + th + hL <= yy + fh then
+            local sy = yy + 2 + hL + th
+            local _, w1 = drawT(x + 8, sy, fw - 12, v[4], FONT_S, v[6], "l")
+            if v[5] then
+              triO(x + 12 + w1, sy + hL * 0.2, hL * 0.55, v[6])
+              if v[5] ~= "" then drawT(x + 16 + w1 + hL * 0.6, sy, fw - 12, v[5], FONT_S, v[6], "l") end
+            end
+          end
+        end
       end
     end
   end
