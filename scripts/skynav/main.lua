@@ -30,7 +30,7 @@
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den kleinsten MC, der sie schafft (Tippen auf das
--- MC-Feld schaltet zwischen festem MC und MC ZEIT; mit MC-Poti gilt immer der Poti-Wert). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
+-- MC-Feld schaltet zwischen festem MC und MC ZEIT; mit MC-Poti: Anschlag oben = MC ZEIT). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
 --
 -- IGC: Das Widget schreibt ab dem Scharfschalten bzw. Abheben (mit 90 s Vorlauf) eine IGC-Datei nach
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
@@ -1924,7 +1924,9 @@ function RZ.table(w, now)
   -- Steigen: im Bart ab 20 s dessen Mittel (wie Ø THERMIK), sonst die letzten Baerte, sonst MC
   local tm = w.therm
   local vt = tm and tm.h and now - tm.t0 >= 20 and (tm.h - tm.h0) / (now - tm.t0) or nil
-  r.vcU = math.max(0.2, vt or r.vc or math.max(0.5, w.mcValue))
+  -- (Poti am Anschlag fuer MC ZEIT: dessen MC ist kein Steigen, dann 1 m/s)
+  local mcV = (validSource(w.mcSrc) and not w.rzMan) and 1 or w.mcValue
+  r.vcU = math.max(0.2, vt or r.vc or math.max(0.5, mcV))
   if r.mcz then r.mcS, r.mcN = r.mcS + (w.rzMan and w.mcValue or r.mcz), r.mcN + 1 end
   -- Schenkel O-TP1-TP2-TP3-O: Laenge, Wind laengs (positiv = Rueckenwind) und quer
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
@@ -2087,12 +2089,12 @@ local function wakeup(w)
   if dt > 0.5 then dt = 0.5 end
   refreshTasks(w, now, false)
   refreshPolar(w, now, false)
-  -- MC ZEIT oder fester MC: mit MC-Poti gilt immer der Poti-Wert; ohne Poti der feste MC, Tippen auf das
-  -- MC-Feld schaltet auf MC ZEIT und zurueck
-  w.rzMan = validSource(w.mcSrc) ~= nil or not w.rzTap
-  if not validSource(w.mcSrc) then w.mcValue = w.mc / 10 else
+  -- MC ZEIT oder fester MC: mit MC-Poti gilt der Poti-Wert, am Anschlag oben (ab 99 %) MC ZEIT; ohne Poti
+  -- der feste MC, Tippen auf das MC-Feld schaltet auf MC ZEIT und zurueck
+  if not validSource(w.mcSrc) then w.mcValue = w.mc / 10; w.rzMan = not w.rzTap else
     local v = readNumber(w.mcSrc)
     if v then w.mc = math.floor(clamp((v + 1024) / 2048, 0, 1) * w.mcMax + 0.5); w.mcValue = w.mc / 10 end
+    w.rzMan = not (v and v >= 1004)
   end
   -- ARM
   -- Jede Betaetigung (Flanke) stellt scharf, nach einem misslungenen Start startet sie neu. Taster und
