@@ -3307,6 +3307,10 @@ local function paintGlide(w, W, H, top)
   drawLeft(vf)
   if fh > 20 then
     local hL = textH(FONT_S)
+    -- Werte aller drei Felder auf gleicher Hoehe: Wert und Zeile darunter zusammen mittig unter der Beschriftung
+    lcd.font(vf)
+    local _, thv = lcd.getTextSize("0")
+    local vy = yy + 2 + hL + math.max(math.floor((fh - 2 - hL - thv - hL) / 2), 0)
     for i = 1, 3 do
       local x = nx + (i - 1) * fw
       lcd.color(rgb(17, 17, 17))
@@ -3314,19 +3318,16 @@ local function paintGlide(w, W, H, top)
       local v = vals[i]
       if v[1] then
         drawT(x + 8, yy + 2, fw - 12, v[1], FONT_S, C_DIM, "l")
-        local th, tw = drawT(x + 8, yy + 2 + hL, fw - 12, v[2], vf, v[3], "l")
+        local th, tw = drawT(x + 8, vy, fw - 12, v[2], vf, v[3], "l")
         if v[6] then
-          -- Feld der Restzeit-Sollfahrt: gestrichelter blauer Rahmen, Dreieck hinter der Zahl, Zeile darunter
-          lcd.color(C_BLUE)
-          for d = 0, fw - 14, 16 do rect(x + 3 + d, yy + 1, 8, 1); rect(x + 3 + d, yy + fh - 2, 8, 1) end
-          for d = 0, fh - 10, 16 do rect(x + 3, yy + 1 + d, 1, 8); rect(x + fw - 4, yy + 1 + d, 1, 8) end
+          -- Feld der Restzeit-Sollfahrt: Dreieck hinter der Zahl, Zeile darunter
           local function triO(tx0, ty0, sz, col)
             lcd.color(col)
             line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
           end
-          triO(x + 8 + tw + th * 0.15, yy + 2 + hL + th * 0.22, th * 0.55, v[3])
-          if v[4] and yy + 2 + hL + th + hL <= yy + fh then
-            local sy = yy + 2 + hL + th
+          triO(x + 8 + tw + th * 0.15, vy + th * 0.22, th * 0.55, v[3])
+          if v[4] and vy + th + hL <= yy + fh then
+            local sy = vy + th
             local _, w1 = drawT(x + 8, sy, fw - 12, v[4], FONT_S, v[6], "l")
             if v[5] then
               triO(x + 12 + w1, sy + hL * 0.2, hL * 0.55, v[6])
