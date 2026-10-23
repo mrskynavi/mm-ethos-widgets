@@ -28,6 +28,10 @@
 -- (und damit der Versatz der Ecken) werden dreimal nachgerechnet. Daraus kommen der Soll-Steuerkurs
 -- (Kommando "x Grad links/rechts") und die Zeit bis zum Einleiten der Kurve (Piepse davor).
 --
+-- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
+-- viele Dreiecke noch passen, und zeigt statt des festen MC den kleinsten MC, der sie schafft (Tippen auf das
+-- MC-Feld schaltet fuer den Flug auf den festen MC). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
+--
 -- IGC: Das Widget schreibt ab dem Scharfschalten bzw. Abheben (mit 90 s Vorlauf) eine IGC-Datei nach
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
@@ -964,7 +968,11 @@ local NUM_DEFS = {
   {key = "trackMin",  def = 3},     -- Uebersicht: Flugweg der letzten x Minuten (0 = keiner)
   {key = "glideF1",   def = 1},     -- Seite Gleiten, Felder unten (App): 0 leer, 1 TP, 2 Wenden in, 3 Hoehe,
   {key = "glideF2",   def = 2},     -- 4 Hoehe Ziellinie, 5 Rest, 6 Runde, 7 letzte Runde, 8 Grund, 9 Gleitzahl,
-  {key = "glideF3",   def = 4},     -- 10 Vario 30 s, 11 Gegenwind, 12 Seitenwind, 13 Ablage, 14 Dreiecke, 15 Radius
+  {key = "glideF3",   def = 4},     -- 10 Vario 30 s, 11 Gegenwind, 12 Seitenwind, 13 Ablage, 14 Dreiecke, 15 Radius,
+                                    -- 16 Zeit-MC, 17 Endanflug ab
+  {key = "rzRes",     def = 3},     -- Restzeit-Sollfahrt: Zeitreserve % der Restzeit (mind. 15 s)
+  {key = "rzPilot",   def = 3},     -- Pilotfaktor % (laengerer Weg auf den letzten zwei Runden)
+  {key = "rzHmin",    def = 60},    -- m, tiefste Hoehe, auf der man noch gleiten will
 }
 local BOOL_DEFS = {
   {key = "sound", def = true},
@@ -974,6 +982,7 @@ local BOOL_DEFS = {
   {key = "varioTone", def = false},   -- Vario-Ton macht normalerweise der Sender selbst
   {key = "startTone", def = true},
   {key = "autoPage", def = true},
+  {key = "rzOn", def = true},        -- Restzeit-Sollfahrt (Zeit-MC) statt festem MC
 }
 local TEXT_DEFS = {
   {key = "compId", def = ""},
@@ -984,9 +993,10 @@ local TEXT_DEFS = {
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
-  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000}, glideF1 = {0, 15}, glideF2 = {0, 15}, glideF3 = {0, 15},
+  winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000}, glideF1 = {0, 17}, glideF2 = {0, 17}, glideF3 = {0, 17},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
+  rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
 }
 
 local function applyAppSettings(w, st)
@@ -1015,6 +1025,7 @@ local function resetFlight(w)
   w.track, w.marks = {}, {}
   w.ref, w.tpT, w.tpPrev = nil, nil, nil
   w.therm = nil
+  w.rz, w.rzMan, w.rzPh = nil, nil, nil
   w.evalScroll = 0
   w.msg, w.msgT = nil, nil
 end
@@ -1626,7 +1637,9 @@ local function nettoCalc(w, f, dt)
     w.netto = lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8)
     local head = nil
     if w.windOk and f.hdg then local hx, hy = dirVec(f.hdg); head = -(w.wx * hx + w.wy * hy) end
-    w.vstf = speedToFly(p, w.mcValue, clamp(w.netto, -5, 5), head)
+    -- Zeit-MC, solange er gilt (Tippen auf das MC-Feld schaltet fuer diesen Flug auf den festen MC)
+    local rz = not w.rzMan and w.rz
+    w.vstf = speedToFly(p, rz and rz.mcz or w.mcValue, clamp(w.netto, -5, 5), head)
     w.stfDv = ((w.tasF or f.tas) - w.vstf) * KMH
   elseif not w.polar then
     w.vstf, w.stfDv = nil, nil
@@ -1810,6 +1823,7 @@ local function thermCalc(w, f, now, dt)
   end
   if w.therm and w.straightSince and now - w.straightSince > 8 then
     w.lastTherm = w.therm
+    w.therm.tEnd = now - 8
     w.therm, w.circSince = nil, nil
     -- abgetrieben: Querablage ab hier neu messen (Linie vom Ausstieg zur naechsten Ecke)
     if w.state == S_STARTED and f then setRef(w, f) end
@@ -1843,6 +1857,151 @@ local function thermTones(w, now)
     w.varTT = now + 0.9
   else
     w.varTT = now + 0.2
+  end
+end
+
+-- ---------------------------------------------------------------- Restzeit-Sollfahrt (Zeit-MC)
+-- Wie viele Dreiecke passen noch in die Arbeitszeit (Netto pro Schenkel, Wind, Steigen, Hoehe), und welcher
+-- MC schafft sie mit der kleinsten Fahrt (Zeit-MC)? Pro Schenkel i und MC m: Sollfahrt v (Polare, Gegenwind,
+-- Netto des Schenkels), Zeit pro Meter 1/vg, Hoehenverlust pro Meter (Sinken - Netto)/vg. N Dreiecke (das
+-- laufende zaehlt als erstes): Gleitzeit = Index k * (Rest dieser Runde + (N-1) Runden), die Hoehe, die ueber
+-- hmin fehlt, wird mit Vc gestiegen. Pilotfaktor z auf den letzten zwei Runden, Lernfaktor f = echte durch
+-- modellierte Rundenzeit. Zeit-MC = kleinster m, mit dem N_max noch in Restzeit minus Reserve passt (bei zu
+-- viel Hoehe ergibt das von selbst mehr Fahrt). Zwei Portionen (Tabelle, Suche) in Aufrufen ohne GPS-Fix,
+-- hoechstens einmal pro Sekunde (Instruktionsgrenze).
+local RZ = {M = {}}
+for i = 0, 24 do RZ.M[i + 1] = i * 0.25 end
+
+-- Lernen und Tabelle pro MC-Wert: Rest dieser Runde (TP, HP) und ganze Runde (TL, HL), ohne Index k
+function RZ.table(w, now)
+  local T, f, p, r = w.task, w.cur, w.polar, w.rz
+  if not (T and f and p and w.rzOn and w.state == S_STARTED and w.startT) then w.rz = nil; return end
+  if not r or r.startT ~= w.startT then
+    r = {startT = w.startT, net = {0, 0, 0, 0}, ks = {}, nl = #w.laps, mcS = 0, mcN = 0, dist = 0, tL = now}
+    w.rz = r
+  end
+  local dt = math.min(now - r.tL, 3)
+  r.tL = now
+  local leg = math.min(w.tp, 3) + 1
+  -- Gleitstrecke ohne Baerte (fuer den Index), Netto nur geradeaus. Strecke im Kreisen erst merken: war es
+  -- nur eine Wende (Bart unter 20 s), zaehlt sie doch, nach einem Bart die 8 s Geradeausflug am Ende.
+  local ld = w.lapDist or 0
+  local dd = ld >= (r.ld or 0) and ld - (r.ld or 0) or ld
+  r.ld = ld
+  if w.therm then r.thd = (r.thd or 0) + dd else
+    r.dist = r.dist + dd
+    if w.netto and (w.omega or 0) < math.rad(8) then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 3) - r.net[leg]) * dt / 60 end
+  end
+  -- Steigen pro Bart (Mittel der letzten Baerte)
+  local lt = w.lastTherm
+  if lt and lt ~= r.th then
+    r.th = lt
+    local dur = (lt.tEnd or now) - lt.t0
+    r.dist, r.thd = r.dist + (r.thd or 0) * (dur < 20 and 1 or 8 / (dur + 8)), 0
+    if dur > 20 and lt.hMax > lt.h0 + 5 then local c = (lt.hMax - lt.h0) / dur; r.vc = r.vc and (r.vc + c) / 2 or c end
+  end
+  -- Runde fertig: Index und Lernfaktor f (Hoehengewinn/-verlust der Runde mit Vc umgerechnet)
+  if #w.laps > r.nl then
+    r.nl = #w.laps
+    local L = w.laps[r.nl]
+    r.ks[#r.ks + 1] = clamp(r.dist / T.perim, 1, 1.6)
+    if #r.ks > 3 then table.remove(r.ks, 1) end
+    r.dist = 0
+    if r.TL and r.mcN > 0 then
+      local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
+      local tg, dh = r.k * r.TL[mi], r.k * r.HL[mi]
+      local q = clamp(L.time / math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vcU), 0.7, 2.5)
+      r.f = r.f and (r.f + q) / 2 or q
+    end
+    r.mcS, r.mcN = 0, 0
+  end
+  local k = 0
+  for _, v in ipairs(r.ks) do k = k + v end
+  r.k = #r.ks > 0 and k / #r.ks or 1.05
+  -- Steigen: im Bart ab 20 s dessen Mittel (wie Ø THERMIK), sonst die letzten Baerte, sonst MC
+  local tm = w.therm
+  local vt = tm and tm.h and now - tm.t0 >= 20 and (tm.h - tm.h0) / (now - tm.t0) or nil
+  r.vcU = math.max(0.2, vt or r.vc or math.max(0.5, w.mcValue))
+  if r.mcz then r.mcS, r.mcN = r.mcS + (w.rzMan and w.mcValue or r.mcz), r.mcN + 1 end
+  -- Schenkel O-TP1-TP2-TP3-O: Laenge, Wind laengs (positiv = Rueckenwind) und quer
+  local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
+  local len, wa, wq = {}, {}, {}
+  local ax, ay = 0, 0
+  for i = 1, 4 do
+    local b = T.tp[i] or {x = 0, y = 0}
+    local dx, dy = b.x - ax, b.y - ay
+    local l = math.sqrt(dx * dx + dy * dy)
+    len[i], wa[i], wq[i] = l, (wx * dx + wy * dy) / l, (wx * dy - wy * dx) / l
+    ax, ay = b.x, b.y
+  end
+  local d0 = leg < 4 and math.sqrt((T.tp[leg].x - f.x) ^ 2 + (T.tp[leg].y - f.y) ^ 2) or math.max(-(f.x * T.ux + f.y * T.uy), 0)
+  local TP, HP, TL, HL = {}, {}, {}, {}
+  local nm = #RZ.M
+  for mi = 1, nm do
+    local tl, hl, tp, hp, over = 0, 0, 0, 0, true
+    for i = 1, 4 do
+      local n = r.net[i]
+      local v, o = speedToFly(p, RZ.M[mi], n, -wa[i])
+      over = over and o
+      local vg = math.max(math.sqrt(math.max(v * v - wq[i] * wq[i], 1)) + wa[i], 1)
+      local a, b = 1 / vg, (polarSink(p, v) - n) / vg
+      tl, hl = tl + len[i] * a, hl + len[i] * b
+      if i == leg then tp, hp = d0 * a, d0 * b elseif i > leg then tp, hp = tp + len[i] * a, hp + len[i] * b end
+    end
+    TP[mi], HP[mi], TL[mi], HL[mi] = tp, hp, tl, hl
+    -- ab hier ueberall Vmax: groessere MC-Werte aendern nichts mehr
+    if over then nm = mi; break end
+  end
+  r.TP, r.HP, r.TL, r.HL, r.nm = TP, HP, TL, HL, nm
+end
+
+-- Suche: N_max (Bisektion), Zeit-MC, Zeitreserve, was fuer ein Dreieck mehr fehlt, Abflughoehe aus dem Bart
+function RZ.search(w, now)
+  local r, T, f = w.rz, w.task, w.cur
+  if not (r and r.TL and f and T) then return end
+  local rest = T.work * 60 - (f.clk - w.startT)
+  local avail = rest - math.max(15, rest * w.rzRes / 100)
+  local F = r.f or 1
+  local availM = avail / F
+  local k, z, Vc, nm = r.k, w.rzPilot / 100, r.vcU, r.nm
+  local TP, HP, TL, HL = r.TP, r.HP, r.TL, r.HL
+  local hmax, hmin = T.maxAlt - 30, w.rzHmin
+  local dh0 = math.min(f.agl, hmax) - hmin
+  -- Zeit fuer N Dreiecke mit MC-Index mi (Pilotfaktor auf den letzten zwei Runden)
+  local function ev(N, mi, h0)
+    local cp, cl = k * (N <= 2 and 1 + z or 1), k * (N - 1 + z * math.min(2, N - 1))
+    local tg, dh = cp * TP[mi] + cl * TL[mi], cp * HP[mi] + cl * HL[mi]
+    return tg + math.max(0, dh - h0) / Vc, tg, dh
+  end
+  -- kleinster MC-Index, mit dem N Dreiecke passen
+  local function fits(N) for mi = 1, nm do if ev(N, mi, dh0) <= availM then return mi end end end
+  local lo, hi = 0, 1
+  while hi < 64 and fits(hi) do lo, hi = hi, hi * 2 end
+  while hi - lo > 1 do
+    local mid = math.floor((lo + hi) / 2)
+    if fits(mid) then lo = mid else hi = mid end
+  end
+  local N, mi = lo, lo > 0 and fits(lo) or nil
+  local best = 1e9
+  for j = 1, nm do best = math.min(best, (ev(N + 1, j, dh0))) end
+  r.N, r.mcz, r.behind = N, mi and RZ.M[mi], best * F - avail
+  r.slack = mi and rest - ev(N, mi, dh0) * F or nil
+  -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
+  r.hgo = nil
+  if mi then
+    for j = 1, nm do
+      local _, tg, dh = ev(N, j, 1e9)
+      local need = hmin + dh
+      if math.max(0, need - f.agl) / Vc + tg <= availM then r.hgo = need; break end
+    end
+  end
+  r.over = r.hgo and r.hgo > hmax
+  -- im Bart die Abflughoehe erreicht: einmal pro Bart melden
+  local th = w.therm
+  if th and r.hgo and not r.over and f.agl >= r.hgo and r.goTh ~= th then
+    r.goTh = th
+    tone(w, P_THERM, 1200, 150); tone(w, P_THERM, 1600, 150); tone(w, P_THERM, 2000, 400); haptic(w, P_THERM, 300)
+    sayWord(w, P_THERM, "endanflug.wav")
   end
 end
 
@@ -1958,7 +2117,12 @@ local function wakeup(w)
   if f then w.calcDue = (w.calcDue or 0) + 1 end
   local redo = (w.calcDue ~= nil and (f == nil or w.calcDue >= 3)) or not cur or pg ~= w.calcPage
   if redo then w.calcDue = nil end
-  if not redo and f == nil then windFit(w, now) end
+  -- Aufrufe ohne Fix: Windfit, Restzeit-Sollfahrt (Tabelle, im naechsten Aufruf die Suche), nie zusammen
+  if not redo and f == nil then
+    if w.rzPh then w.rzPh = nil; RZ.search(w, now)
+    elseif not w.rzT or now - w.rzT >= 1 then w.rzT = now; RZ.table(w, now); w.rzPh = w.rz ~= nil
+    else windFit(w, now) end
+  end
   w.calcPage = pg
   if pg == P_START then
     if redo then w.sc = startCalc(w, cur) end
@@ -2924,10 +3088,12 @@ local function paintGlide(w, W, H, top)
   local y = top
   local barW = SMALL and 22 or 48
   local tx, tw = m + barW + 8, lw - barW - 8
+  local rz = w.rz
+  local rzM = not w.rzMan and rz and rz.mcz
   local leftVals = w.polar and {
     {"SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE},
     {"IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE},
-    {"MC", string.format("%.1f", w.mcValue), C_WHITE},
+    rzM and {"ZEIT-MC", string.format("%.1f", rzM), C_BLUE} or {"MC", string.format("%.1f", w.mcValue), C_WHITE},
     {"NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE)},
   } or nil
   -- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen; alle gleich gross
@@ -3101,8 +3267,19 @@ local function paintGlide(w, W, H, top)
     elseif code == 12 then
       return "SEITENWIND", cr and string.format("%d %s", math.floor(math.abs(cr) + 0.5), cr > 0 and "v. li" or "v. re") or "--", C_WHITE
     elseif code == 13 then return "ABLAGE", string.format("%d m %s", math.floor(math.abs(xt) + 0.5), xt > 0 and "re" or "li"), C_WHITE
-    elseif code == 14 then return "DREIECKE", string.format("%d", scoreOf(w).n), C_WHITE
-    elseif code == 15 then return "RADIUS", string.format("%d m", math.floor((g.R or 0) + 0.5)), C_WHITE end
+    elseif code == 14 then
+      -- geflogen / erreichbar in der Arbeitszeit (~ bis die erste Runde den Lernfaktor geliefert hat)
+      local n = #w.laps
+      if not (rz and rz.N) then return "DREIECKE", string.format("%d", n), C_WHITE end
+      local b = rz.behind
+      local lb = (b and b > 0 and b < 60) and string.format("DREIECKE  +1: %d s", math.floor(b + 0.5))
+        or (rz.slack and string.format("DREIECKE  Rest %d s", math.floor(rz.slack + 0.5)) or "DREIECKE")
+      return lb, string.format("%d/%s%d", n, rz.f and "" or "~", n + rz.N), rz.N > 0 and C_WHITE or C_RED
+    elseif code == 15 then return "RADIUS", string.format("%d m", math.floor((g.R or 0) + 0.5)), C_WHITE
+    elseif code == 16 then return "ZEIT-MC", rz and rz.mcz and string.format("%.1f", rz.mcz) or "--", C_BLUE
+    elseif code == 17 then
+      return "ENDANFLUG AB", rz and rz.hgo and string.format("%d m", math.floor(rz.hgo + 0.5)) or "--",
+        rz and rz.hgo and (f.agl >= rz.hgo and C_GREEN or (rz.over and C_ORANGE or C_WHITE)) or C_DIM end
     return nil
   end
   local fh = H - m - yy
@@ -3158,7 +3335,17 @@ local function paintTherm(w, W, H, top)
     local rest = T.maxAlt - f.agl
     valBox(m, yy, half, SMALL and "RESERVE" or ("RESERVE ZU " .. T.maxAlt), string.format("%d m", math.floor(rest + 0.5)), rest < 30 and C_RED or (rest < 80 and C_ORANGE or C_WHITE), FONT_STD)
     local left = w.startT and (T.work * 60 - (f.clk - w.startT)) or nil
-    valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
+    local rz = w.rz
+    if tm and rz and rz.hgo then
+      -- Endanflug: wie viel Hoehe noch, bis man ohne weiteren Bart N Dreiecke schafft (Zeit mit Steigen Vc)
+      local need = rz.hgo - f.agl
+      local lb = string.format(SMALL and "ENDANFL. %d" or "ENDANFLUG AB %d m", math.floor(rz.hgo + 0.5))
+      if rz.over then valBox(m + half, yy, half, lb, "1 BART MEHR", C_ORANGE, FONT_STD)
+      elseif need <= 0 then valBox(m + half, yy, half, lb, "RAUS", C_GREEN, FONT_STD)
+      else valBox(m + half, yy, half, lb, string.format("+%d m %s", math.floor(need + 0.5), fmtMS(need / rz.vcU)), C_BLUE, FONT_STD) end
+    else
+      valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
+    end
   end
   -- Rechts: Kreisbild im festen Kartenbild (Hypotenuse unten), mit Steigen eingefaerbt, Pfeil zum besten Steigen
   local mx0 = lw + m * 2
@@ -3391,6 +3578,10 @@ local function eventHandler(w, category, value, x, y)
       armOrRestart(w, os.clock())
       lcd.invalidate(); return true
     end
+    if inside(w.mcBox, x, y) and w.rz then
+      w.rzMan = not w.rzMan
+      lcd.invalidate(); return true
+    end
     if inside(w.resetBox, x, y) then
       local now = os.clock()
       if w.resetArmed and now - w.resetArmed < 4 then resetFlight(w); w.resetArmed = nil else w.resetArmed = now end
@@ -3519,6 +3710,6 @@ local M = {init = init}
 M._test = {
   buildTask = buildTask, inSector = inSector, penaltyOf = penaltyOf, planPath = planPath, cornersFrom = cornersFrom,
   crossTrack = crossTrack, slotEpoch = slotEpoch, igcLat = igcLat, igcLon = igcLon, create = create, assess = assess,
-  scoreOf = scoreOf, startCalc = startCalc, angDiff = angDiff, bearingOf = bearingOf, toLocal = toLocal,
+  scoreOf = scoreOf, startCalc = startCalc, rz = RZ, angDiff = angDiff, bearingOf = bearingOf, toLocal = toLocal,
 }
 return M
