@@ -3325,12 +3325,13 @@ local function paintGlide(w, W, H, top)
             lcd.color(col)
             line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
           end
-          triO(x + 8 + tw + th * 0.15, vy + th * 0.22, th * 0.55, v[3])
+          -- Ziffern stehen etwa von 4 % bis 64 % der Zeilenhoehe: Dreieck mit gleicher Unterkante
+          triO(x + 8 + tw + th * 0.15, vy + th * 0.14, th * 0.5, v[3])
           if v[4] and vy + th + hL <= yy + fh then
             local sy = vy + th
             local _, w1 = drawT(x + 8, sy, fw - 12, v[4], FONT_S, v[6], "l")
             if v[5] then
-              triO(x + 12 + w1, sy + hL * 0.2, hL * 0.55, v[6])
+              triO(x + 12 + w1, sy + hL * 0.14, hL * 0.5, v[6])
               if v[5] ~= "" then drawT(x + 16 + w1 + hL * 0.6, sy, fw - 12, v[5], FONT_S, v[6], "l") end
             end
           end
