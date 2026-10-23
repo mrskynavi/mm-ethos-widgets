@@ -30,7 +30,7 @@
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den kleinsten MC, der sie schafft (Tippen auf das
--- MC-Feld schaltet zwischen festem MC und MC ZEIT; ohne MC-Poti ist der feste MC voreingestellt). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
+-- MC-Feld schaltet zwischen festem MC und MC ZEIT; mit MC-Poti gilt immer der Poti-Wert). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
 --
 -- IGC: Das Widget schreibt ab dem Scharfschalten bzw. Abheben (mit 90 s Vorlauf) eine IGC-Datei nach
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
@@ -2087,8 +2087,9 @@ local function wakeup(w)
   if dt > 0.5 then dt = 0.5 end
   refreshTasks(w, now, false)
   refreshPolar(w, now, false)
-  -- MC ZEIT oder fester MC: ohne MC-Poti gilt der feste MC, mit Poti MC ZEIT; Tippen auf das MC-Feld tauscht
-  w.rzMan = (not validSource(w.mcSrc)) ~= (w.rzTap == true)
+  -- MC ZEIT oder fester MC: mit MC-Poti gilt immer der Poti-Wert; ohne Poti der feste MC, Tippen auf das
+  -- MC-Feld schaltet auf MC ZEIT und zurueck
+  w.rzMan = validSource(w.mcSrc) ~= nil or not w.rzTap
   if not validSource(w.mcSrc) then w.mcValue = w.mc / 10 else
     local v = readNumber(w.mcSrc)
     if v then w.mc = math.floor(clamp((v + 1024) / 2048, 0, 1) * w.mcMax + 0.5); w.mcValue = w.mc / 10 end
@@ -3620,7 +3621,7 @@ local function eventHandler(w, category, value, x, y)
       armOrRestart(w, os.clock())
       lcd.invalidate(); return true
     end
-    if inside(w.mcBox, x, y) and w.rz then
+    if inside(w.mcBox, x, y) and w.rz and not validSource(w.mcSrc) then
       w.rzTap = not w.rzTap
       lcd.invalidate(); return true
     end
