@@ -1637,9 +1637,12 @@ local function nettoCalc(w, f, dt)
     w.netto = lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8)
     local head = nil
     if w.windOk and f.hdg then local hx, hy = dirVec(f.hdg); head = -(w.wx * hx + w.wy * hy) end
-    -- Zeit-MC, solange er gilt (Tippen auf das MC-Feld schaltet fuer diesen Flug auf den festen MC)
+    -- Zeit-MC, solange er gilt (Tippen auf das MC-Feld schaltet fuer diesen Flug auf den festen MC). Dann zaehlt
+    -- das gelernte Netto-Mittel des Schenkels (wie im Modell der Restzeit), nicht das Netto im Moment.
     local rz = not w.rzMan and w.rz
-    w.vstf = speedToFly(p, rz and rz.mcz or w.mcValue, clamp(w.netto, -5, 5), head)
+    local net = w.netto
+    if rz and rz.mcz and rz.net then net = rz.net[math.min(w.tp, 3) + 1] end
+    w.vstf = speedToFly(p, rz and rz.mcz or w.mcValue, clamp(net, -5, 5), head)
     w.stfDv = ((w.tasF or f.tas) - w.vstf) * KMH
   elseif not w.polar then
     w.vstf, w.stfDv = nil, nil
