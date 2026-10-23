@@ -30,7 +30,7 @@
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den kleinsten MC, der sie schafft (Tippen auf das
--- MC-Feld schaltet fuer den Flug auf den festen MC). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
+-- MC-Feld schaltet zwischen festem MC und MC ZEIT; ohne MC-Poti ist der feste MC voreingestellt). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
 --
 -- IGC: Das Widget schreibt ab dem Scharfschalten bzw. Abheben (mit 90 s Vorlauf) eine IGC-Datei nach
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
@@ -1025,7 +1025,7 @@ local function resetFlight(w)
   w.track, w.marks = {}, {}
   w.ref, w.tpT, w.tpPrev = nil, nil, nil
   w.therm = nil
-  w.rz, w.rzMan, w.rzPh = nil, nil, nil
+  w.rz, w.rzTap, w.rzPh = nil, nil, nil
   w.evalScroll = 0
   w.msg, w.msgT = nil, nil
 end
@@ -1637,7 +1637,7 @@ local function nettoCalc(w, f, dt)
     w.netto = lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8)
     local head = nil
     if w.windOk and f.hdg then local hx, hy = dirVec(f.hdg); head = -(w.wx * hx + w.wy * hy) end
-    -- Zeit-MC, solange er gilt (Tippen auf das MC-Feld schaltet fuer diesen Flug auf den festen MC). Dann zaehlt
+    -- Zeit-MC, solange er gilt (siehe w.rzMan in wakeup: Poti oder Tippen auf das MC-Feld). Dann zaehlt
     -- das gelernte Netto-Mittel des Schenkels (wie im Modell der Restzeit), nicht das Netto im Moment.
     local rz = not w.rzMan and w.rz
     local net = w.netto
@@ -2087,6 +2087,8 @@ local function wakeup(w)
   if dt > 0.5 then dt = 0.5 end
   refreshTasks(w, now, false)
   refreshPolar(w, now, false)
+  -- MC ZEIT oder fester MC: ohne MC-Poti gilt der feste MC, mit Poti MC ZEIT; Tippen auf das MC-Feld tauscht
+  w.rzMan = (not validSource(w.mcSrc)) ~= (w.rzTap == true)
   if not validSource(w.mcSrc) then w.mcValue = w.mc / 10 else
     local v = readNumber(w.mcSrc)
     if v then w.mc = math.floor(clamp((v + 1024) / 2048, 0, 1) * w.mcMax + 0.5); w.mcValue = w.mc / 10 end
@@ -3619,7 +3621,7 @@ local function eventHandler(w, category, value, x, y)
       lcd.invalidate(); return true
     end
     if inside(w.mcBox, x, y) and w.rz then
-      w.rzMan = not w.rzMan
+      w.rzTap = not w.rzTap
       lcd.invalidate(); return true
     end
     if inside(w.resetBox, x, y) then
