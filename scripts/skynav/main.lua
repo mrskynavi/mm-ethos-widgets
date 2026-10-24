@@ -2087,8 +2087,20 @@ local function armOrRestart(w, now)
     w.zoneHit, w.altHit, w.badEntry = nil, nil, nil
     w.restarts = (w.restarts or 0) + 1
     note(w, "Neustart: wieder scharf", now)
-  elseif w.state == S_STARTED then
-    note(w, "Neustart nur vor der ersten Runde", now)
+  elseif w.state == S_STOPPED or w.state == S_STARTED then
+    -- Neuer Wertungsflug in der Luft (z. B. nach Motorsteigflug): bei fertigen Runden erst nach
+    -- zweiter Betaetigung innert 4 s. Das IGC des alten Versuchs wird geschlossen, ein neues beginnt.
+    if w.state == S_STARTED and not (w.rsArm and now - w.rsArm < 4) then
+      w.rsArm = now
+      note(w, "Nochmal = neuer Wertungsflug", now)
+      return
+    end
+    local fl, tk = w.flying, w.takeoffT
+    resetFlight(w)
+    w.flying, w.takeoffT, w.rsArm = fl, tk, nil
+    w.state, w.armedAt, w.armPending = S_ARMED, now, true
+    w.restarts = (w.restarts or 0) + 1
+    note(w, "Neuer Wertungsflug: scharf", now)
   end
 end
 
@@ -2995,13 +3007,17 @@ local function paintStart(w, W, H, top)
     drawT(rx, yy, rw, why, FONT_STD, C_RED, "l")
     yy = yy + textH(FONT_STD) + 4
   end
-  local canRestart = w.state == S_STARTED and #w.laps == 0
+  local canRestart = w.state == S_STARTED
   if w.state == S_IDLE or w.state == S_STOPPED or canRestart then
     local bf = (canRestart and w.badEntry) and F_L or FONT_STD
+    local txt = canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)"
+    if canRestart and #w.laps > 0 then
+      txt = (w.rsArm and os.clock() - w.rsArm < 4) and "NOCHMAL = NEUER FLUG" or "NEUSTART (2x tippen)"
+    end
     w.armBox = {x = rx, y = yy, w = rw, h = textH(bf) + 8}
     lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
-    drawT(rx, yy + 4, rw, canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)", bf, C_ORANGE, "c")
+    drawT(rx, yy + 4, rw, txt, bf, C_ORANGE, "c")
   end
 end
 
@@ -3642,7 +3658,6 @@ local function eventHandler(w, category, value, x, y)
       lcd.invalidate(); return true
     end
     if inside(w.armBox, x, y) and w.task then
-      if w.state == S_STOPPED then resetFlight(w) end
       armOrRestart(w, os.clock())
       lcd.invalidate(); return true
     end
