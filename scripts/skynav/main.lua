@@ -3408,21 +3408,28 @@ local function paintTherm(w, W, H, top)
     local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
     local nowc = os.clock()
     local half = clamp(R * 3.5, 35, 150)
+    -- nur die letzten 20 s: von hinten durch die Spur (bis 300 Punkte), beim ersten aelteren Punkt aufhoeren
+    local tr = w.trail
     local sx, sy, sn = 0, 0, 0
-    for _, p in ipairs(w.trail) do
+    for i = #tr, 1, -1 do
+      local p = tr[i]
       local age = nowc - p.t
-      if age < 20 then sx, sy, sn = sx + p.x + wx * age, sy + p.y + wy * age, sn + 1 end
+      if age >= 20 then break end
+      sx, sy, sn = sx + p.x + wx * age, sy + p.y + wy * age, sn + 1
     end
     local ox, oy = f.x, f.y
     if sn >= 10 and (w.therm or w.circSince) then
       ox, oy = sx / sn, sy / sn
       -- Kreise fuellen das Bild: Massstab nach dem gemessenen Kreis statt nach dem gelernten Radius
-      local rMax = 0
-      for _, p in ipairs(w.trail) do
+      local r2 = 0
+      for i = #tr, #tr - sn + 1, -1 do
+        local p = tr[i]
         local age = nowc - p.t
-        if age < 20 then rMax = math.max(rMax, math.sqrt((p.x + wx * age - ox) ^ 2 + (p.y + wy * age - oy) ^ 2)) end
+        local dx, dy = p.x + wx * age - ox, p.y + wy * age - oy
+        local d2 = dx * dx + dy * dy
+        if d2 > r2 then r2 = d2 end
       end
-      half = clamp(rMax * 1.5, 25, 150)
+      half = clamp(math.sqrt(r2) * 1.5, 25, 150)
     end
     local sc = math.min(mw, mh) / 2 / half
     do
@@ -3476,14 +3483,18 @@ local function paintTherm(w, W, H, top)
     end
     -- Spur im Luftmassen-System (um den Wind zurueckversetzt), dann liegen die Kreise uebereinander
     local best, bv, bx0, by0 = nil, -99, 0, 0
-    local tr, lastCol = w.trail, nil
+    local lastCol = nil
     local c1, c2, c3, c4 = mx0, y, mx0 + mw - 1, y + mh - 1
+    -- P() ausgeschrieben (Drehung + Massstab), spart je Punkt zwei Funktionsaufrufe
+    local kxx, kxy, kyx, kyy, ex, ey
+    if T then kxx, kxy, kyx, kyy = T.ux * sc, T.uy * sc, -T.px * sc, -T.py * sc else kxx, kxy, kyx, kyy = sc, 0, 0, -sc end
+    ex, ey = cx - ox * kxx - oy * kxy, cy - ox * kyx - oy * kyy
     for i = #tr, 1, -1 do
       local p = tr[i]
       local age = nowc - p.t
       if age >= 35 then break end
       local qx, qy = p.x + wx * age, p.y + wy * age
-      local ax, ay = P(qx, qy)
+      local ax, ay = ex + qx * kxx + qy * kxy, ey + qx * kyx + qy * kyy
       local pv = p.v or 0
       if pv > bv then bv, best, bx0, by0 = pv, p, qx, qy end
       if ax >= c1 and ax <= c3 and ay >= c2 and ay <= c4 then
