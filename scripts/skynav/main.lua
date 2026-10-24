@@ -970,6 +970,10 @@ local NUM_DEFS = {
   {key = "glideF2",   def = 2},     -- 4 Hoehe Ziellinie, 5 Rest, 6 Runde, 7 letzte Runde, 8 Grund, 9 Gleitzahl,
   {key = "glideF3",   def = 4},     -- 10 Vario 30 s, 11 Gegenwind, 12 Seitenwind, 13 Ablage, 14 Dreiecke, 15 Radius,
                                     -- 16 Zeit-MC, 17 Endanflug ab
+  {key = "thermF1",   def = 1},     -- Seite Thermik, vier Werte (App): 0 leer, 1 Vario, 2 Vario 30 s, 3 Thermik,
+  {key = "thermF2",   def = 3},     -- 4 Gewinn, 5 Hoehe, 6 Netto Thermik, 7 Reserve Maximalhoehe, 8 Rest,
+  {key = "thermF3",   def = 4},     -- 9 Dreiecke, 10 Zeit-MC, 11 Radius, 12 Wind
+  {key = "thermF4",   def = 5},
   {key = "rzRes",     def = 3},     -- Restzeit-Sollfahrt: Zeitreserve % der Restzeit (mind. 15 s)
   {key = "rzPilot",   def = 3},     -- Pilotfaktor % (laengerer Weg auf den letzten zwei Runden)
   {key = "rzHmin",    def = 60},    -- m, tiefste Hoehe, auf der man noch gleiten will
@@ -994,6 +998,7 @@ local TEXT_DEFS = {
 local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
   winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000}, glideF1 = {0, 17}, glideF2 = {0, 17}, glideF3 = {0, 17},
+  thermF1 = {0, 12}, thermF2 = {0, 12}, thermF3 = {0, 12}, thermF4 = {0, 12},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
@@ -3389,44 +3394,142 @@ local function paintTherm(w, W, H, top)
   local m = 6
   local y = top
   local lw = math.floor(W * 0.36)
-  local v = w.vFast
-  local th = drawT(m, y, lw, "VARIO", FONT_XS, C_DIM, "l")
-  th = th + drawT(m, y + th, lw, v and string.format("%+.1f", v) or "--", F_XL, (v or 0) >= 0 and C_GREEN or C_RED, "l")
-  local yy = y + th + 4
-  local avg = 0
-  if w.avg30 and #w.avg30 > 0 then for _, a in ipairs(w.avg30) do avg = avg + a end; avg = avg / #w.avg30 end
   local half = math.floor(lw / 2)
-  valBox(m, yy, half, "Ø 30 s", string.format("%+.1f", avg), avg >= 0 and C_GREEN or C_RED, F_L)
   local tm = w.therm
+  local rz = w.rz
   local thAvg, gain = nil, nil
   if tm and f then
     local dtm = os.clock() - tm.t0
     gain = f.agl - tm.h0
     if dtm > 5 then thAvg = gain / dtm end
   end
-  yy = yy + valBox(m + half, yy, half, "Ø THERMIK", thAvg and string.format("%+.1f", thAvg) or "--", C_WHITE, F_L) + 4
-  valBox(m, yy, half, "GEWINN", gain and string.format("%+d m", math.floor(gain + 0.5)) or "--", C_WHITE, F_L)
-  yy = yy + valBox(m + half, yy, half, "HÖHE", f and string.format("%d m", math.floor(f.agl + 0.5)) or "--", C_WHITE, F_L) + 4
-  local tmN = tm or w.lastTherm
-  local nAvg = tmN and tmN.nT and tmN.nT > 5 and tmN.nSum / tmN.nT or nil
-  yy = yy + valBox(m, yy, lw, tm and "NETTO LUFT Ø THERMIK" or "NETTO LUFT Ø LETZTE THERMIK", nAvg and string.format("%+.1f", nAvg) or "--",
-    nAvg and (nAvg >= 0.1 and C_GREEN or (nAvg <= -0.1 and C_RED or C_WHITE)) or C_WHITE, F_L) + 4
-  if T and f then
-    local rest = T.maxAlt - f.agl
-    valBox(m, yy, half, SMALL and "RESERVE" or ("RESERVE ZU " .. T.maxAlt), string.format("%d m", math.floor(rest + 0.5)), rest < 30 and C_RED or (rest < 80 and C_ORANGE or C_WHITE), FONT_STD)
-    local left = w.startT and (T.work * 60 - (f.clk - w.startT)) or nil
-    local rz = w.rz
-    if tm and rz and rz.hgo then
-      -- Endanflug: wie viel Hoehe noch, bis man ohne weiteren Bart N Dreiecke schafft (Zeit mit Steigen Vc)
-      local need = rz.hgo - f.agl
-      local lb = string.format(SMALL and "ENDANFL. %d" or "ENDANFLUG AB %d m", math.floor(rz.hgo + 0.5))
-      if rz.over then valBox(m + half, yy, half, lb, "1 BART MEHR", C_ORANGE, FONT_STD)
-      elseif need <= 0 then valBox(m + half, yy, half, lb, "RAUS", C_GREEN, FONT_STD)
-      else valBox(m + half, yy, half, lb, string.format("+%d m %s", math.floor(need + 0.5), fmtMS(need / rz.vcG)), C_BLUE, FONT_STD) end
-    else
-      valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
+  -- Links oben vier Werte (2 x 2), in der App waehlbar (thermF1..4): 0 leer, 1 Vario, 2 Vario 30 s, 3 Thermik,
+  -- 4 Gewinn, 5 Hoehe, 6 Netto Thermik, 7 Reserve zur Maximalhoehe, 8 Rest, 9 Dreiecke, 10 Zeit-MC, 11 Radius, 12 Wind
+  local function tf(code)
+    if code == 1 then local v = w.vFast; return "VARIO", v and string.format("%+.1f", v) or "--", (v or 0) >= 0 and C_GREEN or C_RED
+    elseif code == 2 then
+      local a = 0
+      if w.avg30 and #w.avg30 > 0 then for _, x in ipairs(w.avg30) do a = a + x end; a = a / #w.avg30 end
+      return "Ø 30 s", string.format("%+.1f", a), a >= 0 and C_GREEN or C_RED
+    elseif code == 3 then return "Ø THERMIK", thAvg and string.format("%+.1f", thAvg) or "--", thAvg and (thAvg >= 0 and C_GREEN or C_RED) or C_DIM
+    elseif code == 4 then return "GEWINN", gain and string.format("%+d m", math.floor(gain + 0.5)) or "--", gain and C_WHITE or C_DIM
+    elseif code == 5 then return "HÖHE", f and string.format("%d m", math.floor(f.agl + 0.5)) or "--", C_WHITE
+    elseif code == 6 then
+      local tmN = tm or w.lastTherm
+      local nAvg = tmN and tmN.nT and tmN.nT > 5 and tmN.nSum / tmN.nT or nil
+      return (tm or SMALL) and "NETTO Ø THERMIK" or "NETTO Ø LETZTE", nAvg and string.format("%+.1f", nAvg) or "--",
+        nAvg and (nAvg >= 0.1 and C_GREEN or (nAvg <= -0.1 and C_RED or C_WHITE)) or C_DIM
+    elseif code == 7 then
+      if not (T and f) then return "RESERVE", "--", C_DIM end
+      local r = T.maxAlt - f.agl
+      return SMALL and "RESERVE" or ("RESERVE ZU " .. T.maxAlt), string.format("%d m", math.floor(r + 0.5)), r < 30 and C_RED or (r < 80 and C_ORANGE or C_WHITE)
+    elseif code == 8 then local r = restTime(w); return "REST", r and fmtMS(math.max(r, 0)) or "--", C_WHITE
+    elseif code == 9 then
+      local N = rz and #w.laps > 0 and (rz.Ns or rz.N)
+      return "DREIECKE", N and tostring(N) or "--", N and C_WHITE or C_DIM
+    elseif code == 10 then return "MC ZEIT", rz and rz.mcz and string.format("%.1f", rz.mcz) or "--", C_BLUE
+    elseif code == 11 then return "RADIUS", string.format("%d m", math.floor(radius(w) + 0.5)), C_WHITE
+    elseif code == 12 then
+      return "WIND", w.windOk and string.format("%d km/h", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5)) or "--", w.windOk and C_WHITE or C_DIM
     end
   end
+  -- Unten links der Kasten Endanflug: Hoehe bis zur Abflughoehe (rz.hgo), aus der man ohne weiteren Bart die
+  -- N Dreiecke in der Restzeit schafft. Zeilen: Beschriftung, Wert, Zeile darunter, Balken.
+  local hX, hS = textH(FONT_XS), textH(FONT_S)
+  local bF = SMALL and FONT_L or FONT_XL
+  local bH = hX + textH(bF) + hS + 14
+  local N = rz and (rz.Ns or rz.N)
+  local lab, val, col, sub, prog, arrowUp = "ENDANFLUG", "--", C_DIM, nil, nil, false
+  if not (T and f and w.state == S_STARTED) then sub = "nach dem Start"
+  elseif not rz then sub = w.rzOn and "rechnet ..." or "Restzeit-Rechnung aus"
+  elseif #w.laps < 1 then sub = "ab Runde 2"
+  elseif not rz.hgo then val, col, sub = "0", C_ORANGE, "kein Dreieck mehr möglich"
+  else
+    local h0 = tm and tm.h0 or f.agl
+    local need = rz.hgo - f.agl
+    if rz.over then
+      local hmax = T.maxAlt - 30
+      lab, val, col = SMALL and "ENDANFLUG NOCH NICHT" or "ENDANFLUG NOCH NICHT MÖGLICH", "1 Bart mehr", C_ORANGE
+      sub = {string.format("bis %d m steigen · %d", hmax, N), true}
+      prog = (f.agl - h0) / math.max(hmax - h0, 1)
+    elseif not tm then
+      -- im Gleitflug: nur die Abflughoehe, und ob die Hoehe reicht
+      lab, val, col = "ENDANFLUG AB", string.format("%d m", math.floor(rz.hgo + 0.5)), need <= 0 and C_GREEN or C_WHITE
+      sub = need <= 0 and {string.format("Höhe reicht für %d", N), true} or {string.format("fehlen %d m für %d", math.floor(need + 0.5), N), true}
+    elseif need <= 0 then
+      val, col = "RAUS", C_GREEN
+      sub = {string.format("%d m erreicht · %d", math.floor(rz.hgo + 0.5), N), true}
+      prog = 1
+    else
+      local t = need / rz.vcG
+      lab, val, col, arrowUp = SMALL and "NOCH TANKEN" or "ENDANFLUG: NOCH TANKEN", string.format("+%d m", math.floor(need + 0.5)), C_BLUE, true
+      sub = {string.format("ab %d m · %d", math.floor(rz.hgo + 0.5), N), true, t < 100 and string.format(" · ca. %d s", math.floor(t + 0.5)) or (" · ca. " .. fmtMS(t))}
+      prog = tm and (f.agl - h0) / math.max(rz.hgo - h0, 1) or nil
+    end
+  end
+  -- Raster der vier Werte: groesste Schrift, in der alle in ihre Zelle passen
+  local gH = H - m - y - bH - 4
+  local rh = math.floor(gH / 2)
+  local vals = {}
+  for i, code in ipairs({w.thermF1, w.thermF2, w.thermF3, w.thermF4}) do vals[i] = {tf(code)} end
+  local vf = FONT_STD
+  for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L}) do
+    local ok = hX + textH(fo) <= rh
+    if ok then
+      lcd.font(fo)
+      for i = 1, 4 do if ok and vals[i][2] and lcd.getTextSize(vals[i][2]) > half - 6 then ok = false end end
+    end
+    if ok then vf = fo; break end
+  end
+  local vy = math.max(math.floor((rh - hX - textH(vf)) / 2), 0)
+  for i = 1, 4 do
+    local v = vals[i]
+    if v[1] then valBox(m + ((i - 1) % 2) * half, y + math.floor((i - 1) / 2) * rh + vy, half - 4, v[1], v[2], v[3], vf) end
+  end
+  -- Kasten Endanflug
+  local by = H - m - bH
+  lcd.color(rgb(17, 17, 17))
+  rect(m, by, lw, bH)
+  local bx = m + 6
+  drawT(bx, by + 3, lw - 12, lab, FONT_XS, C_DIM, "l")
+  local vy2 = by + 3 + hX
+  local th = textH(bF)
+  if arrowUp then
+    -- Pfeil nach oben vor dem Wert, Hoehe wie die Ziffern
+    local ax, ay, s = bx + th * 0.3, vy2 + th * 0.06, th * 0.6
+    lcd.color(col)
+    tri(ax, ay, ax - s * 0.4, ay + s * 0.45, ax + s * 0.4, ay + s * 0.45)
+    rect(ax - s * 0.1, ay + s * 0.4, s * 0.2, s * 0.6)
+    bx = bx + th * 0.75
+  end
+  drawT(bx, vy2, lw - 12, val, bF, col, "l")
+  bx = m + 6
+  local sy = vy2 + th
+  if type(sub) == "table" then
+    -- Zeile mit Dreieck-Zeichen (true) zwischen den Texten
+    local x = bx
+    for _, s in ipairs(sub) do
+      if s == true then
+        local sz = hS * 0.5
+        lcd.color(col)
+        local tx0, ty0 = x + 3, sy + hS * 0.14
+        line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
+        x = x + sz * 1.1 + 4
+      else
+        local _, tw = drawT(x, sy, lw - 12, s, FONT_S, col, "l")
+        x = x + tw
+      end
+    end
+  elseif sub then drawT(bx, sy, lw - 12, sub, FONT_S, C_DIM, "l") end
+  if prog then
+    local bw = lw - 12
+    lcd.color(rgb(50, 50, 50))
+    rect(bx, by + bH - 7, bw, 4)
+    lcd.color(col)
+    rect(bx, by + bH - 7, math.floor(bw * clamp(prog, 0, 1)), 4)
+  end
+  -- Abflughoehe im Bart erreicht: Banner ueber der Karte (am Ende gezeichnet)
+  local banner = tm and val == "RAUS"
   -- Rechts: Kreisbild im festen Kartenbild (Hypotenuse unten), mit Steigen eingefaerbt, Pfeil zum besten Steigen
   local mx0 = lw + m * 2
   local mw = W - mx0 - m
@@ -3580,6 +3683,16 @@ local function paintTherm(w, W, H, top)
     if T then windFlat(w, T, mx0 + mw - 26, y + 24, mx0 + math.floor(mw / 2)) end
     local wind = w.windOk and string.format("Wind %d km/h aus %03d", math.floor(math.sqrt(w.wx ^ 2 + w.wy ^ 2) * KMH + 0.5), math.floor(bearingOf(-w.wx, -w.wy) + 0.5)) or "Wind: noch kein Fit"
     drawT(mx0, y + mh - textH(FONT_XS) - 2, mw - 4, wind .. string.format("  R %d m", math.floor(R + 0.5)), FONT_XS, C_DIM, "r")
+  end
+  if banner then
+    local txt = "BART VERLASSEN · ENDANFLUG"
+    local bf2 = F_L
+    lcd.font(bf2)
+    if lcd.getTextSize(txt) > mw - 12 then bf2 = FONT_STD; lcd.font(bf2); if lcd.getTextSize(txt) > mw - 12 then txt = "ENDANFLUG" end end
+    local hb = textH(bf2) + 8
+    lcd.color(C_GREEN)
+    rect(mx0, y, mw, hb)
+    drawT(mx0, y + 4, mw, txt, bf2, C_BG, "c")
   end
 end
 
