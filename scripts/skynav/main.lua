@@ -1880,7 +1880,7 @@ function RZ.table(w, now)
   local T, f, p, r = w.task, w.cur, w.polar, w.rz
   if not (T and f and p and w.rzOn and w.state == S_STARTED and w.startT) then w.rz = nil; return end
   if not r or r.startT ~= w.startT then
-    r = {startT = w.startT, net = {0, 0, 0, 0}, ks = {}, nl = #w.laps, mcS = 0, mcN = 0, dist = 0, tL = now}
+    r = {startT = w.startT, net = {0, 0, 0, 0}, ks = {}, nl = #w.laps, mcS = 0, mcN = 0, dist = 0, tL = now, tS = now, th = w.lastTherm}
     w.rz = r
   end
   local dt = math.min(now - r.tL, 3)
@@ -1893,15 +1893,21 @@ function RZ.table(w, now)
   r.ld = ld
   if w.therm then r.thd = (r.thd or 0) + dd else
     r.dist = r.dist + dd
-    if w.netto and (w.omega or 0) < math.rad(8) then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 3) - r.net[leg]) * dt / 60 end
+    -- (nicht bei Motor oder Hangaufwind mit mehr als 2 m/s Steigen)
+    if w.netto and (w.omega or 0) < math.rad(8) and (w.teN or 0) < 2 then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 3) - r.net[leg]) * dt / 60 end
   end
-  -- Steigen pro Bart (Mittel der letzten Baerte)
+  -- Steigen: nur aus ausgekurbelten Baerten seit dem Start (mind. 20 s und 15 m Gewinn, 0.2 bis 4 m/s, mehr
+  -- ist Motor), zeitgewichtetes Mittel. Vorher rechnet die Restzeit ohne Steigen (nur Abgleiten).
   local lt = w.lastTherm
   if lt and lt ~= r.th then
     r.th = lt
     local dur = (lt.tEnd or now) - lt.t0
     r.dist, r.thd = r.dist + (r.thd or 0) * (dur < 20 and 1 or 8 / (dur + 8)), 0
-    if dur > 20 and lt.hMax > lt.h0 + 5 then local c = (lt.hMax - lt.h0) / dur; r.vc = r.vc and (r.vc + c) / 2 or c end
+    local gain = lt.hMax - lt.h0
+    if lt.t0 >= r.tS and dur >= 20 and gain >= 15 and gain / dur >= 0.2 and gain / dur <= 4 then
+      r.vcS, r.vcT = (r.vcS or 0) + gain, (r.vcT or 0) + dur
+      r.vc = r.vcS / r.vcT
+    end
   end
   -- Runde fertig: Index und Lernfaktor f (Hoehengewinn/-verlust der Runde mit Vc umgerechnet)
   if #w.laps > r.nl then
@@ -1913,7 +1919,7 @@ function RZ.table(w, now)
     if r.TL and r.mcN > 0 then
       local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
       local tg, dh = r.k * r.TL[mi], r.k * r.HL[mi]
-      local q = clamp(L.time / math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vcU), 0.7, 2.5)
+      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.7, 2.5)
       r.f = r.f and (r.f + q) / 2 or q
     end
     r.mcS, r.mcN = 0, 0
@@ -1921,12 +1927,12 @@ function RZ.table(w, now)
   local k = 0
   for _, v in ipairs(r.ks) do k = k + v end
   r.k = #r.ks > 0 and k / #r.ks or 1.05
-  -- Steigen: im Bart ab 20 s dessen Mittel (wie Ø THERMIK), sonst die letzten Baerte, sonst MC
+  -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant). Fuer die
+  -- Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst die gelernten.
   local tm = w.therm
   local vt = tm and tm.h and now - tm.t0 >= 20 and (tm.h - tm.h0) / (now - tm.t0) or nil
-  -- (Poti am Anschlag fuer MC ZEIT: dessen MC ist kein Steigen, dann 1 m/s)
-  local mcV = (validSource(w.mcSrc) and not w.rzMan) and 1 or w.mcValue
-  r.vcU = math.max(0.2, vt or r.vc or math.max(0.5, mcV))
+  r.vcU = r.vc or 0.001
+  r.vcG = math.max(0.2, vt or r.vc or 0.2)
   if r.mcz then r.mcS, r.mcN = r.mcS + (w.rzMan and w.mcValue or r.mcz), r.mcN + 1 end
   -- Schenkel O-TP1-TP2-TP3-O: Laenge, Wind laengs (positiv = Rueckenwind) und quer
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
@@ -2002,10 +2008,14 @@ function RZ.search(w, now)
     for j = 1, nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
-      if math.max(0, need - f.agl) / Vc + tg <= availM then r.hgo = need; break end
+      if math.max(0, need - f.agl) / r.vcG + tg <= availM then r.hgo = need; break end
     end
   end
   r.over = r.hgo and r.hgo > hmax
+  -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt), neue Zahl erst, wenn sie
+  -- 10 s gleich bleibt
+  if N ~= r.Nn then r.Nn, r.Nt = N, now end
+  if not r.Ns or now - r.Nt >= 10 then r.Ns = N end
   -- im Bart die Abflughoehe erreicht: einmal pro Bart melden
   local th = w.therm
   if th and r.hgo and not r.over and f.agl >= r.hgo and r.goTh ~= th then
@@ -3294,7 +3304,9 @@ local function paintGlide(w, W, H, top)
       -- Restzeit-Sollfahrt: Dreiecke, die noch in die Arbeitszeit passen (das laufende zaehlt mit), darunter
       -- Reserve, was fuer eines mehr fehlt, Hoehenabbau oder "kein weiteres". Ohne Rechnung: geflogene Dreiecke.
       if not (rz and rz.N) then return "DREIECKE", string.format("%d", #w.laps), C_WHITE end
-      local N, b = rz.N, rz.behind
+      if #w.laps < 1 then return "DREIECKE", "--", C_DIM, "ab Runde 2", nil, C_DIM end
+      local N, b = rz.Ns or rz.N, rz.behind
+      if N ~= rz.N then return "DREIECKE", string.format("%d", N), C_WHITE, "", nil, C_DIM end
       if N == 0 then return "DREIECKE", "0", C_ORANGE, "kein weiteres", "", C_ORANGE end
       if b and b > 0 and b < 30 then return "DREIECKE", string.format("%d", N), C_WHITE, string.format("%d", N + 1), string.format("fehlen %d s", math.floor(b + 0.5)), C_ORANGE end
       if rz.down then return "DREIECKE", string.format("%d", N), C_WHITE, "Höhe wird abgebaut", nil, C_BLUE end
@@ -3387,7 +3399,7 @@ local function paintTherm(w, W, H, top)
       local lb = string.format(SMALL and "ENDANFL. %d" or "ENDANFLUG AB %d m", math.floor(rz.hgo + 0.5))
       if rz.over then valBox(m + half, yy, half, lb, "1 BART MEHR", C_ORANGE, FONT_STD)
       elseif need <= 0 then valBox(m + half, yy, half, lb, "RAUS", C_GREEN, FONT_STD)
-      else valBox(m + half, yy, half, lb, string.format("+%d m %s", math.floor(need + 0.5), fmtMS(need / rz.vcU)), C_BLUE, FONT_STD) end
+      else valBox(m + half, yy, half, lb, string.format("+%d m %s", math.floor(need + 0.5), fmtMS(need / rz.vcG)), C_BLUE, FONT_STD) end
     else
       valBox(m + half, yy, half, "RESTZEIT", left and fmtMS(left) or "--", C_WHITE, FONT_STD)
     end
