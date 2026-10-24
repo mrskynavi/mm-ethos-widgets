@@ -1993,19 +1993,26 @@ function RZ.search(w, now)
     if fits(mid) then lo = mid else hi = mid end
   end
   local N, mi = lo, lo > 0 and fits(lo) or nil
+  r.mcz = mi and RZ.M[mi]
+  -- Mit normalem MC zaehlen die Dreiecke mit dem eingestellten MC (hoechstens so viele wie mit dem Zeit-MC)
+  local mm = w.rzMan and clamp(math.floor(w.mcValue * 4 + 1.5), 1, nm)
+  if mm then
+    while N > 0 and ev(N, mm, dh0) > availM do N = N - 1 end
+    mi = N > 0 and mm or nil
+  end
   local best = 1e9
-  for j = 1, nm do best = math.min(best, (ev(N + 1, j, dh0))) end
-  r.N, r.mcz, r.behind = N, mi and RZ.M[mi], best * F - avail
+  for j = mm or 1, mm or nm do best = math.min(best, (ev(N + 1, j, dh0))) end
+  r.N, r.behind = N, best * F - avail
   local _, _, dhN = ev(N, mi or 1, dh0)
   r.slack = mi and rest - ev(N, mi, dh0) * F or nil
   -- Hoehe reicht ohne Kreisen und der Zeit-MC liegt ueber dem Steigen: Hoehe wird gezielt in Fahrt umgesetzt
   r.down = mi ~= nil and dhN <= dh0 and RZ.M[mi] > Vc
   -- kein Dreieck mehr moeglich: bestes Gleiten (MC 0), ab jetzt zaehlt nur noch sicheres Landen
-  if not mi then r.mcz = 0 end
+  if not r.mcz then r.mcz = 0 end
   -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
   r.hgo = nil
   if mi then
-    for j = 1, nm do
+    for j = mm or 1, mm or nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
       if math.max(0, need - f.agl) / r.vcG + tg <= availM then r.hgo = need; break end
