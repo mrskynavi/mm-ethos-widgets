@@ -512,7 +512,7 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow, noPts)
       end
       L = L + arcA * R
       ts[k] = L / V
-      if k == 1 then res.t1 = ts[1] end
+      if k == 1 then res.t1 = ts[1] elseif k == 2 then res.t2 = ts[2] end
       if k == n then break end
       -- Aussentangente zum naechsten Kreis (gleicher Drehsinn)
       local ex, ey = Z[k + 1].x - Z[k].x, Z[k + 1].y - Z[k].y
@@ -1687,7 +1687,30 @@ local function glideCalc(w, f, full)
       missed = plan ~= nil
     end
   end
+  -- Kurvenbeginn verpasst (planPath: geradeaus bis in den Sektor, dann wenden): im naechsten Aufruf die
+  -- Wende zur anderen Seite (missPlan) rechnen und die schnellere nehmen (verglichen bis zur naechsten Ecke). Nie beide im selben Aufruf
+  -- (Instruktionsgrenze); ist die andere Seite schneller, bleibt es bis zum Sektor bei ihr.
+  local lm, heavy = w.lateMiss, missed
+  if lm and lm.j ~= j then lm = nil; w.lateMiss = nil end
+  if not plan and lm and f.hdg then
+    local now = os.clock()
+    if lm.use or lm.pending then
+      local mp = missPlan(w, f, T, j, wx, wy, w.tasF or f.tas or 20, radius(w, j))
+      heavy = true
+      if mp and (lm.use or mp.t1 < lm.t2 - (now - lm.t)) then
+        plan, missed, lm.use = mp, true, true
+      elseif lm.pending then
+        plan, lm.pending, lm.t = lm.plan, false, now
+      else
+        w.lateMiss = nil
+      end
+    end
+  end
   plan = plan or planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C, f.hdg)
+  if plan.late and not missed and w.tp < 3 then
+    local now = os.clock()
+    if not lm or now - lm.t >= 1 then w.lateMiss = {j = j, t = now, t2 = plan.t2 or 1e9, plan = plan, pending = true} end
+  end
   g.plan, g.R, g.C = plan, R, C
   if f.hdg then g.err = angDiff(plan.hdg, f.hdg) end   -- positiv = rechts drehen
   if w.ref then
@@ -1716,7 +1739,7 @@ local function glideCalc(w, f, full)
     -- Restzeit der Runde: zweite Planung nur jede Sekunde und nie im selben Aufruf wie die Fehlwende
     local now = os.clock()
     local hc = w.hFinC
-    if not hc or hc.tp ~= w.tp or (not missed and now - hc.t >= 1) then
+    if not hc or hc.tp ~= w.tp or (not heavy and now - hc.t >= 1) then
       local pr = planPath(f.x, f.y, wx, wy, V, R, cornersFrom(T, w.tp + 1, nRem, radiusFn(w), w.margin), f.hdg, true)
       hc = {tp = w.tp, t = now, tAll = pr.tAll or 0, x = f.x, y = f.y}
       w.hFinC = hc
