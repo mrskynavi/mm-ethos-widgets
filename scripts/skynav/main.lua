@@ -2011,7 +2011,8 @@ function RZ.search(w, now)
   local _, _, dhN = ev(N, mi or 1, dh0)
   r.slack = mi and rest - ev(N, mi, dh0) * F or nil
   -- Hoehe reicht ohne Kreisen und der Zeit-MC liegt ueber dem Steigen: Hoehe wird gezielt in Fahrt umgesetzt
-  r.down = mi ~= nil and dhN <= dh0 and RZ.M[mi] > Vc
+  -- (nur mit MC ZEIT: mit normalem MC bestimmt der Pilot die Fahrt)
+  r.down = not w.rzMan and mi ~= nil and dhN <= dh0 and RZ.M[mi] > Vc
   -- kein Dreieck mehr moeglich: bestes Gleiten (MC 0), ab jetzt zaehlt nur noch sicheres Landen
   if not r.mcz then r.mcz = 0 end
   -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
@@ -3338,7 +3339,7 @@ local function paintGlide(w, W, H, top)
       if N == 0 then return "DREIECKE", "0", C_ORANGE, "kein weiteres", "", C_ORANGE end
       if b and b > 0 and b < 30 then return "DREIECKE", string.format("%d", N), C_WHITE, string.format("%d", N + 1), string.format("fehlen %d s", math.floor(b + 0.5)), C_ORANGE end
       if rz.down then return "DREIECKE", string.format("%d", N), C_WHITE, "Höhe wird abgebaut", nil, C_BLUE end
-      return "DREIECKE", string.format("%d", N), C_WHITE, rz.slack and string.format("Reserve %+d s", math.floor(rz.slack + 0.5)), nil, C_GREEN
+      return "DREIECKE", string.format("%d", N), C_WHITE, rz.slack and (rz.slack < 100 and string.format("Reserve %+d s", math.floor(rz.slack + 0.5)) or ("Reserve " .. fmtMS(rz.slack))), nil, C_GREEN
     elseif code == 15 then return "RADIUS", string.format("%d m", math.floor((g.R or 0) + 0.5)), C_WHITE
     elseif code == 16 then return "MC ZEIT", rz and rz.mcz and string.format("%.1f", rz.mcz) or "--", C_BLUE
     elseif code == 17 then
