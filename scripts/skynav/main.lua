@@ -6,7 +6,7 @@
 -- sie beim Anschliessen des Senders nach scripts/skynav/aufgaben.lua. In der Konfiguration waehlst
 -- Du nur noch die Aufgabe. Die Polare fuer den Sollfahrt-Teil kommt wie beim Widget Sollfahrt aus
 -- scripts/maccready/polaren.lua (ohne Polare laeuft die Navigation trotzdem).
--- Ballast: Am Sender stehen Ballast-Poti (0..100 %, optional) und Ballast maximal in kg (ohne Poti gilt er
+-- Ballast: Am Sender stehen eine Ballast-Quelle (0..100 %, optional: Poti, Schieber, Schalter, Kanal) und Ballast maximal in kg (ohne Poti gilt er
 -- fix). Das Leergewicht steht pro Modell als mass (kg) in polaren.lua; die Polare wird auf Leergewicht plus
 -- Ballast umgerechnet, die Kopfzeile zeigt Ballast und Fluggewicht.
 --
@@ -3971,9 +3971,9 @@ local function configure(w)
   addSwitch(w, "Schalter Seite Auswertung", "swEval")
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
   addSwitch(w, "Ton-Schalter (optional)", "soundSw")
-  addSource(w, "MC Poti (optional)", "mcSrc")
-  addSource(w, "Ballast Poti (optional, 0 bis 100 %)", "balSrc")
-  local bf = addNumber(w, "Ballast maximal (ohne Poti: fix)", "balMax", 0, 200)
+  addSource(w, "MC-Quelle (optional)", "mcSrc")
+  addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
+  local bf = addNumber(w, "Ballast maximal (ohne Quelle: fix)", "balMax", 0, 200)
   if bf then pcall(bf.decimals, bf, 1); pcall(bf.suffix, bf, " kg") end
   addNumber(w, "Übersicht: Spur der letzten x min (0 = aus)", "trackMin", 0, 5)
   -- Zeit
