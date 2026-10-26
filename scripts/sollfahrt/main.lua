@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.5
+-- @version 1.6
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -727,7 +727,7 @@ local function refreshPolarFile(w, now, force)
   end
   local sig = "-"
   local e = w.fileEntry
-  if e then sig = string.format("%s,%s,%s,%s,%s", tostring(e.a), tostring(e.b), tostring(e.c), tostring(e.vMin), tostring(e.vMax)) end
+  if e then sig = string.format("%s,%s,%s,%s,%s,%s", tostring(e.a), tostring(e.b), tostring(e.c), tostring(e.vMin), tostring(e.vMax), tostring(e.ver)) end
   w.fileSig = sig
 end
 
@@ -748,7 +748,16 @@ end
 -- Statuszeile fuer Konfiguration und Widget. Zweiter Wert: true = Polare vorhanden.
 local function polarStatus(w)
   local name = w.modelName or "?"
-  if w.polar then return "vorhanden: " .. tostring(w.fileKey or name), true end
+  if w.polar then
+    -- Version und Datum der fixierten Polare aus der App (ver = 4, fix = "2026-10-26" -> "v4 · 26.10.")
+    local e, extra = w.fileEntry, ""
+    if e and e.ver then
+      extra = " · v" .. tostring(e.ver)
+      local y, m, d = tostring(e.fix or ""):match("^(%d+)-(%d+)-(%d+)$")
+      if d then extra = extra .. " · " .. d .. "." .. m .. "." end
+    end
+    return "vorhanden: " .. tostring(w.fileKey or name) .. extra, true
+  end
   return "FEHLT fuer '" .. name .. "' (" .. tostring(w.polarNote or "?") .. ")", false
 end
 
