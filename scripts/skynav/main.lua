@@ -6,6 +6,9 @@
 -- sie beim Anschliessen des Senders nach scripts/skynav/aufgaben.lua. In der Konfiguration waehlst
 -- Du nur noch die Aufgabe. Die Polare fuer den Sollfahrt-Teil kommt wie beim Widget Sollfahrt aus
 -- scripts/maccready/polaren.lua (ohne Polare laeuft die Navigation trotzdem).
+-- Ballast: Am Sender stehen Ballast-Poti (0..100 %, optional) und Ballast maximal in kg (ohne Poti gilt er
+-- fix). Das Leergewicht steht pro Modell als mass (kg) in polaren.lua; die Polare wird auf Leergewicht plus
+-- Ballast umgerechnet, die Kopfzeile zeigt Ballast und Fluggewicht.
 --
 -- Regeln nach "GPS Triangle Definition V1.7b" und den Reglementen Light/Sport/Scale:
 --   Dreieck rechtwinklig-gleichschenklig, Ursprung O = Mitte der Hypotenuse, dTP = Abstand O-Ecke,
@@ -648,8 +651,10 @@ local function sayNumber(w, page, v, unit, dec)
 end
 
 -- Optionale Sprachdateien (links.wav, rechts.wav, ...) im Ordner audio des Widgets
+local audioFile
+do -- Cache im eigenen Block (das Hauptkapitel ist am Limit von 200 lokalen Variablen)
 local audioCache = {}
-local function audioFile(name)
+function audioFile(name)
   if audioCache[name] ~= nil then return audioCache[name] or nil end
   audioCache[name] = false
   if io and io.open then
@@ -659,6 +664,7 @@ local function audioFile(name)
     end
   end
   return audioCache[name] or nil
+end
 end
 
 local function sayWord(w, page, name)
@@ -992,6 +998,9 @@ local TEXT_DEFS = {
   {key = "compId", def = ""},
   {key = "gliderId", def = ""},
 }
+-- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
+-- damit aeltere Konfigurationen ihre Reihenfolge behalten.
+local BAL = {}
 
 -- Einstellungen aus der App (aufgaben.lua, Tabelle settings): Schluessel, Bereich. Am Sender stehen nur noch
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
@@ -1147,6 +1156,26 @@ local function learnRadius(w, r, x, y)
   w.radiiDirty = true
 end
 
+-- Ballast in kg: Poti-Anteil mal Ballast maximal, ohne Poti fix Ballast maximal. Liefert kg und Anteil (oder nil)
+function BAL.now(w)
+  local mx = (w.balMax or 0) / 10
+  if mx <= 0 then return 0, nil end
+  local v = readNumber(w.balSrc)
+  if not v then return mx, nil end
+  local fr = clamp((v + 1024) / 2048, 0, 1)
+  return fr * mx, fr
+end
+
+-- Polare fuer das aktuelle Gewicht: Leergewicht der Polare (mass, kg, aus der App) plus Ballast; Fahrt und
+-- Sinken mal sqrt(Gewicht / Leergewicht). Ohne mass gilt wie bisher das Fluggewicht in % aus der App.
+function BAL.polar(w)
+  local e = w.polarE
+  local m0 = e and type(e.mass) == "number" and e.mass > 0 and e.mass or nil
+  w.polarMass = m0
+  local fac = m0 and (m0 + (w.balKg or 0)) / m0 or w.ballast / 100
+  w.polar = e and polarFromAbc(e.a, e.b, e.c, e.vMin, e.vMax, fac, w.bugs / 100) or nil
+end
+
 local function refreshPolar(w, now, force)
   local name = currentModelName()
   if name ~= w.modelName or not w.radii then w.modelName = name; loadRadii(w) end
@@ -1158,7 +1187,8 @@ local function refreshPolar(w, now, force)
   w.polarModel, w.polarT = name, now
   local all = loadLuaTable(POLAR_PATHS)
   local e = all and findByName(all, name or "")
-  w.polar = e and polarFromAbc(e.a, e.b, e.c, e.vMin, e.vMax, w.ballast / 100, w.bugs / 100) or nil
+  w.polarE = e
+  BAL.polar(w)
 end
 
 -- Startfenster in Senderuhr-Zeit: von Hand (Konfiguration) oder aus der Aufgabe (UTC)
@@ -2147,6 +2177,14 @@ local function wakeup(w)
   if dt > 0.5 then dt = 0.5 end
   refreshTasks(w, now, false)
   refreshPolar(w, now, false)
+  -- Ballast: in 0.1 kg, mit Hysterese gegen Poti-Rauschen; eine Aenderung faerbt die Kopfzeile 3 s orange
+  local bk, bfr = BAL.now(w)
+  w.balFr = bfr
+  if not w.balKg or math.abs(bk - w.balKg) > 0.07 then
+    if w.balKg then w.balChgT = now end
+    w.balKg = math.floor(bk * 10 + 0.5) / 10
+    BAL.polar(w)
+  end
   -- MC ZEIT oder fester MC: mit MC-Poti gilt der Poti-Wert, am Anschlag oben (ab 99 %) MC ZEIT; ohne Poti
   -- der feste MC, Tippen auf das MC-Feld schaltet auf MC ZEIT und zurueck
   if not validSource(w.mcSrc) then w.mcValue = w.mc / 10; w.rzMan = not w.rzTap else
@@ -2394,6 +2432,26 @@ local function restTime(w)
   return T.work * 60, false
 end
 
+-- Text fuer die Kopfzeile (lang, kurz, knapp), Farbe, Hintergrund. Ohne Ballast und ohne Leergewicht: nichts.
+function BAL.label(w)
+  local m0, kg = w.polarMass, w.balKg or 0
+  local mx = (w.balMax or 0) / 10
+  if mx <= 0 then
+    if not m0 then return nil end
+    local g = string.format("%.1f kg", m0)
+    return {"GEWICHT " .. g, g}, C_DIM
+  end
+  local b = string.format("%.1f kg", kg)
+  if not m0 then return {"BALLAST " .. b .. "  LEERGEWICHT?", "LEERGEWICHT?", "LEER?"}, C_ORANGE end
+  local g = string.format("%.1f kg", m0 + kg)
+  if w.balChgT and os.clock() - w.balChgT < 3 then
+    local pre = w.balFr and string.format("BALLAST %d %% = ", math.floor(w.balFr * 100 + 0.5)) or "BALLAST "
+    return {pre .. b .. "  GEWICHT " .. g, "BALLAST " .. b .. "  " .. g, b .. " " .. g, g}, C_BG, C_ORANGE
+  end
+  if kg <= 0 then return {"OHNE BALLAST  GEWICHT " .. g, "OHNE BALLAST  " .. g, g}, C_DIM end
+  return {(w.balFr and "BALLAST " or "BALLAST FIX ") .. b .. "  GEWICHT " .. g, "BALLAST " .. b .. "  " .. g, b .. " " .. g, g}, C_BLUE
+end
+
 local function header(w, W)
   local th = math.max(textH(FONT_S), textH(FONT_STD))
   lcd.color(rgb(25, 25, 25))
@@ -2421,13 +2479,41 @@ local function header(w, W)
     st, col = st .. "  GPS STEHT", C_RED
   end
   clock = clock .. (gpsClock(w) and "" or "*")
-  drawT(W * 0.4, 2, W * 0.6 - 6, st .. "  " .. clock, FONT_S, col, "r")
+  local _, stW = drawT(W * 0.4, 2, W * 0.6 - 6, st .. "  " .. clock, FONT_S, col, "r")
   -- Restzeit prominent links
   local rest, running = restTime(w)
+  local restW = 0
   if rest then
     local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
     if rest < 0 then rest = 0 end
-    drawT(6, 1, W * 0.5, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+    _, restW = drawT(6, 1, W * 0.5, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+  end
+  -- Ballast und Fluggewicht in der Mitte
+  local bt, bc, bg = BAL.label(w)
+  if bt then
+    local gap = SMALL and 8 or 16
+    local x0, x1 = 6 + restW + gap, W - 6 - stW - gap
+    lcd.font(FONT_S)
+    local barW = fl(th * 1.4)
+    local txt
+    for _, t in ipairs(bt) do
+      local tw = lcd.getTextSize(t)
+      if tw + (w.balFr and barW + 6 or 0) <= x1 - x0 - (bg and 12 or 0) then txt = t; break end
+    end
+    if txt then
+      local tw = lcd.getTextSize(txt)
+      local bw = tw + (w.balFr and barW + 6 or 0)
+      local bx = x0 + (x1 - x0 - bw) / 2
+      if bg then lcd.color(bg); rect(bx - 6, 0, bw + 12, th + 4) end
+      if w.balFr then
+        lcd.color(bc)
+        local by, bh = 2 + th * 0.25, th * 0.5
+        rect(bx, by, barW, 1); rect(bx, by + bh - 1, barW, 1); rect(bx, by, 1, bh); rect(bx + barW - 1, by, 1, bh)
+        if w.balFr > 0 then rect(bx + 2, by + 2, (barW - 4) * w.balFr, bh - 4) end
+        bx = bx + barW + 6
+      end
+      drawT(bx, 2, tw, txt, FONT_S, bc, "l")
+    end
   end
   return th + 6
 end
@@ -3886,6 +3972,9 @@ local function configure(w)
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
   addSwitch(w, "Ton-Schalter (optional)", "soundSw")
   addSource(w, "MC Poti (optional)", "mcSrc")
+  addSource(w, "Ballast Poti (optional, 0 bis 100 %)", "balSrc")
+  local bf = addNumber(w, "Ballast maximal (ohne Poti: fix)", "balMax", 0, 200)
+  if bf then pcall(bf.decimals, bf, 1); pcall(bf.suffix, bf, " kg") end
   addNumber(w, "Übersicht: Spur der letzten x min (0 = aus)", "trackMin", 0, 5)
   -- Zeit
   addNumber(w, "Startfenster von Hand: Stunde (-1 = Aufgabe)", "slotH", -1, 23)
@@ -3902,6 +3991,7 @@ local function setDefaults(w)
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
+  w.balSrc, w.balMax = nil, 0
 end
 
 local function read(w)
@@ -3911,6 +4001,8 @@ local function read(w)
     for _, d in ipairs(NUM_DEFS) do local v = storage.read(d.key); w[d.key] = type(v) == "number" and v or d.def end
     for _, d in ipairs(BOOL_DEFS) do local v = storage.read(d.key); if type(v) == "boolean" then w[d.key] = v else w[d.key] = d.def end end
     for _, d in ipairs(TEXT_DEFS) do local v = storage.read(d.key); w[d.key] = type(v) == "string" and v or d.def end
+    w.balSrc = validSource(storage.read("balSrc"))
+    local v = storage.read("balMax"); w.balMax = type(v) == "number" and v or 0
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -3922,6 +4014,8 @@ local function write(w)
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
   for _, d in ipairs(BOOL_DEFS) do storage.write(d.key, w[d.key]) end
   for _, d in ipairs(TEXT_DEFS) do storage.write(d.key, w[d.key] or "") end
+  storage.write("balSrc", w.balSrc)
+  storage.write("balMax", w.balMax)
 end
 
 local function init()
