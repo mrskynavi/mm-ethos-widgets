@@ -1981,8 +1981,10 @@ function RZ.table(w, now)
   r.ld = ld
   if w.therm then r.thd = (r.thd or 0) + dd else
     r.dist = r.dist + dd
-    -- (nicht bei Motor oder Hangaufwind mit mehr als 2 m/s Steigen)
-    if w.netto and (w.omega or 0) < math.rad(8) and (w.teN or 0) < 2 then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 3) - r.net[leg]) * dt / 60 end
+    -- Motor: Netto ueber 4 m/s (wie bei den Baerten), dazu 10 s danach (Netto ist 8 s geglaettet). Starkes
+    -- Steigen im Delphinflug zaehlt mit.
+    if (w.netto or 0) > 4 or (w.teN or 0) > 5 then r.motT = now end
+    if w.netto and (w.omega or 0) < math.rad(8) and not (r.motT and now - r.motT < 10) then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 4) - r.net[leg]) * dt / 60 end
   end
   -- Steigen: nur aus ausgekurbelten Baerten seit dem Start (mind. 20 s und 15 m Gewinn, 0.2 bis 4 m/s, mehr
   -- ist Motor), die letzten 6 fuer RZ.climb. Vorher rechnet die Restzeit ohne Steigen (nur Abgleiten).
@@ -2099,8 +2101,9 @@ function RZ.search(w, now)
   local _, _, dhN = ev(N, mi or 1, dh0)
   r.slack = mi and rest - ev(N, mi, dh0) * F or nil
   -- Hoehe reicht ohne Kreisen und der Zeit-MC liegt ueber dem Steigen: Hoehe wird gezielt in Fahrt umgesetzt
-  -- (nur mit MC ZEIT: mit normalem MC bestimmt der Pilot die Fahrt)
-  r.down = not w.rzMan and mi ~= nil and dhN <= dh0 and RZ.M[mi] > Vc
+  -- (nur mit MC ZEIT: mit normalem MC bestimmt der Pilot die Fahrt). Nur wenn der Plan wirklich mindestens die
+  -- halbe verfuegbare Hoehe (und 20 m) verbraucht; im Delphinflug mit Netto haelt man die Hoehe.
+  r.down = not w.rzMan and mi ~= nil and dhN <= dh0 and dhN >= math.max(20, dh0 / 2) and RZ.M[mi] > Vc
   -- kein Dreieck mehr moeglich: bestes Gleiten (MC 0), ab jetzt zaehlt nur noch sicheres Landen
   if not r.mcz then r.mcz = 0 end
   -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
