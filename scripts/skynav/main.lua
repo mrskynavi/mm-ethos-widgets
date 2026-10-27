@@ -909,6 +909,7 @@ local function igcOpen(w, f)
   for _, b in ipairs(w.ring) do igcAdd(w, b) end
   w.ring = {}
   igcFlush(w)
+  w.igcSkip = true                                                 -- Pruefsumme erst ab dem naechsten Aufruf
 end
 
 local function igcEvent(w, code, f)
@@ -928,6 +929,7 @@ end
 
 -- pro wakeup: Pruefsummen in Portionen, fertig gerechnete Dateien abschliessen
 local function igcStep(w)
+  if w.igcSkip then w.igcSkip = nil; return end
   local budget = 400
   local Q = w.igcQ
   if Q and Q[1] then
@@ -1556,7 +1558,7 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
   local ax, ay = c.x + w.margin * c.bx, c.y + w.margin * c.by
   local nxt = T.tp[j % 3 + 1]
   local om = math.deg(V / R)                                       -- Grad pro Sekunde
-  local STEP = 10
+  local STEP = 15                                                  -- 10 Grad sprengte im Testflug die Instruktionsgrenze
   local dt = STEP / om
   -- Restzeit ab einem Punkt im Sektor mit Steuerkurs h: Kurve (kuerzere Seite) bis auf Kurs zur naechsten
   -- Ecke, dann gerade bis dorthin. Kurve geschlossen gerechnet (Kreis in der Luft, Wind als Versatz),
@@ -1625,7 +1627,7 @@ local function missPlan(w, f, T, j, wx, wy, V, R)
       -- b) gerade zum Zielpunkt: Grundgeschwindigkeit s entlang u mit |s*u - W| = V
       local gx, gy = ax - x, ay - y
       local D = math.sqrt(gx * gx + gy * gy)
-      if D > 1 then
+      if D > 1 and gx * hx + gy * hy > 0 then                      -- Zielpunkt hinter dem Kurs: kein Kandidat
         local ux, uy = gx / D, gy / D
         local wu = wx * ux + wy * uy
         local disc = wu * wu - W2 + V * V
