@@ -32,7 +32,7 @@
 -- (Kommando "x Grad links/rechts") und die Zeit bis zum Einleiten der Kurve (Piepse davor).
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
--- viele Dreiecke noch passen, und zeigt statt des festen MC den kleinsten MC, der sie schafft (Tippen auf das
+-- viele Dreiecke noch passen, und zeigt statt des festen MC den MC, der sie am schnellsten schafft (Tippen auf das
 -- MC-Feld schaltet zwischen festem MC und MC ZEIT; mit MC-Poti: Anschlag oben = MC ZEIT). Im Bart: ab welcher Hoehe der Endanflug ohne Bart reicht.
 --
 -- IGC: Das Widget schreibt ab dem Scharfschalten bzw. Abheben (mit 90 s Vorlauf) eine IGC-Datei nach
@@ -1925,11 +1925,11 @@ end
 
 -- ---------------------------------------------------------------- Restzeit-Sollfahrt (Zeit-MC)
 -- Wie viele Dreiecke passen noch in die Arbeitszeit (Netto pro Schenkel, Wind, Steigen, Hoehe), und welcher
--- MC schafft sie mit der kleinsten Fahrt (Zeit-MC)? Pro Schenkel i und MC m: Sollfahrt v (Polare, Gegenwind,
+-- MC schafft sie in der kuerzesten Zeit (Zeit-MC)? Pro Schenkel i und MC m: Sollfahrt v (Polare, Gegenwind,
 -- Netto des Schenkels), Zeit pro Meter 1/vg, Hoehenverlust pro Meter (Sinken - Netto)/vg. N Dreiecke (das
 -- laufende zaehlt als erstes): Gleitzeit = Index k * (Rest dieser Runde + (N-1) Runden), die Hoehe, die ueber
 -- hmin fehlt, wird mit Vc gestiegen. Pilotfaktor z auf den letzten zwei Runden, Lernfaktor f = echte durch
--- modellierte Rundenzeit. Zeit-MC = kleinster m, mit dem N_max noch in Restzeit minus Reserve passt (bei zu
+-- modellierte Rundenzeit. Zeit-MC = m mit der kuerzesten Zeit fuer N_max (bei Gleichstand zaehlt die Zeit; bei zu
 -- viel Hoehe ergibt das von selbst mehr Fahrt). Zwei Portionen (Tabelle, Suche) in Aufrufen ohne GPS-Fix,
 -- hoechstens einmal pro Sekunde (Instruktionsgrenze).
 local RZ = {M = {}}
@@ -2088,6 +2088,15 @@ function RZ.search(w, now)
     if fits(mid) then lo = mid else hi = mid end
   end
   local N, mi = lo, lo > 0 and fits(lo) or nil
+  -- Bei gleich vielen Dreiecken zaehlt die schnellere Zeit: Zeit-MC = MC mit der kuerzesten Zeit fuer die N
+  -- Dreiecke (mit Kreisen bei fehlender Hoehe; uebrige Hoehe bis hmin wird in Fahrt umgesetzt)
+  if mi then
+    local tb = ev(N, mi, dh0)
+    for j = mi + 1, nm do
+      local t = ev(N, j, dh0)
+      if t < tb then mi, tb = j, t end
+    end
+  end
   r.mcz = mi and RZ.M[mi]
   -- Mit normalem MC zaehlen die Dreiecke mit dem eingestellten MC (hoechstens so viele wie mit dem Zeit-MC)
   local mm = w.rzMan and clamp(math.floor(w.mcValue * 4 + 1.5), 1, nm)
@@ -2106,14 +2115,22 @@ function RZ.search(w, now)
   r.down = not w.rzMan and mi ~= nil and dhN <= dh0 and dhN >= math.max(20, dh0 / 2) and RZ.M[mi] > Vc
   -- kein Dreieck mehr moeglich: bestes Gleiten (MC 0), ab jetzt zaehlt nur noch sicheres Landen
   if not r.mcz then r.mcz = 0 end
-  -- tiefste Hoehe, ab der man ohne weiteren Bart die N Dreiecke in der Zeit schafft
+  -- Abflughoehe fuer den Endanflug ohne weiteren Bart: die mit der kuerzesten Gesamtzeit (Steigen hier plus
+  -- Gleiten) fuer die N Dreiecke, unter dem Hoehenlimit; geht keine darunter, die tiefste
   r.hgo = nil
   if mi then
+    local tb, nb, lowN
     for j = mm or 1, mm or nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
-      if math.max(0, need - f.agl) / r.vcG + tg <= availM then r.hgo = need; break end
+      local t = math.max(0, need - f.agl) / r.vcG + tg
+      if t <= availM then
+        if need <= hmax then
+          if not tb or t < tb then tb, nb = t, need end
+        elseif not lowN or need < lowN then lowN = need end
+      end
     end
+    r.hgo = nb or lowN
   end
   r.over = r.hgo and r.hgo > hmax
   -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt), neue Zahl erst, wenn sie
