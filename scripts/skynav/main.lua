@@ -1933,6 +1933,34 @@ end
 local RZ = {M = {}}
 for i = 0, 24 do RZ.M[i + 1] = i * 0.25 end
 
+-- Steigen aus den Baerten {t = Mitte, v = Steigen, d = Dauer}: Mittel nach Dauer, jeder aeltere Bart zaehlt halb
+-- so viel wie der naechste. Ab 3 Baerten ueber mind. 2 min der Trend (Gerade nach Dauer gewichtet): nimmt das
+-- Steigen ab, gilt fuer die Restzeit der Wert der Geraden in der Mitte der Restzeit (nicht weiter voraus als die
+-- halbe Zeitspanne der Baerte), hoechstens auf die Haelfte des Mittels herunter. Zunehmendes Steigen wird nicht
+-- eingeplant.
+function RZ.climb(bs, now, rest)
+  local n = #bs
+  if n == 0 then return nil end
+  local sw, sv, q = 0, 0, 1
+  for i = n, 1, -1 do
+    local g = bs[i].d * q
+    sw, sv, q = sw + g, sv + g * bs[i].v, q / 2
+  end
+  local vc = sv / sw
+  if n < 3 or bs[n].t - bs[1].t < 120 then return vc, vc end
+  local st, sx, sy, sxx, sxy = 0, 0, 0, 0, 0
+  for i = 1, n do
+    local g, x = bs[i].d, bs[i].t - now
+    st, sx, sy, sxx, sxy = st + g, sx + g * x, sy + g * bs[i].v, sxx + g * x * x, sxy + g * x * bs[i].v
+  end
+  local den = st * sxx - sx * sx
+  if den <= 0 then return vc, vc end
+  local b = (st * sxy - sx * sy) / den
+  if b >= 0 then return vc, vc end
+  local a = (sy - b * sx) / st
+  return vc, clamp(a + b * math.min(math.max(rest, 0), bs[n].t - bs[1].t) / 2, vc / 2, vc)
+end
+
 -- Lernen und Tabelle pro MC-Wert: Rest dieser Runde (TP, HP) und ganze Runde (TL, HL), ohne Index k
 function RZ.table(w, now)
   local T, f, p, r = w.task, w.cur, w.polar, w.rz
@@ -1955,7 +1983,7 @@ function RZ.table(w, now)
     if w.netto and (w.omega or 0) < math.rad(8) and (w.teN or 0) < 2 then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 3) - r.net[leg]) * dt / 60 end
   end
   -- Steigen: nur aus ausgekurbelten Baerten seit dem Start (mind. 20 s und 15 m Gewinn, 0.2 bis 4 m/s, mehr
-  -- ist Motor), zeitgewichtetes Mittel. Vorher rechnet die Restzeit ohne Steigen (nur Abgleiten).
+  -- ist Motor), die letzten 6 fuer RZ.climb. Vorher rechnet die Restzeit ohne Steigen (nur Abgleiten).
   local lt = w.lastTherm
   if lt and lt ~= r.th then
     r.th = lt
@@ -1963,8 +1991,9 @@ function RZ.table(w, now)
     r.dist, r.thd = r.dist + (r.thd or 0) * (dur < 20 and 1 or 8 / (dur + 8)), 0
     local gain = lt.hMax - lt.h0
     if lt.t0 >= r.tS and dur >= 20 and gain >= 15 and gain / dur >= 0.2 and gain / dur <= 4 then
-      r.vcS, r.vcT = (r.vcS or 0) + gain, (r.vcT or 0) + dur
-      r.vc = r.vcS / r.vcT
+      r.bs = r.bs or {}
+      r.bs[#r.bs + 1] = {t = lt.t0 + dur / 2, v = gain / dur, d = dur}
+      if #r.bs > 6 then table.remove(r.bs, 1) end
     end
   end
   -- Runde fertig: Index und Lernfaktor f (Hoehengewinn/-verlust der Runde mit Vc umgerechnet)
@@ -1985,12 +2014,16 @@ function RZ.table(w, now)
   local k = 0
   for _, v in ipairs(r.ks) do k = k + v end
   r.k = #r.ks > 0 and k / #r.ks or 1.05
-  -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant). Fuer die
-  -- Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst die gelernten.
+  -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant), mit
+  -- abnehmendem Trend fuer die Restzeit. Fuer die Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst
+  -- die gelernten.
   local tm = w.therm
   local vt = tm and tm.h and now - tm.t0 >= 20 and (tm.h - tm.h0) / (now - tm.t0) or nil
-  r.vcU = r.vc or 0.001
-  r.vcG = math.max(0.2, vt or r.vc or 0.2)
+  local vce
+  if r.bs then r.vc, vce = RZ.climb(r.bs, now, T.work * 60 - (f.clk - w.startT)) end
+  r.vcE = vce
+  r.vcU = vce or 0.001
+  r.vcG = math.max(0.2, vt or vce or 0.2)
   if r.mcz then r.mcS, r.mcN = r.mcS + (w.rzMan and w.mcValue or r.mcz), r.mcN + 1 end
   -- Schenkel O-TP1-TP2-TP3-O: Laenge, Wind laengs (positiv = Rueckenwind) und quer
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
