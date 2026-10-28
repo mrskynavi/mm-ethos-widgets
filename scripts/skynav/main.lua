@@ -2107,8 +2107,8 @@ function RZ.search(w, now)
   end
   -- Fest pro Runde (sonst springt der Wert mit jeder kleinen Aenderung, die Zeit ist um das Optimum flach):
   -- neu gerechnet bei neuer Runde, beim Verlassen eines Barts und wenn der feste Wert die Dreiecke nicht mehr
-  -- schafft
-  if mi and not w.rzMan then
+  -- schafft. Gilt auch fuer die Anzeige MC ZEIT, wenn mit normalem MC geflogen wird.
+  if mi then
     local L = r.lock
     if L and L.lap == #w.laps and L.th == w.lastTherm and L.mi <= nm and ev(N, L.mi, dh0) <= availM then
       mi = L.mi
