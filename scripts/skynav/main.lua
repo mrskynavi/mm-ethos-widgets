@@ -1276,7 +1276,9 @@ local function readInputs(w, now, dt)
   end
   -- Drehrate -> Wenderadius
   if hdg and w.hdgPrev and dtFix > 0.05 then
-    local omega = math.rad(math.abs(angDiff(hdg, w.hdgPrev))) / dtFix
+    local dA = angDiff(hdg, w.hdgPrev)
+    w.turnSum = (w.turnSum or 0) + dA                              -- Drehung mit Vorzeichen, fuer die Kreiserkennung
+    local omega = math.rad(math.abs(dA)) / dtFix
     w.omega = lpf(w.omega, omega, dtFix, 1.5)
     -- Wenderadius nur aus Kurven ausserhalb der Thermik (Wenden an den Ecken), bei voller Drehrate
     if w.omega > math.rad(25) and omega > 0.8 * w.omega and tas > 3 and not w.therm then
@@ -1876,11 +1878,17 @@ local function thermCalc(w, f, now, dt)
       if #w.avg30 > 30 then table.remove(w.avg30, 1) end
     end
   end
-  -- Kreisen erkennen: Drehrate > 12 Grad/s ueber 8 s
+  -- Kreisen erkennen: Drehrate > 12 Grad/s ueber 8 s ohne Unterbruch (hoechstens 2 s geradeaus) und mindestens
+  -- 270 Grad in eine Richtung. Wenden an den Ecken (rund 120 Grad) und S-Kurven sind kein Bart.
   local circ = (w.omega or 0) > math.rad(12)
-  if circ then w.circSince = w.circSince or now; w.straightSince = nil
-  else w.straightSince = w.straightSince or now end
-  if w.circSince and now - w.circSince > 8 and not w.therm and f then
+  if circ then
+    if not w.circSince then w.circSince, w.turnAt = now, w.turnSum or 0 end
+    w.straightSince = nil
+  else
+    w.straightSince = w.straightSince or now
+    if w.circSince and not w.therm and now - w.straightSince > 2 then w.circSince = nil end
+  end
+  if w.circSince and now - w.circSince > 8 and not w.therm and f and math.abs((w.turnSum or 0) - (w.turnAt or 0)) >= 270 then
     w.therm = {t0 = now, h0 = f.agl, hMax = f.agl}
     -- keine automatische Umschaltung auf Thermik: nur ueber den Schalter oder den Reiter
   end
@@ -2098,11 +2106,11 @@ function RZ.search(w, now)
     end
   end
   -- Fest pro Runde (sonst springt der Wert mit jeder kleinen Aenderung, die Zeit ist um das Optimum flach):
-  -- neu gerechnet bei neuer Runde, nach einem Bart (im Bart laufend) und wenn der feste Wert die Dreiecke
-  -- nicht mehr schafft
+  -- neu gerechnet bei neuer Runde, beim Verlassen eines Barts und wenn der feste Wert die Dreiecke nicht mehr
+  -- schafft
   if mi and not w.rzMan then
     local L = r.lock
-    if L and L.lap == #w.laps and L.th == w.lastTherm and not w.therm and L.mi <= nm and ev(N, L.mi, dh0) <= availM then
+    if L and L.lap == #w.laps and L.th == w.lastTherm and L.mi <= nm and ev(N, L.mi, dh0) <= availM then
       mi = L.mi
     else
       r.lock = {mi = mi, lap = #w.laps, th = w.lastTherm}
