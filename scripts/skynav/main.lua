@@ -2097,6 +2097,17 @@ function RZ.search(w, now)
       if t < tb then mi, tb = j, t end
     end
   end
+  -- Fest pro Runde (sonst springt der Wert mit jeder kleinen Aenderung, die Zeit ist um das Optimum flach):
+  -- neu gerechnet bei neuer Runde, nach einem Bart (im Bart laufend) und wenn der feste Wert die Dreiecke
+  -- nicht mehr schafft
+  if mi and not w.rzMan then
+    local L = r.lock
+    if L and L.lap == #w.laps and L.th == w.lastTherm and not w.therm and L.mi <= nm and ev(N, L.mi, dh0) <= availM then
+      mi = L.mi
+    else
+      r.lock = {mi = mi, lap = #w.laps, th = w.lastTherm}
+    end
+  end
   r.mcz = mi and RZ.M[mi]
   -- Mit normalem MC zaehlen die Dreiecke mit dem eingestellten MC (hoechstens so viele wie mit dem Zeit-MC)
   local mm = w.rzMan and clamp(math.floor(w.mcValue * 4 + 1.5), 1, nm)
