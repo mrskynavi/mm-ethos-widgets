@@ -29,7 +29,7 @@
 -- Ecken liegt ein Kreis (Radius R) so, dass er den Sektor um "Reserve" Meter innen beruehrt. Der
 -- Weg = Tangente zum ersten Kreis, Bogen, Aussentangente zum naechsten Kreis ... Die Ankunftszeiten
 -- (und damit der Versatz der Ecken) werden dreimal nachgerechnet. Daraus kommen der Soll-Steuerkurs
--- (Kommando "x Grad links/rechts") und die Zeit bis zum Einleiten der Kurve (Piepse davor).
+-- (Kommando: Zwitscher steigend = rechts, fallend = links; Kurs-Ticker bei wachsender Ablage) und die Zeit bis zum Einleiten der Kurve (Piepse davor).
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den MC, der sie am schnellsten schafft (Tippen auf das
@@ -1817,34 +1817,37 @@ local function glideTones(w, g, now)
     -- vor dem Start: nur Sollfahrt
   else
     if turnTone(w, g, now, P_GLIDE) then return end
-    -- Kurs-Kommandos: "x Grad links/rechts"
+    -- Kurs-Kommandos als kurzer Zwitscher (steigend = rechts, fallend = links), die Gradzahl steht im Display.
+    -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 3 s,
+    -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s.
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
     if w.navVoice and g.err and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
-      local a = math.abs(g.err)
+      local a, right = math.abs(g.err), g.err > 0
+      local xt, xp = g.xt, g.xtPred
+      local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
+      if drift then w.driftSince = w.driftSince or now else w.driftSince = nil end
+      local fire = false
+      if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 3) then
+        fire, right = true, xp < 0
+      end
       if a >= w.cmdMin then
         w.errSince = w.errSince or now
         local changed = not w.cmdErr or math.abs(g.err - w.cmdErr) >= 10
-        if now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 3)) then
-          w.cmdT, w.cmdErr = now, g.err
-          local deg = math.floor(a / 5 + 0.5) * 5
-          sayNumber(w, P_GLIDE, deg, UNIT_DEGREE, 0)
-          local right = g.err > 0
-          if not sayWord(w, P_GLIDE, right and "rechts.wav" or "links.wav") then
-            -- Ersatz ohne Sprachdatei: zwei Toene, steigend = rechts, fallend = links
-            w.cmdTones = {t = now + 0.9, f = right and {650, 950} or {950, 650}}
-          end
-          w.quietUntil = now + 2.5
-          return
-        end
+        if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 3)) then fire = true end
       else
         w.errSince = nil
+      end
+      if fire then
+        w.cmdT, w.cmdErr = now, g.err
+        w.cmdTones = {t = now, f = right and {1500, 2200} or {2200, 1500}}
+        w.quietUntil = now + 0.6
       end
     end
   end
   if w.cmdTones and now >= w.cmdTones.t then
     local ft = w.cmdTones.f
-    if ft[1] then tone(w, P_GLIDE, table.remove(ft, 1), 110); w.cmdTones.t = now + 0.16 end
+    if ft[1] then tone(w, P_GLIDE, table.remove(ft, 1), 90); w.cmdTones.t = now + 0.12 end
     if #ft == 0 then w.cmdTones = nil end
     return
   end
@@ -1855,13 +1858,28 @@ local function glideTones(w, g, now)
       local excess = clamp(math.abs(dv) - w.dead, 0, 25)
       if dv > 0 then
         local period = math.max(0.14, 0.55 - excess * 0.016)
-        tone(w, P_GLIDE, 850 + excess * 20, clamp(period * 550, 70, 140))
-        w.stfBeepT = now + period
+        local len = clamp(period * 550, 70, 140)
+        tone(w, P_GLIDE, 850 + excess * 20, len)
+        w.stfBeepT, w.stfEnd = now + period, now + len / 1000
       else
         local period = math.max(0.30, 0.50 - excess * 0.01)
-        tone(w, P_GLIDE, math.max(220, 400 - excess * 8), clamp(period * 600, 180, 300))
-        w.stfBeepT = now + period
+        local len = clamp(period * 600, 180, 300)
+        tone(w, P_GLIDE, math.max(220, 400 - excess * 8), len)
+        w.stfBeepT, w.stfEnd = now + period, now + len / 1000
       end
+      return
+    end
+  end
+  -- Kurs-Ticker (abschaltbar in der Widget-Konfiguration): kurze hohe Klicks, nur solange die Ablage waechst.
+  -- Je schneller sie waechst, desto dichter (1 m/s: 1 s, 5 m/s: 0.4 s, ab 10 m/s: 0.2 s). Laeuft der Flieger
+  -- zur Linie zurueck, ist es still. Nur in den Pausen der Sollfahrt, die hat Vorrang.
+  if w.ticker and g.plan and g.xt and g.xtPred and not g.plan.inTurn and (w.omega or 0) <= math.rad(8)
+      and not (w.tpT and now - w.tpT < 6) and (not w.quietUntil or now > w.quietUntil) and math.abs(g.xt) <= 300 then
+    local rate = (math.abs(g.xtPred) - math.abs(g.xt)) / PRED_S
+    if rate >= 1 and math.abs(g.xtPred) >= 8 and (not w.tickT or now >= w.tickT)
+        and (not w.stfEnd or now >= w.stfEnd + 0.04) and (not w.stfBeepT or w.stfBeepT - now >= 0.08 or now >= w.stfBeepT + 0.3) then
+      tone(w, P_GLIDE, 3000, 25)
+      w.tickT = now + clamp(2 / rate, 0.2, 1.0)
     end
   end
 end
@@ -4045,6 +4063,7 @@ local function configure(w)
   addSwitch(w, "Schalter Seite Auswertung", "swEval")
   addSwitch(w, "Scharf-Schalter (ARM)", "armSw")
   addSwitch(w, "Ton-Schalter (optional)", "soundSw")
+  addBool(w, "Gleiten: Kurs-Ticker (Klicks bei wachsender Ablage)", "ticker")
   addSource(w, "MC-Quelle (optional)", "mcSrc")
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
   local bf = addNumber(w, "Ballast maximal (ohne Quelle: fix)", "balMax", 0, 200)
@@ -4066,6 +4085,7 @@ local function setDefaults(w)
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
   w.balSrc, w.balMax = nil, 0
+  w.ticker = true
 end
 
 local function read(w)
@@ -4077,6 +4097,7 @@ local function read(w)
     for _, d in ipairs(TEXT_DEFS) do local v = storage.read(d.key); w[d.key] = type(v) == "string" and v or d.def end
     w.balSrc = validSource(storage.read("balSrc"))
     local v = storage.read("balMax"); w.balMax = type(v) == "number" and v or 0
+    v = storage.read("ticker"); w.ticker = v ~= false   -- steht zuletzt: aeltere Konfigurationen behalten ihre Reihenfolge
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4090,6 +4111,7 @@ local function write(w)
   for _, d in ipairs(TEXT_DEFS) do storage.write(d.key, w[d.key] or "") end
   storage.write("balSrc", w.balSrc)
   storage.write("balMax", w.balMax)
+  storage.write("ticker", w.ticker ~= false)
 end
 
 local function init()
