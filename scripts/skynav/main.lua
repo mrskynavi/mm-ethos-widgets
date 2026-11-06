@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.1
+-- @version 1.2
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.1"
+local VERSION = "1.2"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1260,14 +1260,20 @@ local function readInputs(w, now, dt)
     x, y = (lon - (w.lon0 or lon)) * M_PER_DEG * math.cos(math.rad(lat)), (lat - (w.lat0 or lat)) * M_PER_DEG
     w.lat0, w.lon0 = w.lat0 or lat, w.lon0 or lon
   end
-  if w.ax == nil then w.ax, w.ay, w.aT = x, y, now end
-  local ddx, ddy = x - w.ax, y - w.ay
+  -- Kurs ueber eine Basis von 2 s: vom juengsten Fix, der mindestens 2 s alt ist, zum neuen Fix. Von Fix zu Fix
+  -- (0,5 bis 1 s, wenige Meter) macht die Aufloesung der Position (etwa 1 m) den Kurs unruhig, Kurszeiger,
+  -- 5-s-Vektor und links/rechts pendelten. 2 s kosten etwa 1 s Verzoegerung. Nach einer Luecke beginnt sie neu.
+  local h = w.crsHist
+  if not h or (#h > 0 and now - h[#h].t > 5) then h = {}; w.crsHist = h end
+  h[#h + 1] = {x = x, y = y, t = now}
+  while #h > 2 and now - h[2].t >= 2.0 do table.remove(h, 1) end
+  local b = h[1]
+  local ddx, ddy = x - b.x, y - b.y
   local dd = math.sqrt(ddx * ddx + ddy * ddy)
   local gsPos
   if dd >= 3 then
     w.crs = bearingOf(ddx, ddy)
-    gsPos = dd / math.max(now - w.aT, 0.05)
-    w.ax, w.ay, w.aT = x, y, now
+    gsPos = dd / math.max(now - b.t, 0.05)
   end
   local gs = speedMs(w.gpsSpd)
   if gs == nil then
