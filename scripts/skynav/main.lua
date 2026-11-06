@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.1
+-- @version 1.2
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -31,7 +31,7 @@
 -- Weg = Tangente zum ersten Kreis, Bogen, Aussentangente zum naechsten Kreis ... Die Ankunftszeiten
 -- (und damit der Versatz der Ecken) werden dreimal nachgerechnet. Daraus kommen der Soll-Steuerkurs
 -- (Ansage "xx links/rechts" vor allem bei wachsender Ablage, Sprachdateien in scripts/skynav/audio; Kurs-Ticker) und die
--- Zeit bis zum Einleiten der Kurve (Wendeton).
+-- Zeit bis zum Einleiten der Kurve (Wendeton: Countdown-Piepse, dann hoher Ton "jetzt wenden").
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den MC, der sie am schnellsten schafft (Tippen auf das
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.1"
+local VERSION = "1.2"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -963,7 +963,7 @@ local NUM_DEFS = {
   {key = "radMode",   def = 1},     -- ungenutzt (Wenderadius wird pro Modell gelernt), Platz fuer die Storage-Reihenfolge
   {key = "radFix",    def = 30},    -- ungenutzt
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
-  {key = "warnSec",   def = 2},     -- Wendeton: Laenge (s), endet am Wendepunkt
+  {key = "warnSec",   def = 2},     -- Wendeton: Countdown (s) vor "Jetzt wenden" am Kurvenbeginn
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
   {key = "cmdMin",    def = 10},    -- Kommando ab x Grad
   {key = "cmdGap",    def = 8},     -- Kommando höchstens alle x s
@@ -1764,6 +1764,14 @@ local function glideCalc(w, f, full)
       if l >= 1 then g.xtPred = g.xt + (f.ve * dy - f.vn * dx) / l * PRED_S end
     end
   end
+  -- Kurs-Kommando (Anzeige "x° LINKS/RECHTS" und Ansage) passend zum Ablage-Balken: zurueck zur Soll-Linie, mit
+  -- einem Anschnitt, der mit der Ablage waechst (0.5 Grad pro Meter, hoechstens 30 Grad). Vorher zeigte das
+  -- Kommando direkt zum Wendekreis: links der Linie und schon kraeftig zur Linie unterwegs hiess es dann
+  -- "LINKS", obwohl der Balken "rechts" sagte. Kurz vor der Ecke (Kurve in weniger als 6 s) gilt der Plan.
+  if g.xt and f.crs and w.ref and not plan.inTurn and not missed and (plan.tT or 0) > 6 then
+    local lb = bearingOf(w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay)
+    g.err = angDiff(lb - clamp(g.xt * 0.5, -30, 30), f.crs)
+  end
   g.next = w.tp % 3 + 1
   local nxt = T.tp[g.next]
   g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
@@ -1803,39 +1811,122 @@ local function glideCalc(w, f, full)
   return g
 end
 
--- Wendeton: ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet. Ist er fertig,
--- wenden. Kommt auf jeder Seite und auch, wenn das Widget nicht auf dem Bildschirm ist (Ereignis).
--- Genau einmal pro Ecke und Runde: Springt der Plan kurz vor der Ecke auf "schon in der Kurve" oder "Ecke
--- geschnitten", bevor der Ton kam, zaehlt die Zeit bis zum Wendekreis (gerade Linie), notfalls sofort ein
--- kurzer Ton. Kein Ton, wenn der Pilot schon kraeftig dreht. Liefert true, solange der Ton laeuft.
-local function turnTone(w, g, now)
+-- Wendeton: Countdown und ein deutliches "Jetzt wenden". warnSec Sekunden vor dem Kurvenbeginn kurze Piepse im
+-- Sekundentakt, beim Kurvenbeginn ein hoher langer Ton mit Vibration. Der Kurvenbeginn wird bei jedem Aufruf aus dem
+-- aktuellen Plan genommen (nicht im Voraus festgelegt): fliegt der Pilot neben dem Plan, verschiebt sich "Jetzt"
+-- (im Grenzfall "geradeaus bis in den Sektor, dann wenden"). Kommt auf jeder Seite und auch, wenn das Widget nicht auf
+-- dem Bildschirm ist (Ereignis). Genau einmal pro Ecke und Runde; kein Ton, wenn der Pilot schon kraeftig dreht.
+-- Liefert true, solange der Countdown laeuft (die anderen Toene schweigen dann).
+local turnTone
+do -- eigener Block: das Hauptkapitel ist am Limit von 200 lokalen Variablen
+-- Zeit (s) bis zum fruehesten Kurvenbeginn, bei dem eine Kurve vom JETZIGEN Steuerkurs aus (Radius R in der Luft,
+-- Drehsinn der Ecke, Wind als Versatz) sicher in den Sektor fuehrt: mindestens Reserve + 5 m tief. Frueher eingeleitet
+-- verfehlt sie den Sektor. 0 = jetzt; nil = auch 12 s geradeaus und dann wenden reicht nicht (Kurs korrigieren).
+-- Bogen in 15-Grad-Schritten bis 180 Grad, Kurvenbeginn per Halbierung (die Kurve wird mit spaeterem Beginn tiefer).
+-- Einmal pro GPS-Fix gerechnet.
+local function headingTurnT(w, g, f)
+  local c = g.C and g.C[1]
+  if not (c and c.tx and f and f.hdg) then return nil end
+  if w.htT and w.htT.clk == f.clk and w.htT.tp == w.tp then return w.htT.v end
+  local V = math.max(w.tasF or f.tas or 15, 5)
+  local R = c.R or R_DEFAULT
+  local s = c.s
+  local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
+  local h0 = math.rad(f.hdg)
+  local dep = (c.margin or w.margin) + 10
+  local om = V / R
+  local function ok(t0)
+    -- Kurvenbeginn nach t0 s geradeaus (Boden: Luft + Wind)
+    local sx, sy = f.x + (V * math.sin(h0) + wx) * t0, f.y + (V * math.cos(h0) + wy) * t0
+    for k = 1, 12 do
+      local a = k * math.rad(15)                                   -- gedrehter Winkel
+      local t = a / om
+      local h = h0 - s * a                                         -- Peilung: links = kleiner
+      -- Luftkreis: Versatz vom Kurvenbeginn = R * (Sehne), dazu Wind
+      local x = sx + s * R * (math.cos(h) - math.cos(h0)) + wx * t
+      local y = sy - s * R * (math.sin(h) - math.sin(h0)) + wy * t
+      local rx, ry = x - c.tx, y - c.ty
+      local d = rx * c.bx + ry * c.by
+      if d >= dep and d * d >= 0.5 * (rx * rx + ry * ry) then return true end
+    end
+    return false
+  end
+  local v
+  if ok(0) then v = 0
+  elseif ok(12) then
+    local lo, hi = 0, 12
+    for _ = 1, 7 do
+      local mid = (lo + hi) / 2
+      if ok(mid) then hi = mid else lo = mid end
+    end
+    v = hi
+  end
+  w.htT = {clk = f.clk, tp = w.tp, v = v}
+  return v
+end
+
+function turnTone(w, g, now)
   local p = g.plan
   if not p or w.warnSec <= 0 or w.state ~= S_STARTED then return false end
   if g.next ~= w.tp % 3 + 1 then return false end              -- Plan noch fuer die eben erreichte Ecke
   local key = #w.laps * 4 + w.tp
-  if w.warnKey == key then
-    if w.warnEnd and now < w.warnEnd then return true end
+  local wt = w.warn
+  if wt and wt.key ~= key then wt = nil; w.warn = nil end
+  if wt and wt.done then
     -- deutlich weg von der Kurve (abgebrochen, z. B. Bart): fuer diese Ecke wieder frei
-    if not (p.inTurn or p.missed) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warnKey = nil end
+    if not (p.inTurn or p.missed or p.late) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warn = nil end
     return false
   end
+  -- Zeit bis zum Kurvenbeginn. Massgebend ist der jetzige Kurs: "Jetzt" kommt erst, wenn eine Kurve von hier aus
+  -- den Sektor sicher erreicht. Zeigt der Kurs so, dass keine Kurve den Zielpunkt erreicht, zaehlt der Plan (die
+  -- Kurs-Ansage sagt, wohin); bei "Ecke geschnitten" ohne erreichbaren Zielpunkt sofort.
   local tT = p.tT or 99
-  if p.inTurn or p.missed then
-    local c, f = g.C and g.C[1], w.cur
-    tT = 0
-    if c and f and c.zx then
-      local d = math.sqrt((f.x - c.zx) ^ 2 + (f.y - c.zy) ^ 2)
-      tT = math.sqrt(math.max(d * d - (c.R or 0) ^ 2, 0)) / math.max(f.gs or 0, 5)
+  local th = w.cur and headingTurnT(w, g, w.cur)
+  if th then tT = th
+  elseif p.missed then tT = (g.dV or 0) < 2 * ((g.C and g.C[1] and g.C[1].R) or R_DEFAULT) and 0 or 99
+  else
+    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: kein "Jetzt", dafuer kurz vor der Ecke die Kurs-Ansage
+    -- nach dem Plan ("15 rechts"), alle 3 s, auf jeder Seite
+    if (p.tT or 99) - w.lead / 10 <= w.warnSec + 3 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
+      w.crsT = now
+      local right = g.err > 0
+      local fn = right and "rechts.wav" or "links.wav"
+      if audioFile(fn) then
+        sayNumber(w, nil, math.max(5, math.floor(math.abs(g.err) / 5 + 0.5) * 5), UNIT_RAW, 0); sayWord(w, nil, fn)
+      else
+        tone(w, nil, right and 2200 or 1500, 120)
+      end
     end
+    tT = 99
   end
-  tT = tT - w.lead / 10
-  if tT > w.warnSec + 0.05 then return false end
-  w.warnKey = key
-  if (w.omega or 0) > math.rad(15) then return false end      -- dreht schon: kein Ton mehr
-  local len = clamp(tT, 0.4, math.max(w.warnSec, 0.4))
-  tone(w, nil, 1700, len * 1000)
-  w.warnEnd, w.quietUntil = now + len, now + len + 1
+  -- Kein Vorhalt mehr: "Jetzt" ist der frueheste sichere Kurvenbeginn. Wer langsamer reagiert, kommt nur tiefer in den
+  -- Sektor; ein Vorhalt liess schnelle Piloten den Sektor verfehlen (Simulation: 0.2 bis 1.2 s Reaktion alle drin).
+  tT = tT - (w.cur and (now - w.cur.clk) or 0)                 -- Fix ist bis zu einem GPS-Takt alt
+  local turning = (w.omega or 0) > math.rad(15)
+  if not wt then
+    if tT > w.warnSec + 0.05 then return false end
+    wt = {key = key}
+    w.warn = wt
+    if turning then wt.done = true; return false end           -- dreht schon: kein Ton mehr
+  end
+  if tT <= 0.15 then
+    -- Jetzt wenden
+    wt.done = true
+    if not turning then
+      tone(w, nil, 2400, 600); haptic(w, nil, 400)
+      w.quietUntil = now + 1.5
+    end
+    return false
+  end
+  if tT > w.warnSec + 1 then return false end                  -- Kurs passt gerade nicht: warten, Kurs-Ansage fuehrt
+  -- Countdown: ein kurzer Piep pro Sekunde, nicht mehr in der letzten halben Sekunde vor "Jetzt"
+  if (not wt.beepT or now - wt.beepT >= 1) and tT > 0.5 then
+    wt.beepT = now
+    tone(w, nil, 1700, 90)
+  end
+  w.quietUntil = now + 1
   return true
+end
 end
 
 local function glideTones(w, g, now, warn)
