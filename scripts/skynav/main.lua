@@ -1219,12 +1219,23 @@ local function readInputs(w, now, dt)
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
     return nil
   end
-  -- neuer Fix: Position geaendert, oder unveraendert seit 1 s (Stillstand am Boden)
-  local fresh = (lat ~= w.lastLat or lon ~= w.lastLon) or (w.gSeen ~= nil and now - w.gSeen >= 1.0)
+  -- Ethos liefert Breite und Laenge als zwei Telemetriewerte, die oft nicht gleichzeitig neu sind.
+  -- Ein halber Fix (neue Breite, alte Laenge) liegt neben der Spur und verdreht den Kurs um bis zu 45 Grad.
+  -- Darum gilt ein Fix erst, wenn beide Werte neu sind, oder HALF_FIX_WAIT s nach der ersten Aenderung
+  -- (z.B. genau Nord/Sued, dann aendert sich die Laenge nicht). Unveraendert seit 1 s = Stillstand am Boden.
+  local HALF_FIX_WAIT = 0.8
+  if lat ~= w.rawLat then w.newLat = true end
+  if lon ~= w.rawLon then w.newLon = true end
+  if (w.newLat or w.newLon) and w.pendT == nil then w.pendT = now end
+  w.rawLat, w.rawLon = lat, lon
+  local fresh
+  if w.pendT then fresh = (w.newLat and w.newLon) or now - w.pendT >= HALF_FIX_WAIT
+  else fresh = w.gSeen ~= nil and now - w.gSeen >= 1.0 end
   if not fresh then
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
     return nil
   end
+  w.newLat, w.newLon, w.pendT = false, false, nil
   if lat ~= w.lastLat or lon ~= w.lastLon then w.posMoveT = now end   -- fuer die Warnung "GPS steht"
   local dtFix = w.gSeen and (now - w.gSeen) or 1
   w.lastLat, w.lastLon, w.gSeen, w.gpsOk = lat, lon, now, true
