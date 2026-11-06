@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.3
+-- @version 1.4
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.3"
+local VERSION = "1.4"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1042,7 +1042,7 @@ local function resetFlight(w)
   w.state = S_IDLE
   w.flying, w.landedT, w.slowSince = false, nil, nil
   w.tp, w.laps, w.startT, w.startUtc, w.lapT = 0, {}, nil, nil, nil
-  w.cornerHold, w.badEntry = nil, nil
+  w.cornerHold, w.badEntry, w.cornerAfter = nil, nil, nil
   w.entry, w.penalty, w.zoneHit, w.altHit = nil, 0, false, false
   w.lastFix, w.lastInStart, w.stopReason = nil, nil, nil
   w.trail, w.ring = {}, {}
@@ -1366,6 +1366,9 @@ local function event(w, code, f, now)
     w.marks[#w.marks + 1] = {x = f.x, y = f.y, k = code}
   end
   if code == "STA" or code == "TPC" or code == "FIN" then w.cornerHold = nil end   -- Sektor erreicht
+  -- Nach der Wende bleibt die Eckansicht der eben erreichten Ecke noch 2 s stehen (man dreht noch)
+  if code == "TPC" and f and f.clk then w.cornerAfter = {k = w.tp, clk = f.clk} end
+  if code == "STA" or code == "FIN" then w.cornerAfter = nil end
   if code == "STP" then w.endClk = f and f.clk end
   if code == "PEV" or code == "STA" or code == "TPC" or code == "FIN" or code == "STP" then igcEvent(w, code, f) end
 end
@@ -1728,6 +1731,7 @@ local function glideCalc(w, f, full)
     g.tCorner = g.dV / math.max(f.gs or w.tasF or f.tas or 20, 5)
     if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
     if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
+    if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
     return g
   end
   local R = radius(w, w.tp + 1)
@@ -1818,13 +1822,15 @@ local function glideCalc(w, f, full)
   local sink = w.polar and polarSink(w.polar, V) or w.sinkAvg
   if sink then g.hFin, g.tFin = f.agl - sink * tRem, tRem end
   -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan). Sobald der Sektor erreicht ist,
-  -- zaehlt die naechste Ecke, die Seite ist sofort wieder Gleiten.
+  -- zaehlt die naechste Ecke, die Eckansicht der erreichten Ecke bleibt noch 2 s, dann wieder Gleiten.
   local gs = math.max(f.gs or V, 5)
   g.tCorner = plan.t1 or (g.dV / gs)
   if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
   -- Ecke geschnitten (Sektor verpasst): Eckansicht bleibt, bis der Sektor erreicht ist (dann wechselt g.next)
   -- oder man sich mehr als 400 m vom TP entfernt hat
   if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
+  -- Nach der Wende: Eckansicht der erreichten Ecke noch 2 s (siehe event)
+  if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
   return g
 end
 
