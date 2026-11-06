@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.2
+-- @version 1.3
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.2"
+local VERSION = "1.3"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
