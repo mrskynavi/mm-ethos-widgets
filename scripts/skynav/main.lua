@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.0
+-- @version 1.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -22,14 +22,16 @@
 --   Schnitt = Anzahl Dreiecke * Umfang / (letztes Ziel - Start), Umfang = dTP * (2 + 2*sqrt(2)).
 --
 -- Seiten (je Seite ein Schalter mit Stellung in der Konfiguration; Tippen auf die Kopfzeile geht
--- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Toene kommen nur fuer die angezeigte Seite.
+-- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Laufende Toene (Sollfahrt, Start, Vario) kommen nur fuer die angezeigte
+-- Seite. Wendeton, Start, Sektor und Ziel kommen immer, auch wenn am Sender ein anderer Bildschirm offen ist.
 --
 -- Optimaler Weg (Seite GLEITEN): Das Widget rechnet im Luftmassen-System. Dort sind Kurven echte
 -- Kreise mit dem aktuellen Wenderadius, die Wendepunkte wandern mit -Wind. Fuer die naechsten drei
 -- Ecken liegt ein Kreis (Radius R) so, dass er den Sektor um "Reserve" Meter innen beruehrt. Der
 -- Weg = Tangente zum ersten Kreis, Bogen, Aussentangente zum naechsten Kreis ... Die Ankunftszeiten
 -- (und damit der Versatz der Ecken) werden dreimal nachgerechnet. Daraus kommen der Soll-Steuerkurs
--- (Kommando: Zwitscher steigend = rechts, fallend = links; Kurs-Ticker bei wachsender Ablage) und die Zeit bis zum Einleiten der Kurve (Piepse davor).
+-- (Ansage "xx links/rechts" vor allem bei wachsender Ablage, Sprachdateien in scripts/skynav/audio; Kurs-Ticker) und die
+-- Zeit bis zum Einleiten der Kurve (Wendeton).
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den MC, der sie am schnellsten schafft (Tippen auf das
@@ -39,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.0"
+local VERSION = "1.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -435,7 +437,11 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow, noPts)
         local th0 = phi + s1 * math.acos(clamp(R1 / d, -1, 1))
         local tx, ty = Z[1].x + R1 * math.cos(th0) - px, Z[1].y + R1 * math.sin(th0) - py
         local tl = math.sqrt(tx * tx + ty * ty)
-        late = tl > 1 and (tx * hx + ty * hy) / tl < 0.87             -- mehr als ~30 Grad abdrehen noetig
+        -- mehr als ~30 Grad abdrehen noetig, und zwar kurz vor dem Kreis (Tangentenpunkt hoechstens 3 s bzw.
+        -- 3 Radien entfernt). Weiter weg ist es nur ein Kursfehler, kein verpasster Kurvenbeginn: sonst schaltete
+        -- ein Pilot, der 150 m vor der Ecke 30 Grad neben dem Plan fliegt, auf "Ecke verpasst" (kein Wendeton,
+        -- keine Kurs-Ansagen mehr bis zum Sektor).
+        late = tl > 1 and (tx * hx + ty * hy) / tl < 0.87 and tl < math.max(3 * R1, 3 * V)
       end
       if late then
         -- geradeaus weiter (ueber Grund mit Wind), bis der Punkt margin tief im Sektor liegt, dann wenden
@@ -622,14 +628,16 @@ local function currentModelName()
   return nil
 end
 
--- ---------------------------------------------------------------- Ton (nur fuer die angezeigte Seite)
+-- ---------------------------------------------------------------- Ton
 
--- page = Seite, zu der der Ton gehoert (nil = Ereignis, siehe w.eventsAlways)
+-- page = Seite, zu der der Ton gehoert: kommt nur, wenn diese Seite angezeigt wird und das Widget auf dem
+-- Bildschirm ist. nil = Ereignis (Wendeton, Sektor, Start, Ziel, Zone): kommt auf jeder Seite und auch,
+-- wenn am Sender ein anderer Bildschirm offen ist (die Wertung laeuft ja weiter).
 local function audible(w, page)
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
-  if not widgetVisible() then return false end
   if page == nil then return true end            -- Ereignis: Aufrufer hat die Seite schon geprueft
+  if not widgetVisible() then return false end
   return w.page == page
 end
 
@@ -1807,52 +1815,87 @@ local function glideCalc(w, f, full)
 end
 
 -- Wendeton: ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet. Ist er fertig,
--- wenden. Kommt auf Gleiten und Uebersicht. Liefert true, solange der Ton laeuft.
-local function turnTone(w, g, now, page)
-  if not g.plan then return false end
-  local tT = (g.plan.tT or 99) - w.lead / 10
-  if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
-    if not w.warnOn then
-      w.warnOn = true
-      tone(w, page, 1700, math.max(tT, 0.4) * 1000)
-    end
-    w.quietUntil = now + 3
-    return true
+-- wenden. Kommt auf jeder Seite und auch, wenn das Widget nicht auf dem Bildschirm ist (Ereignis).
+-- Genau einmal pro Ecke und Runde: Springt der Plan kurz vor der Ecke auf "schon in der Kurve" oder "Ecke
+-- geschnitten", bevor der Ton kam, zaehlt die Zeit bis zum Wendekreis (gerade Linie), notfalls sofort ein
+-- kurzer Ton. Kein Ton, wenn der Pilot schon kraeftig dreht. Liefert true, solange der Ton laeuft.
+local function turnTone(w, g, now)
+  local p = g.plan
+  if not p or w.warnSec <= 0 or w.state ~= S_STARTED then return false end
+  if g.next ~= w.tp % 3 + 1 then return false end              -- Plan noch fuer die eben erreichte Ecke
+  local key = #w.laps * 4 + w.tp
+  if w.warnKey == key then
+    if w.warnEnd and now < w.warnEnd then return true end
+    -- deutlich weg von der Kurve (abgebrochen, z. B. Bart): fuer diese Ecke wieder frei
+    if not (p.inTurn or p.missed) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warnKey = nil end
+    return false
   end
-  if tT > w.warnSec + 1 then w.warnOn = nil end
-  return false
+  local tT = p.tT or 99
+  if p.inTurn or p.missed then
+    local c, f = g.C and g.C[1], w.cur
+    tT = 0
+    if c and f and c.zx then
+      local d = math.sqrt((f.x - c.zx) ^ 2 + (f.y - c.zy) ^ 2)
+      tT = math.sqrt(math.max(d * d - (c.R or 0) ^ 2, 0)) / math.max(f.gs or 0, 5)
+    end
+  end
+  tT = tT - w.lead / 10
+  if tT > w.warnSec + 0.05 then return false end
+  w.warnKey = key
+  if (w.omega or 0) > math.rad(15) then return false end      -- dreht schon: kein Ton mehr
+  local len = clamp(tT, 0.4, math.max(w.warnSec, 0.4))
+  tone(w, nil, 1700, len * 1000)
+  w.warnEnd, w.quietUntil = now + len, now + len + 1
+  return true
 end
 
-local function glideTones(w, g, now)
+local function glideTones(w, g, now, warn)
   if not g.plan then
     -- vor dem Start: nur Sollfahrt
   else
-    if turnTone(w, g, now, P_GLIDE) then return end
-    -- Kurs-Kommandos als kurzer Zwitscher (steigend = rechts, fallend = links), die Gradzahl steht im Display.
-    -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 3 s,
-    -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s.
+    if warn then return end
+    -- Kurs-Ansage "xx links" / "xx rechts" (Zahl ohne "Grad", dann links.wav/rechts.wav aus scripts/skynav/audio;
+    -- fehlen die Dateien, ein Zwitscher: steigend = rechts, fallend = links). Vor allem, wenn man immer mehr
+    -- vom Kurs wegdriftet:
+    -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 4 s,
+    -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s,
+    -- aber nicht, solange die Ablage schon kleiner wird (der Pilot korrigiert bereits).
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
     if w.navVoice and g.err and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
       local a, right = math.abs(g.err), g.err > 0
       local xt, xp = g.xt, g.xtPred
       local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
+      local closing = xt and xp and math.abs(xp) < math.abs(xt) - 2
       if drift then w.driftSince = w.driftSince or now else w.driftSince = nil end
-      local fire = false
-      if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 3) then
+      local fire, deg = false, a
+      if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 4) then
         fire, right = true, xp < 0
+        if (g.err > 0) ~= right or a < 5 then
+          -- Kursfehler zeigt nicht zur Linie zurueck: Winkel, mit dem man von der Linie wegdriftet
+          local gs = math.max(w.gsF or 10, 5)
+          deg = math.deg(math.asin(clamp((math.abs(xp) - math.abs(xt)) / (gs * PRED_S), 0, 1)))
+        end
       end
-      if a >= w.cmdMin then
+      if a >= w.cmdMin and not closing then
         w.errSince = w.errSince or now
         local changed = not w.cmdErr or math.abs(g.err - w.cmdErr) >= 10
-        if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 3)) then fire = true end
+        if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 4)) then fire = true end
       else
         w.errSince = nil
       end
       if fire then
         w.cmdT, w.cmdErr = now, g.err
-        w.cmdTones = {t = now, f = right and {1500, 2200} or {2200, 1500}}
-        w.quietUntil = now + 0.6
+        deg = math.max(5, math.floor(deg / 5 + 0.5) * 5)
+        if audioFile(right and "rechts.wav" or "links.wav") then
+          sayNumber(w, P_GLIDE, deg, UNIT_RAW, 0)
+          sayWord(w, P_GLIDE, right and "rechts.wav" or "links.wav")
+          w.quietUntil = now + 2
+        else
+          w.cmdTones = {t = now, f = right and {1500, 2200} or {2200, 1500}}
+          w.quietUntil = now + 0.6
+        end
+        return
       end
     end
   end
@@ -2345,16 +2388,20 @@ local function wakeup(w)
   -- ideale Runde (blau, vor dem Start) hier rechnen statt beim Zeichnen: eigene Instruktions-Portion
   if w.task and (pg == P_OVER or pg == P_START) and w.state ~= S_STARTED and w.state ~= S_STOPPED then lapRoute(w, w.task) end
   if redo then
-    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START)
+    -- Den ganzen Weg auch auf den anderen Seiten (und bei verstecktem Widget) rechnen, sobald eine Ecke naht:
+    -- der Wendeton kommt auf jeder Seite
+    local gc = w.gc
+    local near = w.state == S_STARTED and gc and gc.tCorner and gc.tCorner < w.zoomSec + w.warnSec + 8
+    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START or near)
   end
   thermCalc(w, cur, now, dt)
 
-  -- Ereignistoene (nur auf der passenden Seite, ausser "Ereignisse immer melden")
+  -- Ereignistoene. Start, Sektor und Ziel (Linie bzw. Sektor erreicht) immer, auf jeder Seite und auch bei
+  -- verstecktem Widget; Scharf (PEV) und Stopp nur auf der passenden Seite, ausser "Ereignisse immer melden".
   if w.lastEvent and w.lastEventT == now then
     local e = w.lastEvent
     local pg = (e == "STA" or e == "PEV") and P_START or P_GLIDE
-    -- Sektor-Bestaetigung (TPC) auch auf der Uebersicht
-    if w.eventsAlways or w.page == pg or (e == "STA" and w.page == P_GLIDE) or (e == "TPC" and w.page == P_OVER) then
+    if w.eventsAlways or w.page == pg or e == "STA" or e == "TPC" or e == "FIN" then
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
       elseif e == "STA" then tone(w, nil, 1000, 150); tone(w, nil, 1400, 250)
         if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0) end
@@ -2369,10 +2416,10 @@ local function wakeup(w)
   if w.zoneEnterT == now then tone(w, nil, 500, 600) end
 
   if cur then
-    if w.page == P_START then startTones(w, w.sc, now)
-    elseif w.page == P_GLIDE then glideTones(w, w.gc, now)
-    elseif w.page == P_OVER then turnTone(w, w.gc or {}, now, P_OVER)
-    elseif w.page == P_THERM then thermTones(w, now) end
+    local warn = turnTone(w, w.gc or {}, now)                -- Wendeton auf jeder Seite
+    if w.page == P_START then if not warn then startTones(w, w.sc, now) end
+    elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn)
+    elseif w.page == P_THERM then if not warn then thermTones(w, now) end end
   end
 
   if now - w.lastInvalidate >= 0.15 then
