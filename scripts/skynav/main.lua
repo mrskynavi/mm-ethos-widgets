@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.5"
+local VERSION = "1.6"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -636,6 +636,9 @@ end
 local function audible(w, page)
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
+  -- Wendevorhersage hat Vorrang vor allem: rund um die Wende (w.prioUntil, siehe turnTone) schweigen alle anderen
+  -- Toene und Ansagen, nur die Wendetoene selbst (w.prioPlay) kommen durch
+  if w.prioUntil and not w.prioPlay and os.clock() < w.prioUntil then return false end
   if page == nil then return true end            -- Ereignis: Aufrufer hat die Seite schon geprueft
   if not widgetVisible() then return false end
   return w.page == page
@@ -1890,7 +1893,10 @@ end
 -- aktuellen Plan genommen (nicht im Voraus festgelegt): fliegt der Pilot neben dem Plan, verschiebt sich "Jetzt"
 -- (im Grenzfall "geradeaus bis in den Sektor, dann wenden"). Kommt auf jeder Seite und auch, wenn das Widget nicht auf
 -- dem Bildschirm ist (Ereignis). Genau einmal pro Ecke und Runde; kein Ton, wenn der Pilot schon kraeftig dreht.
--- Liefert true, solange der Countdown laeuft (die anderen Toene schweigen dann).
+-- Liefert true, solange der Countdown laeuft. Vorrang: ab warnSec + 1.5 s vor dem Kurvenbeginn bis 1 s nach
+-- "Jetzt" (und 2.5 s ab jeder Kurs-Ansage vor der Ecke) schweigen alle anderen Toene und Ansagen auf allen Seiten
+-- (w.prioUntil, siehe audible). So ist auch die Warteschlange des Senders leer, wenn der Countdown beginnt;
+-- Ereignistoene aus dieser Zeit kommen danach.
 local turnTone
 do -- eigener Block: das Hauptkapitel ist am Limit von 200 lokalen Variablen
 -- Zeit (s) bis zum fruehesten Kurvenbeginn, bei dem eine Kurve vom JETZIGEN Steuerkurs aus (Radius R in der Luft,
@@ -1939,6 +1945,19 @@ local function headingTurnT(w, g, f)
   return v
 end
 
+-- Vorrang mindestens bis now + s halten
+local function prioHold(w, now, s)
+  if not w.prioUntil or w.prioUntil < now + s then w.prioUntil = now + s end
+end
+
+-- eigene Toene der Wendevorhersage: kommen trotz Vorrang durch
+local function prioTone(w, f, len, hap)
+  w.prioPlay = true
+  tone(w, nil, f, len)
+  if hap then haptic(w, nil, hap) end
+  w.prioPlay = nil
+end
+
 function turnTone(w, g, now)
   local p = g.plan
   if not p or w.warnSec <= 0 or w.state ~= S_STARTED then return false end
@@ -1965,11 +1984,14 @@ function turnTone(w, g, now)
       w.crsT = now
       local right = g.err > 0
       local fn = right and "rechts.wav" or "links.wav"
+      prioHold(w, now, 2.5)
+      w.prioPlay = true
       if audioFile(fn) then
         sayNumber(w, nil, math.max(5, math.floor(math.abs(g.err) / 5 + 0.5) * 5), UNIT_RAW, 0); sayWord(w, nil, fn)
       else
         tone(w, nil, right and 2200 or 1500, 120)
       end
+      w.prioPlay = nil
     end
     tT = 99
   end
@@ -1977,6 +1999,8 @@ function turnTone(w, g, now)
   -- Sektor; ein Vorhalt liess schnelle Piloten den Sektor verfehlen (Simulation: 0.2 bis 1.2 s Reaktion alle drin).
   tT = tT - (w.cur and (now - w.cur.clk) or 0)                 -- Fix ist bis zu einem GPS-Takt alt
   local turning = (w.omega or 0) > math.rad(15)
+  -- Vorrang schon 1.5 s vor dem Countdown (Warteschlange leeren) und waehrend er laeuft
+  if (wt or tT <= w.warnSec + 1.5) and not turning then prioHold(w, now, 0.4) end
   if not wt then
     if tT > w.warnSec + 0.05 then return false end
     wt = {key = key}
@@ -1987,7 +2011,8 @@ function turnTone(w, g, now)
     -- Jetzt wenden
     wt.done = true
     if not turning then
-      tone(w, nil, 2400, 600); haptic(w, nil, 400)
+      prioHold(w, now, 1.6)                                    -- 0.6 s Ton, danach noch 1 s still
+      prioTone(w, 2400, 600, 400)
       w.quietUntil = now + 1.5
     end
     return false
@@ -1996,7 +2021,7 @@ function turnTone(w, g, now)
   -- Countdown: ein kurzer Piep pro Sekunde, nicht mehr in der letzten halben Sekunde vor "Jetzt"
   if (not wt.beepT or now - wt.beepT >= 1) and tT > 0.5 then
     wt.beepT = now
-    tone(w, nil, 1700, 90)
+    prioTone(w, 1700, 90)
   end
   w.quietUntil = now + 1
   return true
@@ -2552,8 +2577,13 @@ local function wakeup(w)
 
   -- Ereignistoene. Start, Sektor und Ziel (Linie bzw. Sektor erreicht) immer, auf jeder Seite und auch bei
   -- verstecktem Widget; Scharf (PEV) und Stopp nur auf der passenden Seite, ausser "Ereignisse immer melden".
-  if w.lastEvent and w.lastEventT == now then
-    local e = w.lastEvent
+  -- In der Vorrangzeit der Wendevorhersage warten sie und kommen danach.
+  local prio = w.prioUntil and now < w.prioUntil
+  local e = w.lastEvent and w.lastEventT == now and w.lastEvent or nil
+  if e and prio then w.evDefer, e = e, nil
+  elseif not e and not prio and w.evDefer then e = w.evDefer end
+  if e then
+    w.evDefer = nil
     local pg = (e == "STA" or e == "PEV") and P_START or P_GLIDE
     if w.eventsAlways or w.page == pg or e == "STA" or e == "TPC" or e == "FIN" then
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
@@ -2567,10 +2597,12 @@ local function wakeup(w)
       w.quietUntil = now + 1.5
     end
   end
-  if w.zoneEnterT == now then tone(w, nil, 500, 600) end
+  if w.zoneEnterT == now then w.zoneDefer = true end
+  if w.zoneDefer and not prio then w.zoneDefer = nil; tone(w, nil, 500, 600) end
 
   if cur then
     local warn = turnTone(w, w.gc or {}, now)                -- Wendeton auf jeder Seite
+    warn = warn or (w.prioUntil and now < w.prioUntil)        -- Vorrang: keine Seitentoene
     if w.page == P_START then if not warn then startTones(w, w.sc, now) end
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn)
     elseif w.page == P_THERM then if not warn then thermTones(w, now) end end
