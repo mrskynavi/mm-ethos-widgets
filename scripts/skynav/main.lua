@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.4"
+local VERSION = "1.5"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
