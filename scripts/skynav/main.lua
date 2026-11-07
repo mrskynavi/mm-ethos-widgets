@@ -628,6 +628,8 @@ end
 local function audible(w, page)
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
+  -- Wendevorhersage hat Vorrang: kurz davor und waehrenddessen bleiben alle anderen Toene und Ansagen still
+  if w.prioUntil and os.clock() < w.prioUntil then return false end
   if not widgetVisible() then return false end
   if page == nil then return true end            -- Ereignis: Aufrufer hat die Seite schon geprueft
   return w.page == page
@@ -1857,28 +1859,32 @@ local function glideCalc(w, f, full)
   return g
 end
 
--- Wendeton: ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet. Ist er fertig,
--- wenden. Kommt auf Gleiten und Uebersicht. Liefert true, solange der Ton laeuft.
-local function turnTone(w, g, now, page)
-  if not g.plan then return false end
-  local tT = (g.plan.tT or 99) - w.lead / 10
-  if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
-    if not w.warnOn then
-      w.warnOn = true
-      tone(w, page, 1700, math.max(tT, 0.4) * 1000)
-    end
-    w.quietUntil = now + 3
-    return true
-  end
+-- Wendeton (Wendevorhersage): ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet.
+-- Ist er fertig, wenden. Er hat Vorrang vor allen anderen Toenen und Ansagen und kommt auf jeder Seite, auch
+-- wenn das Widget gerade nicht sichtbar ist. Ab 1.5 s vor dem Ton bis 1 s nach dem Kurvenbeginn bleibt alles
+-- andere still (w.prioUntil, siehe audible), damit die Warteschlange des Senders leer ist, wenn er beginnt.
+-- Ereignistoene aus dieser Zeit kommen danach. Liefert true, solange der Vorrang gilt.
+local function turnTone(w, g, now)
+  local p = g and g.plan
+  if not p or w.warnSec <= 0 then w.warnOn = nil; return false end
+  local tT = (p.tT or 99) - w.lead / 10
   if tT > w.warnSec + 1 then w.warnOn = nil end
-  return false
+  if p.inTurn or tT <= -0.5 or tT > w.warnSec + 1.5 then return false end
+  -- Vorrang bis 1 s nach dem Tonende (Kurvenbeginn), damit das Ende klar zu hoeren ist
+  w.prioUntil, w.quietUntil = math.max(w.prioUntil or 0, now + math.max(tT, 0) + 1), now + 3
+  if not w.warnOn and tT <= w.warnSec + 0.05 then
+    w.warnOn = true
+    if w.sound and not (validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0) and system and system.playTone then
+      pcall(system.playTone, 1700, math.floor(math.max(tT, 0.4) * 1000 + 0.5), 0)
+    end
+  end
+  return true
 end
 
 local function glideTones(w, g, now)
   if not g.plan then
     -- vor dem Start: nur Sollfahrt
   else
-    if turnTone(w, g, now, P_GLIDE) then return end
     -- Kurs-Kommandos als kurzer Zwitscher (steigend = rechts, fallend = links), die Gradzahl steht im Display.
     -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 3 s,
     -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s.
@@ -2396,13 +2402,20 @@ local function wakeup(w)
   -- ideale Runde (blau, vor dem Start) hier rechnen statt beim Zeichnen: eigene Instruktions-Portion
   if w.task and (pg == P_OVER or pg == P_START) and w.state ~= S_STARTED and w.state ~= S_STOPPED then lapRoute(w, w.task) end
   if redo then
-    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START)
+    -- volle Planung auch auf Thermik und Wertung, solange der Wendeton eingeschaltet ist (er kommt ueberall)
+    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START or w.warnSec > 0)
   end
   thermCalc(w, cur, now, dt)
 
+  -- Wendevorhersage zuerst: sie sperrt alle anderen Toene (auch die Ereignistoene, die danach nachkommen)
+  local turnBusy = cur and turnTone(w, w.gc, now)
+  local prio = w.prioUntil and now < w.prioUntil
   -- Ereignistoene (nur auf der passenden Seite, ausser "Ereignisse immer melden")
-  if w.lastEvent and w.lastEventT == now then
-    local e = w.lastEvent
+  local e = w.lastEvent and w.lastEventT == now and w.lastEvent or nil
+  if e and prio then w.evDefer, e = e, nil
+  elseif not e and not prio and w.evDefer then e = w.evDefer end
+  if e then
+    w.evDefer = nil
     local pg = (e == "STA" or e == "PEV") and P_START or P_GLIDE
     -- Sektor-Bestaetigung (TPC) auch auf der Uebersicht
     if w.eventsAlways or w.page == pg or (e == "STA" and w.page == P_GLIDE) or (e == "TPC" and w.page == P_OVER) then
@@ -2417,12 +2430,12 @@ local function wakeup(w)
       w.quietUntil = now + 1.5
     end
   end
-  if w.zoneEnterT == now then tone(w, nil, 500, 600) end
+  if w.zoneEnterT == now then w.zoneDefer = true end
+  if w.zoneDefer and not prio then w.zoneDefer = nil; tone(w, nil, 500, 600) end
 
-  if cur then
+  if cur and not turnBusy then
     if w.page == P_START then startTones(w, w.sc, now)
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now)
-    elseif w.page == P_OVER then turnTone(w, w.gc or {}, now, P_OVER)
     elseif w.page == P_THERM then thermTones(w, now) end
   end
 
