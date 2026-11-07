@@ -645,9 +645,60 @@ local function haptic(w, page, ms)
   if not pcall(system.playHaptic, math.floor(ms), 0) then pcall(system.playHaptic, "-") end
 end
 
-local function sayNumber(w, page, v, unit, dec)
+-- Zahlen ansagen. Die Zahlen liegen als Systemdateien des Senders unter /audio/<sprache>/<stimme>/system/<n>.wav,
+-- nicht im audio-Ordner des Widgets. Diese Dateien spielt das Widget direkt mit system.playFile (wie links.wav),
+-- weil system.playNumber hier stumm blieb: UNIT_RAW gibt es in Ethos nicht (nil), dann wurde gar nichts gesagt.
+-- Nur ganze Zahlen 0..999; findet das Widget den Systemordner nicht, bleibt playNumber mit UNIT_RAW/UNIT_NONE.
+local sayNumber
+do -- eigener Block (das Hauptkapitel ist am Limit von 200 lokalen Variablen)
+local numDir
+local function exists(path)
+  if not (io and io.open) then return false end
+  local ok, f = pcall(io.open, path, "r")
+  if ok and f then pcall(f.close, f); return true end
+  return false
+end
+local function findNumDir()
+  if numDir ~= nil then return numDir or nil end
+  numDir = false
+  local langs, seen = {}, {}
+  local function addLang(l)
+    if type(l) == "string" and l ~= "" then
+      l = l:lower():sub(1, 2)
+      if not seen[l] then seen[l] = true; langs[#langs + 1] = l end
+    end
+  end
+  if system and system.getLocale then local ok, l = pcall(system.getLocale); if ok then addLang(l) end end
+  addLang("de"); addLang("en")
+  for _, l in ipairs(langs) do
+    for _, d in ipairs({"/audio/" .. l .. "/default/system/", "/audio/" .. l .. "/system/",
+                        "/audio/" .. l .. "/us/system/", "/audio/" .. l .. "/gb/system/"}) do
+      if exists(d .. "5.wav") then numDir = d; return d end
+    end
+  end
+  return nil
+end
+local function playNum(d, n)
+  -- 0..100 als eigene Datei, darueber Hunderter + Rest (Dateien 200.wav .. 900.wav, 100.wav)
+  if n > 100 then
+    local h, r = math.floor(n / 100) * 100, n % 100
+    pcall(system.playFile, d .. string.format("%d.wav", h))
+    if r > 0 then pcall(system.playFile, d .. string.format("%d.wav", r)) end
+  else
+    pcall(system.playFile, d .. string.format("%d.wav", n))
+  end
+end
+function sayNumber(w, page, v, unit, dec)
   if not audible(w, page) then return end
-  if system and system.playNumber and unit ~= nil then pcall(system.playNumber, v, unit, dec or 0) end
+  if not system then return end
+  local n = math.floor((tonumber(v) or 0) + 0.5)
+  local d = (dec or 0) == 0 and n >= 0 and n <= 999 and system.playFile and findNumDir()
+  if d then playNum(d, n); return end
+  if system.playNumber then
+    unit = unit or UNIT_RAW or UNIT_NONE or 0
+    if not pcall(system.playNumber, v, unit, dec or 0) then pcall(system.playNumber, v) end
+  end
+end
 end
 
 -- Optionale Sprachdateien (links.wav, rechts.wav, ...) im Ordner audio des Widgets
