@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.6"
+local VERSION = "1.7"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1066,6 +1066,11 @@ local TEXT_DEFS = {
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 local BAL = {}
 
+-- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
+-- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
+-- zeigt nur die Restkorrektur. Ohne Sensor gilt die Drehrate aus dem GPS-Kurs (traeger, tau hoechstens 1 s).
+BAL.QL = {}                                                         -- in BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist
+
 -- Einstellungen aus der App (aufgaben.lua, Tabelle settings): Schluessel, Bereich. Am Sender stehen nur noch
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
@@ -1075,6 +1080,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
+  qlTau = {0, 30}, qlTrim = true,
 }
 
 local function applyAppSettings(w, st)
@@ -1109,7 +1115,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1169,6 +1175,7 @@ local function loadRadii(w)
           local r = v[key]
           if type(r) == "number" and r >= 5 and r <= 200 then m[key] = r end
         end
+        if type(v.ql) == "number" and math.abs(v.ql) <= 45 then m.ql = v.ql end   -- Querlage-Nullpunkt (Grad)
         w.radii[k] = m
       end
     end
@@ -1179,10 +1186,10 @@ local function saveRadii(w)
   local keys = {}
   for k in pairs(w.radii) do keys[#keys + 1] = k end
   table.sort(keys)
-  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\nreturn {\n"}
+  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\nreturn {\n"}
   for _, k in ipairs(keys) do
     local m, parts = w.radii[k], {}
-    for _, key in ipairs({"all", "tp1", "tp2", "tp3"}) do
+    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql"}) do
       if m[key] then parts[#parts + 1] = string.format("%s = %.1f", key, m[key]) end
     end
     out[#out + 1] = string.format("  [%q] = {%s},\n", k, table.concat(parts, ", "))
@@ -1359,6 +1366,7 @@ local function readInputs(w, now, dt)
     w.turnSum = (w.turnSum or 0) + dA                              -- Drehung mit Vorzeichen, fuer die Kreiserkennung
     local omega = math.rad(math.abs(dA)) / dtFix
     w.omega = lpf(w.omega, omega, dtFix, 1.5)
+    w.omS = lpf(w.omS, math.rad(dA) / dtFix, dtFix, 0.7)            -- mit Vorzeichen (rechts +), fuer die Querlage
     -- Wenderadius nur aus Kurven ausserhalb der Thermik (Wenden an den Ecken), bei voller Drehrate
     if w.omega > math.rad(25) and omega > 0.8 * w.omega and tas > 3 and not w.therm then
       local r = clamp(tas / omega, 8, 200)
@@ -1774,6 +1782,80 @@ end
 
 -- Weg, Querablage, Ankunftshoehe. Laeuft nur bei einem neuen GPS-Fix. full = eine sichtbare Seite zeigt den
 -- Weg (Gleiten, Uebersicht, Start nach dem Start); sonst nur Distanz und Zeit zur Ecke fuer die Eckansicht.
+-- pro wakeup: Querlage lesen, Nullpunkt (radien.lua, pro Modell) und Nachtrimmen im geraden Flug abziehen
+function BAL.QL.read(w, now, dt)
+  local v = readNumber(w.bankSrc)
+  if v == nil or math.abs(v) > 180 then w.qlPhi, w.qlRaw = nil, nil; return end
+  if w.bankInv then v = -v end
+  w.qlRaw = v
+  local m = w.radii and w.radii[w.modelName or "?"]
+  local phi = v - (m and m.ql or 0) - (w.qlTrimV or 0)
+  w.qlPhi = phi
+  -- gerade nach GPS (10 s, nicht im Bart, in Fahrt): dort muss die Querlage 0 sein
+  local f = w.cur
+  if f and w.flying and not w.therm and (f.gs or 0) > 5 and math.abs(w.omS or 1) < math.rad(3) then
+    w.qlStraight = (w.qlStraight or 0) + dt
+    if w.qlStraight >= 10 then
+      -- nur kleine Reste nachtrimmen; grosse Querlage heisst meist "Kurve beginnt" (der Sensor ist dem GPS voraus)
+      if w.qlTrim and math.abs(phi) < 8 then w.qlTrimV = clamp((w.qlTrimV or 0) + phi * dt / 20, -5, 5) end
+      -- bleibt sie 5 s am Stueck gross, passt der Sensor nicht (falsche Quelle, Achse): Drehrate dann aus GPS
+      if math.abs(phi) > 10 then w.qlBadT = (w.qlBadT or 0) + dt else w.qlBadT = math.max((w.qlBadT or 0) - dt, 0) end
+      if w.qlBadT >= 5 then w.qlBad = true elseif w.qlBadT == 0 then w.qlBad = nil end
+    end
+  else
+    w.qlStraight = 0
+    if math.abs(phi) <= 10 then w.qlBadT = math.max((w.qlBadT or 0) - dt, 0) end
+  end
+end
+
+-- Nullen: jetziger Rohwert wird der Nullpunkt dieses Modells (Fluegel waagrecht halten)
+function BAL.QL.zero(w)
+  if not w.qlRaw or not w.radii then return false end
+  local name = w.modelName or "?"
+  local m = w.radii[name] or {}
+  w.radii[name] = m
+  m.ql = math.floor(w.qlRaw * 10 + 0.5) / 10
+  w.qlTrimV, w.qlBad = 0, nil
+  saveRadii(w)
+  return true
+end
+
+-- Restkorrektur und gebogene Ablage-Vorhersage. g.rest = Kursfehler nach der Drehung in tau s,
+-- g.qlState = "hold" (Querlage reicht), "out" (zu viel: ausleiten) oder nil
+function BAL.QL.apply(w, g, f)
+  g.rest, g.qlState = nil, nil
+  local tau = (w.qlTau or 15) / 10
+  if not g.err or tau <= 0 then return end
+  local om
+  if w.qlPhi and not w.qlBad then
+    local phi = math.abs(w.qlPhi) < 3 and 0 or clamp(w.qlPhi, -60, 60)
+    om = 9.81 * math.tan(math.rad(phi)) / math.max(w.tasF or f.tas or 15, 8)
+  elseif w.omS then
+    om, tau = w.omS, math.min(tau, 1)
+  else
+    return
+  end
+  local turn = math.deg(om * tau)
+  local rest = g.err - turn
+  g.rest, g.turn = rest, turn
+  if math.abs(turn) >= 3 then
+    if math.abs(rest) < 5 then g.qlState = "hold"
+    elseif rest * turn < 0 and (g.err * turn > 0 or math.abs(g.err) < 5) then g.qlState = "out" end
+  end
+  -- Ablage in PRED_S s: tau s auf dem Bogen (Sehne), danach geradeaus mit dem neuen Kurs
+  if g.xt and f.ve and f.vn and w.ref then
+    local dx, dy = w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay
+    local l = math.sqrt(dx * dx + dy * dy)
+    if l >= 1 then
+      local t1 = math.min(tau, PRED_S)
+      local c1, s1, c2, s2 = math.cos(om * t1 / 2), math.sin(om * t1 / 2), math.cos(om * t1), math.sin(om * t1)
+      local se = (f.ve * c1 + f.vn * s1) * t1 + (f.ve * c2 + f.vn * s2) * (PRED_S - t1)
+      local sn = (-f.ve * s1 + f.vn * c1) * t1 + (-f.ve * s2 + f.vn * c2) * (PRED_S - t1)
+      g.xtPred = g.xt + (se * dy - sn * dx) / l
+    end
+  end
+end
+
 local function glideCalc(w, f, full)
   local T = w.task
   local g = {}
@@ -1847,6 +1929,7 @@ local function glideCalc(w, f, full)
     local lb = bearingOf(w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay)
     g.err = angDiff(lb - clamp(g.xt * 0.5, -30, 30), f.crs)
   end
+  BAL.QL.apply(w, g, f)
   g.next = w.tp % 3 + 1
   local nxt = T.tp[g.next]
   g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
@@ -2041,8 +2124,10 @@ local function glideTones(w, g, now, warn)
     -- aber nicht, solange die Ablage schon kleiner wird (der Pilot korrigiert bereits).
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
-    if w.navVoice and g.err and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
-      local a, right = math.abs(g.err), g.err > 0
+    -- Mit Querlage: Kursfehler nach der vorausgerechneten Drehung (g.rest); HALTEN und AUSLEITEN ohne Kurs-Ansage
+    local ge = g.rest or g.err
+    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
+      local a, right = math.abs(ge), ge > 0
       local xt, xp = g.xt, g.xtPred
       local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
       local closing = xt and xp and math.abs(xp) < math.abs(xt) - 2
@@ -2050,21 +2135,21 @@ local function glideTones(w, g, now, warn)
       local fire, deg = false, a
       if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 4) then
         fire, right = true, xp < 0
-        if (g.err > 0) ~= right or a < 5 then
+        if (ge > 0) ~= right or a < 5 then
           -- Kursfehler zeigt nicht zur Linie zurueck: Winkel, mit dem man von der Linie wegdriftet
           local gs = math.max(w.gsF or 10, 5)
           deg = math.deg(math.asin(clamp((math.abs(xp) - math.abs(xt)) / (gs * PRED_S), 0, 1)))
         end
       end
-      if a >= w.cmdMin and not closing then
+      if a >= w.cmdMin and not closing and not g.qlState then
         w.errSince = w.errSince or now
-        local changed = not w.cmdErr or math.abs(g.err - w.cmdErr) >= 10
+        local changed = not w.cmdErr or math.abs(ge - w.cmdErr) >= 10
         if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 4)) then fire = true end
       else
         w.errSince = nil
       end
       if fire then
-        w.cmdT, w.cmdErr = now, g.err
+        w.cmdT, w.cmdErr = now, ge
         deg = math.max(5, math.floor(deg / 5 + 0.5) * 5)
         if audioFile(right and "rechts.wav" or "links.wav") then
           sayNumber(w, P_GLIDE, deg, UNIT_RAW, 0)
@@ -2525,6 +2610,11 @@ local function wakeup(w)
   w.armOn, w.armInit = arm, true
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
+  BAL.QL.read(w, now, dt)
+  if w.qlPress and now - w.qlPress >= 2 then
+    w.qlPress = nil
+    if BAL.QL.zero(w) then tone(w, nil, 2000, 150); note(w, "Querlage genullt", now) end
+  end
   local f = readInputs(w, now, dt)
   if f then
     if w.armPending then
@@ -3476,6 +3566,15 @@ local function paintStart(w, W, H, top)
     lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
     drawT(rx, yy + 4, rw, txt, bf, C_ORANGE, "c")
+    yy = yy + w.armBox.h + 6
+  end
+  -- Querlage nullen: nur am Boden (steht), Fluegel waagrecht halten, 2 s auf das Feld druecken
+  if w.qlRaw and not w.flying and (not f or (f.gs or 0) < 2) and w.state ~= S_STARTED then
+    local h = textH(FONT_S) + 8
+    w.qlBox = {x = rx, y = yy, w = rw, h = h}
+    lcd.color(w.qlPress and rgb(0, 70, 30) or rgb(40, 40, 40))
+    rect(rx, yy, rw, h)
+    drawT(rx, yy + 4, rw, string.format("QL %+.0f°  (2 s drücken = nullen)", w.qlPhi or 0), FONT_S, C_WHITE, "c")
   end
 end
 
@@ -3577,6 +3676,28 @@ local function stfBar(w, x0, y0, bw, bh)
   line(x0 - 3, mid, x0 + bw + 2, mid)
 end
 
+-- Flugzeug von hinten, um die Querlage gekippt, daneben die Gradzahl (grau, wenn der Sensor nicht passt)
+function BAL.QL.draw(w, px, py, k, side)
+  local phi = clamp(w.qlPhi, -80, 80)
+  if w.qlBad then lcd.color(C_DIM) end
+  local c, s = math.cos(math.rad(phi)), math.sin(math.rad(phi))
+  local L, t = 36 * k, 2.5 * k                                  -- halbe Spannweite, halbe Strichdicke
+  local ax, ay, bx, by = px - L * c, py - L * s, px + L * c, py + L * s
+  local nx, ny = -s * t, c * t
+  tri(ax + nx, ay + ny, bx + nx, by + ny, bx - nx, by - ny)
+  tri(ax + nx, ay + ny, bx - nx, by - ny, ax - nx, ay - ny)
+  lcd.drawFilledCircle(math.floor(px), math.floor(py), math.max(2, math.floor(7.5 * k)))
+  local fx, fy = px + 17 * k * s, py - 17 * k * c                -- Seitenleitwerk steht senkrecht zum Fluegel
+  local tx, ty = c * 2 * k, s * 2 * k
+  tri(px + tx, py + ty, px - tx, py - ty, fx, fy)
+  tri(px + tx, py + ty, fx, fy, fx + tx, fy + ty)
+  local a = math.floor(math.abs(w.qlPhi) + 0.5)
+  local txt = a < 1 and "0°" or string.format("%d° %s", a, w.qlPhi > 0 and "R" or "L")
+  local tw = 120
+  if side > 0 then drawT(px + 44 * k, py + 8 * k, tw, txt, FONT_S, w.qlBad and C_DIM or C_WHITE, "l")
+  else drawT(px - 44 * k - tw, py + 8 * k, tw, txt, FONT_S, w.qlBad and C_DIM or C_WHITE, "r") end
+end
+
 local function paintGlide(w, W, H, top)
   local T, f, g = w.task, w.cur, w.gc or {}
   local m = 6
@@ -3664,11 +3785,13 @@ local function paintGlide(w, W, H, top)
   local cx0, cw = nx + hb + 6, nw - hb - 6
   local ccx = cx0 + cw / 2
   -- Kommando gross; Rechts steht links der Mitte, Links rechts davon: > und < zeigen auf die Mitte
-  local err = g.err or 0
+  local err = g.rest or g.err or 0
   local a = math.abs(err)
   local cmd, col, side
   if g.plan.turnDir then cmd, col, side = g.plan.turnDir > 0 and "< KURVE LINKS" or "KURVE RECHTS >", C_ORANGE, g.plan.turnDir > 0 and 1 or -1
   elseif g.plan.inTurn then cmd, col, side = "KURVE", C_BLUE, 0
+  elseif g.qlState == "hold" then cmd, col, side = "QUERLAGE HALTEN", C_GREEN, 0
+  elseif g.qlState == "out" then cmd, col, side = "AUSLEITEN", C_BLUE, 0
   elseif a < 5 then cmd, col, side = "KURS OK", C_GREEN, 0
   elseif err > 0 then cmd, col, side = string.format("%d° RECHTS >", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, -1
   else cmd, col, side = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, 1 end
@@ -3725,7 +3848,8 @@ local function paintGlide(w, W, H, top)
     -- Flugzeug (Dreieck) bei der aktuellen Ablage, zwischen Balken und Seitenwindpfeil
     local ppx = ccx + clamp(xt / rng, -1, 1) * half
     lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
-    tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k)
+    if w.qlPhi then BAL.QL.draw(w, ppx, yy + 62 * k, k, ppx > ccx and -1 or 1)
+    else tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k) end
   end
   -- Seitenwind unten: Pfeil vom Rand her, von links nach rechts bei Wind von links und umgekehrt
   local cr = g.cross
@@ -4200,7 +4324,7 @@ local function paint(w)
   rect(0, 0, W, H)
   local top = header(w, W)
   H = tabBar(w, W, H)
-  w.armBox, w.resetBox, w.mcBox = nil, nil, nil
+  w.armBox, w.resetBox, w.mcBox, w.qlBox = nil, nil, nil, nil
   if w.page == P_OVER then paintOver(w, W, H, top)
   elseif w.page == P_START then paintStart(w, W, H, top)
   elseif w.page == P_GLIDE then paintGlide(w, W, H, top)
@@ -4216,11 +4340,22 @@ local function inside(b, x, y)
 end
 
 local function eventHandler(w, category, value, x, y)
+  if w.qlPress and EVT_TOUCH and category == EVT_TOUCH and TOUCH_END and value == TOUCH_END then w.qlPress = nil; lcd.invalidate() end
   if EVT_TOUCH and category == EVT_TOUCH and (TOUCH_START == nil or value == TOUCH_START) then
     if inside(w.hdrBox, x, y) then
       local tabW = w.hdrBox.w / #PAGE_NAMES
       local p = clamp(math.floor(x / tabW) + 1, 1, #PAGE_NAMES)
       w.manual, w.manualFrom, w.page = p, w.autoTarget, p
+      lcd.invalidate(); return true
+    end
+    if inside(w.qlBox, x, y) then
+      if TOUCH_END == nil then
+        -- ohne Loslassen-Ereignis: zweimal tippen innert 3 s
+        local now = os.clock()
+        if w.qlTap and now - w.qlTap < 3 then w.qlTap = nil; w.qlPress = now - 2 else w.qlTap = now end
+      else
+        w.qlPress = os.clock()
+      end
       lcd.invalidate(); return true
     end
     if inside(w.armBox, x, y) and w.task then
@@ -4310,6 +4445,15 @@ local function configure(w)
   addBool(w, "Gleiten: Kurs-Ticker (Klicks bei wachsender Ablage)", "ticker")
   addSource(w, "MC-Quelle (optional)", "mcSrc")
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
+  addSource(w, "Querlage (optional, Rollwinkel Grad)", "bankSrc")
+  addBool(w, "Querlage: Richtung umkehren", "bankInv")
+  l = form.addLine("Querlage nullen (Flügel waagrecht)")
+  if form.addTextButton then
+    form.addTextButton(l, nil, "Jetzt nullen", function()
+      if BAL.QL.zero(w) then note(w, "Querlage genullt", os.clock()) end
+      return true
+    end)
+  end
   local bf = addNumber(w, "Ballast maximal (ohne Quelle: fix)", "balMax", 0, 200)
   if bf then pcall(bf.decimals, bf, 1); pcall(bf.suffix, bf, " kg") end
   addNumber(w, "Übersicht: Spur der letzten x min (0 = aus)", "trackMin", 0, 5)
@@ -4330,6 +4474,7 @@ local function setDefaults(w)
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
   w.balSrc, w.balMax = nil, 0
   w.ticker = true
+  w.bankSrc, w.bankInv = nil, false
 end
 
 local function read(w)
@@ -4342,6 +4487,8 @@ local function read(w)
     w.balSrc = validSource(storage.read("balSrc"))
     local v = storage.read("balMax"); w.balMax = type(v) == "number" and v or 0
     v = storage.read("ticker"); w.ticker = v ~= false   -- steht zuletzt: aeltere Konfigurationen behalten ihre Reihenfolge
+    w.bankSrc = validSource(storage.read("bankSrc"))   -- Querlage: nach dem Ticker angehaengt
+    w.bankInv = storage.read("bankInv") == true
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4356,6 +4503,8 @@ local function write(w)
   storage.write("balSrc", w.balSrc)
   storage.write("balMax", w.balMax)
   storage.write("ticker", w.ticker ~= false)
+  storage.write("bankSrc", w.bankSrc)
+  storage.write("bankInv", w.bankInv == true)
 end
 
 local function init()
