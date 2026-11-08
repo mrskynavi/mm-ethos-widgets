@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.12
+-- @version 1.13
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
