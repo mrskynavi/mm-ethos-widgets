@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.15
+-- @version 1.16
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.15"
+local VERSION = "1.16"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1108,7 +1108,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3}, vDamp = {0, 20},
 }
 
 local function applyAppSettings(w, st)
@@ -1143,7 +1143,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1311,6 +1311,7 @@ local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
   local vario = readNumber(w.vario)
   if vario ~= nil then w.vSlow2 = lpf(w.vSlow2, vario, dt, 2) end   -- Sensor wie er kommt (Vertikalgeschwindigkeit, 3D-Speed)
+  w.vSens = vario                                                     -- fuer die Fusion mit AccZ (BAL.VF)
   -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
   if vario ~= nil and w.varioType == 2 then vario = vario + (w.teDE or 0) end
   w.varioRaw = vario
@@ -2300,8 +2301,53 @@ end
 -- der Vorrang der Wendevorhersage. In BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist.
 BAL.VT = {}
 
+-- Wert fuer den Varioton, ruhig und trotzdem schnell. Daempfung vDamp (App, 0.1 s, Vorgabe 4).
+-- Mit AccZ (und Vario-Art barometrisch): Fusion wie bei guten Varios. Die senkrechte Beschleunigung
+-- (AccZ * cos Roll * cos Nick - 1 g) liefert die schnelle Aenderung, das Vario korrigiert langsam (Komplementaerfilter,
+-- Verstaerkung 1.5/s gegen den Wert von vor 0.3 s, weil der Vario-Sensor nachhinkt; Nullpunkt der Beschleunigung
+-- wird mitgeschaetzt). Im Log vom 7.11.2026 ist AccZ dem Vario rund 0.7 s voraus. Die Kompensation kommt mit AccX
+-- schnell: TAS * (-AccX + sin Nick) ~ TAS * dv/dt / g, hochpass 1.5 s, dazu der langsame Teil aus der GPS-Fahrt
+-- (teDE). Danach vDamp als Glaettung. Ohne AccZ: adaptive Daempfung, kleine Abweichungen (unter 0.5 m/s) mit
+-- 0.3 + 3 * vDamp s, grosse fast sofort (0.3 s).
+function BAL.VF(w, now, dt)
+  local x = w.varioRaw
+  if x == nil then return w.vtV end
+  local damp = (w.vDamp or 4) / 10
+  local az = w.varioType == 2 and w.vSens ~= nil and readNumber(w.accZSrc)
+  if az then
+    if math.abs(az) > 4 then az = az / G end                 -- Quelle in m/s2 statt g
+    local r, p = math.rad(w.qlPhi or 0), math.rad(readNumber(w.pitchSrc) or 0)
+    w.fuA = lpf(w.fuA, (az * math.cos(r) * math.cos(p) - 1) * G, dt, 0.3)
+    local y = (w.fuY or w.vSens) + (w.fuA - (w.fuB or 0)) * dt
+    local q = w.fuQ or {}
+    w.fuQ = q
+    q[#q + 1] = {t = now, y = y}
+    while #q > 1 and now - q[2].t >= 0.3 do table.remove(q, 1) end
+    local e = w.vSens - q[1].y
+    y = y + 1.5 * dt * e
+    w.fuB = clamp((w.fuB or 0) - 0.02 * dt * e, -2, 2)
+    w.fuY = y
+    local c = w.teDE or 0
+    local ax, tas = readNumber(w.accXSrc), w.tasF
+    if ax and tas and tas > 5 then
+      if math.abs(ax) > 4 then ax = ax / G end
+      local cf = tas * (-ax + math.sin(p))
+      w.fuCs = lpf(w.fuCs, cf, dt, 1.5)
+      c = cf - w.fuCs + c
+    end
+    w.vtFu = true
+    return lpf(w.vtV, y + c, dt, damp)
+  end
+  w.fuY, w.fuQ, w.vtFu = nil, nil, nil
+  local f = lpf(w.vtFast, x, dt, 0.3)
+  w.vtFast = f
+  local v0 = w.vtV or f
+  local ts = 0.3 + damp * 3
+  return lpf(v0, f, dt, ts + (0.3 - ts) * math.min(1, ((f - v0) / 0.5) ^ 2))
+end
+
 function BAL.VT.mode(w, now, dt)
-  if w.varioRaw ~= nil then w.vtV = lpf(w.vtV, w.varioRaw, dt, 0.3) end
+  w.vtV = BAL.VF(w, now, dt)
   -- Kreisen: Drehrate > 12 Grad/s und mehr als 200 Grad gedreht (mehr als eine Wende an der Ecke);
   -- vorbei nach 2 s geradeaus
   if (w.omega or 0) > math.rad(12) then
@@ -4601,6 +4647,9 @@ local function configure(w)
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
   addSource(w, "Querlage (optional, Rollwinkel Grad)", "bankSrc")
   addBool(w, "Querlage: Richtung umkehren", "bankInv")
+  addSource(w, "AccZ (optional, Varioton schneller)", "accZSrc")
+  addSource(w, "AccX (optional, mit AccZ)", "accXSrc")
+  addSource(w, "Nickwinkel (optional, mit AccZ)", "pitchSrc")
   l = form.addLine("Querlage nullen (Flügel waagrecht)")
   if form.addTextButton then
     form.addTextButton(l, nil, "Jetzt nullen", function()
@@ -4629,6 +4678,7 @@ local function setDefaults(w)
   w.balSrc, w.balMax = nil, 0
   w.ticker = true
   w.bankSrc, w.bankInv = nil, false
+  w.accZSrc, w.accXSrc, w.pitchSrc = nil, nil, nil
 end
 
 local function read(w)
@@ -4643,6 +4693,9 @@ local function read(w)
     v = storage.read("ticker"); w.ticker = v ~= false   -- steht zuletzt: aeltere Konfigurationen behalten ihre Reihenfolge
     w.bankSrc = validSource(storage.read("bankSrc"))   -- Querlage: nach dem Ticker angehaengt
     w.bankInv = storage.read("bankInv") == true
+    w.accZSrc = validSource(storage.read("accZSrc"))   -- Fusion Varioton: nach der Querlage angehaengt
+    w.accXSrc = validSource(storage.read("accXSrc"))
+    w.pitchSrc = validSource(storage.read("pitchSrc"))
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4659,6 +4712,9 @@ local function write(w)
   storage.write("ticker", w.ticker ~= false)
   storage.write("bankSrc", w.bankSrc)
   storage.write("bankInv", w.bankInv == true)
+  storage.write("accZSrc", w.accZSrc)
+  storage.write("accXSrc", w.accXSrc)
+  storage.write("pitchSrc", w.pitchSrc)
 end
 
 local function init()
