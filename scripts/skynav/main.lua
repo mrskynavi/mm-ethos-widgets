@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.12"
+local VERSION = "1.13"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1105,7 +1105,7 @@ local APP_SETTINGS = {
   sound = true, eventsAlways = true, startTone = true, stfTone = true, navVoice = true, varioTone = true, autoPage = true,
   winLo = {2, 50}, speedMargin = {0, 20}, cmdMin = {3, 45}, cmdGap = {3, 60}, startToneLogic = {1, 2}, startSpan = {100, 2000}, glideF1 = {0, 17}, glideF2 = {0, 17}, glideF3 = {0, 17},
   thermF1 = {0, 12}, thermF2 = {0, 12}, thermF3 = {0, 12}, thermF4 = {0, 12},
-  margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
+  margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
   qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3},
@@ -1143,7 +1143,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, vzLo = 3, vzHi = 1, vtStyle = 1}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1460,7 +1460,7 @@ local function event(w, code, f, now)
     w.marks[#w.marks + 1] = {x = f.x, y = f.y, k = code}
   end
   if code == "STA" or code == "TPC" or code == "FIN" then w.cornerHold = nil end   -- Sektor erreicht
-  -- Nach der Wende bleibt die Eckansicht der eben erreichten Ecke noch 2 s stehen (man dreht noch)
+  -- Nach der Wende bleibt die Eckansicht der eben erreichten Ecke noch zoomAfter s stehen (App, Vorgabe 5 s)
   if code == "TPC" and f and f.clk then w.cornerAfter = {k = w.tp, clk = f.clk} end
   if code == "STA" or code == "FIN" then w.cornerAfter = nil end
   if code == "STP" then w.endClk = f and f.clk end
@@ -1899,7 +1899,7 @@ local function glideCalc(w, f, full)
     g.tCorner = g.dV / math.max(f.gs or w.tasF or f.tas or 20, 5)
     if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
     if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
-    if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
+    if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < (w.zoomAfter or 5) then g.corner = w.cornerAfter.k end
     return g
   end
   local R = radius(w, w.tp + 1)
@@ -1991,15 +1991,15 @@ local function glideCalc(w, f, full)
   local sink = w.polar and polarSink(w.polar, V) or w.sinkAvg
   if sink then g.hFin, g.tFin = f.agl - sink * tRem, tRem end
   -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan). Sobald der Sektor erreicht ist,
-  -- zaehlt die naechste Ecke, die Eckansicht der erreichten Ecke bleibt noch 2 s, dann wieder Gleiten.
+  -- zaehlt die naechste Ecke, die Eckansicht der erreichten Ecke bleibt noch zoomAfter s, dann wieder Gleiten.
   local gs = math.max(f.gs or V, 5)
   g.tCorner = plan.t1 or (g.dV / gs)
   if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
   -- Ecke geschnitten (Sektor verpasst): Eckansicht bleibt, bis der Sektor erreicht ist (dann wechselt g.next)
   -- oder man sich mehr als 400 m vom TP entfernt hat
   if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
-  -- Nach der Wende: Eckansicht der erreichten Ecke noch 2 s (siehe event)
-  if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
+  -- Nach der Wende: Eckansicht der erreichten Ecke noch zoomAfter s (siehe event)
+  if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < (w.zoomAfter or 5) then g.corner = w.cornerAfter.k end
   return g
 end
 
