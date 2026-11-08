@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.9.1
+-- @version 1.10.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -1097,7 +1097,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3},
 }
 
 local function applyAppSettings(w, st)
@@ -1132,7 +1132,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, vzLo = 3, vzHi = 1}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, vzLo = 3, vzHi = 1, vtStyle = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -2271,7 +2271,7 @@ local function thermCalc(w, f, now, dt)
   end
 end
 
--- Varioton des Widgets, Tonkurve wie XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
+-- Varioton des Widgets, Klang waehlbar (App vtStyle: XCSoar, OpenVario, XCVario, siehe BAL.VT.climb). Standard XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
 -- Steigen: 500 Hz bei 0 bis 1500 Hz bei +5 m/s, Periode 600 ms bei 0 bis 150 ms bei +5 m/s, davon 2/3 Ton und
 -- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
 -- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
@@ -2320,6 +2320,32 @@ function BAL.VT.mode(w, now, dt)
   w.vtOn = w.varioTone and w.vtV ~= nil and (pg == P_THERM or w.vtCirc or (pg == P_GLIDE and w.vtTh)) or false
 end
 
+-- Klang (App, vtStyle): Frequenz f (Hz), Periode und Tondauer (ms) beim Steigen v (m/s, 0..5), Frequenz beim Sinken.
+-- 1 XCSoar (VarioSynthesiser): 500..1500 Hz linear, Periode 600..150 ms, 2/3 Ton.
+-- 2 OpenVario (variod audiovario.c): 350 + 120 Hz pro m/s; Periode 1.088 s / v (bis 0.5 m/s: 2.18 s), gut 51 % Ton;
+--   Sinken 350 / (1 + 0.85 |v|) Hz.
+-- 3 XCVario (ESPAudio.cpp, Standard: 500 Hz Mitte, 2 Oktaven, Bereich 5 m/s, Exponent 1, ein Ton mit Pausen):
+--   f = 500 + 500 * (1 + v/5) * v/5 (bis 1500 Hz), Sinken 500 - 125 * (1 + |v|/5) * |v|/5 (bis 250 Hz);
+--   Takt 1 + 9 v/5 pro s, Ton 90 % der Periode minus 40 ms, Pause 10 % plus 40 ms (Periode hier mind. 100 ms).
+function BAL.VT.climb(st, v)
+  if st == 2 then
+    local per = v > 0.5 and 1088 / v or 2177
+    return 350 + 120 * v, per, per * 0.51
+  elseif st == 3 then
+    local x = v / 5
+    local per = math.max(100, 1000 / (1 + 9 * x))
+    return 500 + 500 * (1 + x) * x, per, math.max(40, per * 0.9 - 40)
+  end
+  local per = 150 + (5 - v) * 90
+  return 500 + 200 * v, per, per - math.floor(per / 3)
+end
+function BAL.VT.sink(st, v)
+  local a = -v
+  if st == 2 then return 350 / (1 + 0.85 * a) end
+  if st == 3 then local x = a / 5; return 500 - 125 * (1 + x) * x end
+  return 500 - 60 * a
+end
+
 function BAL.VT.play(w, now)
   local v = w.vtV
   if not w.vtOn or v == nil then w.vtNext, w.vtEnd = nil, nil; return end
@@ -2327,18 +2353,18 @@ function BAL.VT.play(w, now)
   local iv = clamp(v * 100, -500, 500)                        -- cm/s wie XCSoar
   if iv >= -(w.vzLo or 3) * 10 and iv <= (w.vzHi or 1) * 10 then w.vtNext, w.vtEnd = nil, nil; return end
   local busy = w.vtEnd or 0                                   -- bis dann klingt der zuletzt bestellte Ton
+  local st = w.vtStyle or 1
   if iv > 0 then
     if now < busy or (w.vtNext and now < w.vtNext) then return end
-    local per = 150 + (500 - iv) * 450 / 500                  -- ms
-    local on = per - math.floor(per / 3)
-    tone(w, w.page, 500 + iv * 1000 / 500, on)
+    local f, per, on = BAL.VT.climb(st, iv / 100)
+    tone(w, w.page, f, on)
     -- Takt aus der geplanten Zeit (nicht aus "jetzt"), damit der Rhythmus im 50-ms-Raster von wakeup nicht driftet
     local base = (w.vtNext and now - w.vtNext < 0.1) and w.vtNext or now
     w.vtNext, w.vtEnd = base + per / 1000, now + on / 1000
   else
     -- durchgehender Ton: Stuecke von 250 ms, das naechste kurz vor dem Ende des laufenden bestellt
     if now < busy - 0.08 then return end
-    tone(w, w.page, 500 + iv * 300 / 500, 250)
+    tone(w, w.page, BAL.VT.sink(st, iv / 100), 250)
     w.vtNext, w.vtEnd = nil, math.max(now, busy) + 0.25
   end
 end
