@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.18
+-- @version 1.19
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.18"
+local VERSION = "1.19"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -4317,22 +4317,21 @@ local function paintTherm(w, W, H, top)
     local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
     local nowc = os.clock()
     local half = clamp(R * 3.5, 35, 150)
-    -- nur die letzten 20 s: von hinten durch die Spur (bis 80 Punkte), beim ersten aelteren Punkt aufhoeren.
-    -- Jeder zweite Punkt genuegt fuer Mitte und Kreisgroesse (spart Instruktionen fuer die Spur-Kurve).
+    -- nur die letzten 20 s: von hinten durch die Spur (bis 80 Punkte), beim ersten aelteren Punkt aufhoeren
     local tr = w.trail
     local sx, sy, sn = 0, 0, 0
-    for i = #tr, 1, -2 do
+    for i = #tr, 1, -1 do
       local p = tr[i]
       local age = nowc - p.t
       if age >= 20 then break end
       sx, sy, sn = sx + p.x + wx * age, sy + p.y + wy * age, sn + 1
     end
     local ox, oy = f.x, f.y
-    if sn >= 5 and (w.therm or w.circSince) then
+    if sn >= 10 and (w.therm or w.circSince) then
       ox, oy = sx / sn, sy / sn
       -- Kreise fuellen das Bild: Massstab nach dem gemessenen Kreis statt nach dem gelernten Radius
       local r2 = 0
-      for i = #tr, #tr - 2 * sn + 2, -2 do
+      for i = #tr, #tr - sn + 1, -1 do
         local p = tr[i]
         local age = nowc - p.t
         local dx, dy = p.x + wx * age - ox, p.y + wy * age - oy
@@ -4340,6 +4339,25 @@ local function paintTherm(w, W, H, top)
         if d2 > r2 then r2 = d2 end
       end
       half = clamp(math.sqrt(r2) * 1.5, 25, 150)
+      -- ruhiges Bild: Mitte (im Luftmassen-System) und Massstab geglaettet. Die 20 s sind selten ganze Kreise,
+      -- roh pendeln Mitte und groesster Abstand mit jedem neuen Punkt. Groesser werden in ~1 s, kleiner in ~6 s,
+      -- Aenderungen unter 10 % gar nicht.
+      local v = w.thView
+      if not v or nowc - v.t > 3 then v = {x = ox, y = oy, h = half, t = nowc, t0 = nowc}; w.thView = v end
+      local mx, my = ox - wx * (nowc - v.t0), oy - wy * (nowc - v.t0)
+      if v.t == nowc then
+        v.x, v.y = mx, my
+      else
+        local dt = nowc - v.t
+        local k = clamp(dt / 2, 0, 1)
+        v.x, v.y = v.x + (mx - v.x) * k, v.y + (my - v.y) * k
+        if half > v.h * 1.1 then v.h = v.h + (half - v.h) * clamp(dt, 0, 1)
+        elseif half < v.h * 0.9 then v.h = v.h + (half - v.h) * clamp(dt / 6, 0, 1) end
+        v.t = nowc
+      end
+      ox, oy, half = v.x + wx * (nowc - v.t0), v.y + wy * (nowc - v.t0), v.h
+    else
+      w.thView = nil
     end
     local sc = math.min(mw, mh) / 2 / half
     do
@@ -4392,23 +4410,27 @@ local function paintTherm(w, W, H, top)
       end
     end
     -- Spur im Luftmassen-System (um den Wind zurueckversetzt), dann liegen die Kreise uebereinander.
-    -- Gezeichnet als etwa 4 px dicke Kurve: hoechstens 40 Spurpunkte (bei mehr jeder zweite, dritte ...) sind
-    -- Kontrollpunkte einer quadratischen B-Spline, jedes Stueck geht von Mitte zu Mitte zweier Punkte, lange
-    -- Stuecke in zwei Teilen. Farbe nach dem Steigen am Kontrollpunkt, die neueste Spur liegt oben.
-    -- Rechenlast: die Spur braucht hoechstens rund 7000 Instruktionen pro Bild.
+    -- Gezeichnet als 3 px breite, glatte Kurve: die Spurpunkte (hoechstens 40, bei mehr jeder zweite, dritte ...) sind
+    -- Kontrollpunkte einer quadratischen B-Spline, jedes Stueck geht von Mitte zu Mitte zweier Punkte und wird
+    -- ab 14 px in 2, ab 28 px in 3 Teilstuecke zerlegt (wenige GPS-Punkte pro Kreis bleiben rund). Farbe nach dem
+    -- Steigen am Kontrollpunkt, die neueste Spur liegt oben.
     local best, bv, bx0, by0 = nil, -99, 0, 0
     local showBest = w.thBest
     local lastCol = nil
-    local c1, c2, c3, c4 = mx0 + 3, y + 3, mx0 + mw - 4, y + mh - 4
+    local c1, c2, c3, c4 = mx0 + 2, y + 2, mx0 + mw - 3, y + mh - 3
     -- P() ausgeschrieben (Drehung + Massstab), spart je Punkt zwei Funktionsaufrufe
     local kxx, kxy, kyx, kyy, ex, ey
     if T then kxx, kxy, kyx, kyy = T.ux * sc, T.uy * sc, -T.px * sc, -T.py * sc else kxx, kxy, kyx, kyy = sc, 0, 0, -sc end
     ex, ey = cx - ox * kxx - oy * kxy + 0.5, cy - ox * kyx - oy * kyy + 0.5
-    -- dickes Stueck (ganze Pixel) aus zwei Dreiecken, quer zur Hauptrichtung (h) um o versetzt
-    local FT = lcd.drawFilledTriangle
-    local function seg(x1, y1, x2, y2, h, o, u)
-      if h then FT(x1, y1 - o, x2, y2 - o, x2, y2 + u); FT(x1, y1 - o, x2, y2 + u, x1, y1 + u)
-      else FT(x1 - o, y1, x2 - o, y2, x2 + u, y2); FT(x1 - o, y1, x2 + u, y2, x1 + u, y1) end
+    -- Teilstueck 3 px breit (ganze Pixel): drei Linien quer zur Hauptrichtung versetzt
+    local DL = lcd.drawLine
+    local function seg(x1, y1, x2, y2)
+      local dx, dy = x2 - x1, y2 - y1
+      if (dx < 0 and -dx or dx) >= (dy < 0 and -dy or dy) then
+        DL(x1, y1 - 1, x2, y2 - 1); DL(x1, y1, x2, y2); DL(x1, y1 + 1, x2, y2 + 1)
+      else
+        DL(x1 - 1, y1, x2 - 1, y2); DL(x1, y1, x2, y2); DL(x1 + 1, y1, x2 + 1, y2)
+      end
     end
     -- erster Punkt juenger als 35 s (Zeiten steigen: Binaersuche), Schrittweite fuer hoechstens 40 Punkte
     local n = #tr
@@ -4424,27 +4446,31 @@ local function paintTherm(w, W, H, top)
       local p = tr[i]
       local age = nowc - p.t
       local qx, qy = p.x + wx * age, p.y + wy * age
-      local vx, vy = floor(ex + qx * kxx + qy * kxy), floor(ey + qx * kyx + qy * kyy)
+      local vx, vy = ex + qx * kxx + qy * kxy, ey + qx * kyx + qy * kyy
       local pv = p.v or 0
       if showBest and pv > bv then bv, best, bx0, by0 = pv, p, qx, qy end
       if px then
-        local nx, ny = (px + vx) // 2, (py + vy) // 2
+        local nx, ny = (px + vx) * 0.5, (py + vy) * 0.5
         if mx >= c1 and mx <= c3 and my >= c2 and my <= c4 and px >= c1 and px <= c3 and py >= c2 and py <= c4
           and nx >= c1 and nx <= c3 and ny >= c2 and ny <= c4 then
           local col = pv0 > 1.5 and C_RED or (pv0 > 0.5 and C_YELLOW or (pv0 > 0 and C_GREEN or C_BLUE))
           if col ~= lastCol then lcd.color(col); lastCol = col end
           local d, e = nx - mx, ny - my
-          if d < 0 then d = -d end
-          if e < 0 then e = -e end
-          -- Breite 4 px quer zur Linie: waagrecht/senkrecht -2..+1, schraeg -3..+2
-          local h, o = d >= e, (d + d > e and e + e > d) and 3 or 2
-          if d + e > 14 then
-            -- Kurvenmitte B(1/2)
-            local hx, hy = (mx + px + px + nx) // 4, (my + py + py + ny) // 4
-            seg(mx, my, hx, hy, h, o, o - 1); seg(hx, hy, nx, ny, h, o, o - 1)
-          else
-            seg(mx, my, nx, ny, h, o, o - 1)
+          d = (d < 0 and -d or d) + (e < 0 and -e or e)
+          local x0, y0 = floor(mx), floor(my)
+          if d > 14 then
+            -- B(t) = m + 2t(c - m) + t^2 (m - 2c + n), in k gleichen Schritten
+            local k = d > 28 and 3 or 2
+            local ax, ay = 2 * (px - mx), 2 * (py - my)
+            local bx, by = mx - px - px + nx, my - py - py + ny
+            for j = 1, k - 1 do
+              local t = j / k
+              local x1, y1 = floor(mx + t * (ax + t * bx)), floor(my + t * (ay + t * by))
+              seg(x0, y0, x1, y1)
+              x0, y0 = x1, y1
+            end
           end
+          seg(x0, y0, floor(nx), floor(ny))
         end
         px, py, pv0, mx, my = vx, vy, pv, nx, ny
       else
@@ -4455,11 +4481,7 @@ local function paintTherm(w, W, H, top)
     if px and mx >= c1 and mx <= c3 and my >= c2 and my <= c4 and px >= c1 and px <= c3 and py >= c2 and py <= c4 then
       local col = pv0 > 1.5 and C_RED or (pv0 > 0.5 and C_YELLOW or (pv0 > 0 and C_GREEN or C_BLUE))
       if col ~= lastCol then lcd.color(col) end
-      local d, e = px - mx, py - my
-      if d < 0 then d = -d end
-      if e < 0 then e = -e end
-      local o = (d + d > e and e + e > d) and 3 or 2
-      seg(mx, my, px, py, d >= e, o, o - 1)
+      seg(floor(mx), floor(my), floor(px), floor(py))
     end
     local ax0, ay0 = P(f.x, f.y)
     -- rote Linie zum besten Steigen der Spur (App thBest, Vorgabe aus)
