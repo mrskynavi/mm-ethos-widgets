@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.4
+-- @version 1.8
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -23,7 +23,7 @@
 --
 -- Seiten (je Seite ein Schalter mit Stellung in der Konfiguration; Tippen auf die Kopfzeile geht
 -- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Laufende Toene (Sollfahrt, Start, Vario) kommen nur fuer die angezeigte
--- Seite. Wendeton, Start, Sektor und Ziel kommen immer, auch wenn am Sender ein anderer Bildschirm offen ist.
+-- Seite. Varioton (wie XCSoar): Seite Thermik, beim Kreisen auf allen Seiten, auf Gleiten statt Sollfahrt bei Netto > MC. Wendeton, Start, Sektor und Ziel kommen immer, auch wenn am Sender ein anderer Bildschirm offen ist.
 --
 -- Optimaler Weg (Seite GLEITEN): Das Widget rechnet im Luftmassen-System. Dort sind Kurven echte
 -- Kreise mit dem aktuellen Wenderadius, die Wendepunkte wandern mit -Wind. Fuer die naechsten drei
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.7"
+local VERSION = "1.8"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1053,7 +1053,7 @@ local BOOL_DEFS = {
   {key = "eventsAlways", def = false},
   {key = "stfTone", def = true},
   {key = "navVoice", def = true},
-  {key = "varioTone", def = false},   -- Vario-Ton macht normalerweise der Sender selbst
+  {key = "varioTone", def = true},    -- Varioton des Widgets (dann Vario-Ton des Senders aus)
   {key = "startTone", def = true},
   {key = "autoPage", def = true},
   {key = "rzOn", def = true},        -- Restzeit-Sollfahrt (Zeit-MC) statt festem MC
@@ -1080,7 +1080,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true,
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20},
 }
 
 local function applyAppSettings(w, st)
@@ -1115,7 +1115,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, vzLo = 3, vzHi = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -2250,20 +2250,75 @@ local function thermCalc(w, f, now, dt)
   end
 end
 
-local function thermTones(w, now)
-  if not w.varioTone or w.vFast == nil then return end
-  if w.varTT and now < w.varTT then return end
-  local v = w.vFast
-  if v > 0.2 then
-    local f = 600 + clamp(v, 0, 6) * 160
-    local period = clamp(0.55 - v * 0.07, 0.12, 0.55)
-    tone(w, P_THERM, f, period * 450)
-    w.varTT = now + period
-  elseif v < -1.5 then
-    tone(w, P_THERM, 300, 300)
-    w.varTT = now + 0.9
+-- Varioton des Widgets, Tonkurve wie XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
+-- Steigen: 500 Hz bei 0 bis 1500 Hz bei +5 m/s, Periode 600 ms bei 0 bis 150 ms bei +5 m/s, davon 2/3 Ton und
+-- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
+-- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
+-- Wann: auf der Seite Thermik immer; beim Kreisen auf allen Seiten (auch Start); auf der Seite Gleiten (mit
+-- Eckansicht) ersetzt er den Sollfahrt-Ton, solange das Netto-Steigen ueber dem eingestellten MC liegt (nicht mit
+-- MC ZEIT, das ist der Endanflug). Der Sollfahrt-Ton selbst bleibt unveraendert. Laeuft ueber tone(), darum gilt
+-- der Vorrang der Wendevorhersage. In BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist.
+BAL.VT = {}
+
+function BAL.VT.mode(w, now, dt)
+  if w.varioRaw ~= nil then w.vtV = lpf(w.vtV, w.varioRaw, dt, 0.3) end
+  -- Kreisen: Drehrate > 12 Grad/s und mehr als 200 Grad gedreht (mehr als eine Wende an der Ecke);
+  -- vorbei nach 2 s geradeaus
+  if (w.omega or 0) > math.rad(12) then
+    w.vtStr = nil
+    if not w.vtC0 then w.vtC0, w.vtTurn0 = now, w.turnSum or 0 end
+    if math.abs((w.turnSum or 0) - w.vtTurn0) >= 200 then w.vtCirc = true end
   else
-    w.varTT = now + 0.2
+    w.vtStr = w.vtStr or now
+    if now - w.vtStr > 2 then w.vtC0, w.vtCirc = nil, false end
+  end
+  -- Netto fuer die Umschaltung: TE plus Eigensinken aus der Polare, 1 s geglaettet (das Netto der Sollfahrt mit
+  -- 8 s ist fuer einen Bart, den man in 2 bis 3 s durchfliegt, zu traege). Rein bei Netto > MC + 0.1 fuer 0.5 s,
+  -- raus bei Netto < MC - 0.3 fuer 2 s. Mit MC ZEIT nie.
+  local p = w.polar
+  if p and w.varioRaw ~= nil and w.tasN and w.tasN * KMH > 15 then
+    w.vtNet = lpf(w.vtNet, w.varioRaw + polarSink(p, w.tasN), dt, 1)
+  else
+    w.vtNet = nil
+  end
+  local mc = w.mcValue or 0
+  if w.vtNet and (w.rzMan or w.rzOn == false) then
+    if w.vtTh then
+      if w.vtNet < mc - 0.3 then
+        w.vtOut = w.vtOut or now
+        if now - w.vtOut >= 2 then w.vtTh, w.vtOut = false, nil end
+      else w.vtOut = nil end
+    elseif w.vtNet > mc + 0.1 then
+      w.vtIn = w.vtIn or now
+      if now - w.vtIn >= 0.5 then w.vtTh, w.vtIn = true, nil end
+    else w.vtIn = nil end
+  else
+    w.vtTh, w.vtIn, w.vtOut = false, nil, nil
+  end
+  local pg = w.page
+  w.vtOn = w.varioTone and w.vtV ~= nil and (pg == P_THERM or w.vtCirc or (pg == P_GLIDE and w.vtTh)) or false
+end
+
+function BAL.VT.play(w, now)
+  local v = w.vtV
+  if not w.vtOn or v == nil then w.vtNext, w.vtEnd = nil, nil; return end
+  if w.quietUntil and now < w.quietUntil then return end      -- kurz nach Ereignistoenen (Sektor, Start ...)
+  local iv = clamp(v * 100, -500, 500)                        -- cm/s wie XCSoar
+  if iv >= -(w.vzLo or 3) * 10 and iv <= (w.vzHi or 1) * 10 then w.vtNext, w.vtEnd = nil, nil; return end
+  local busy = w.vtEnd or 0                                   -- bis dann klingt der zuletzt bestellte Ton
+  if iv > 0 then
+    if now < busy or (w.vtNext and now < w.vtNext) then return end
+    local per = 150 + (500 - iv) * 450 / 500                  -- ms
+    local on = per - math.floor(per / 3)
+    tone(w, w.page, 500 + iv * 1000 / 500, on)
+    -- Takt aus der geplanten Zeit (nicht aus "jetzt"), damit der Rhythmus im 50-ms-Raster von wakeup nicht driftet
+    local base = (w.vtNext and now - w.vtNext < 0.1) and w.vtNext or now
+    w.vtNext, w.vtEnd = base + per / 1000, now + on / 1000
+  else
+    -- durchgehender Ton: Stuecke von 250 ms, das naechste kurz vor dem Ende des laufenden bestellt
+    if now < busy - 0.08 then return end
+    tone(w, w.page, 500 + iv * 300 / 500, 250)
+    w.vtNext, w.vtEnd = nil, math.max(now, busy) + 0.25
   end
 end
 
@@ -2690,12 +2745,16 @@ local function wakeup(w)
   if w.zoneEnterT == now then w.zoneDefer = true end
   if w.zoneDefer and not prio then w.zoneDefer = nil; tone(w, nil, 500, 600) end
 
-  if cur then
-    local warn = turnTone(w, w.gc or {}, now)                -- Wendeton auf jeder Seite
-    warn = warn or (w.prioUntil and now < w.prioUntil)        -- Vorrang: keine Seitentoene
+  BAL.VT.mode(w, now, dt)
+  local warn = cur and turnTone(w, w.gc or {}, now)           -- Wendeton auf jeder Seite
+  warn = warn or (w.prioUntil and now < w.prioUntil)          -- Vorrang: keine Seitentoene
+  if w.vtOn then
+    -- Varioton ersetzt Sollfahrt-, Start- und Kurs-Toene (Thermik-Seite, Kreisen, Gleiten mit Netto > MC)
+    w.cmdTones = nil
+    if not warn then BAL.VT.play(w, now) end
+  elseif cur then
     if w.page == P_START then if not warn then startTones(w, w.sc, now) end
-    elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn)
-    elseif w.page == P_THERM then if not warn then thermTones(w, now) end end
+    elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn) end
   end
 
   if now - w.lastInvalidate >= 0.15 then
