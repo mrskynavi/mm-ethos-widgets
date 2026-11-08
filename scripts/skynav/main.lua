@@ -24,6 +24,7 @@
 -- Seiten (je Seite ein Schalter mit Stellung in der Konfiguration; Tippen auf die Kopfzeile geht
 -- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Laufende Toene (Sollfahrt, Start, Vario) kommen nur fuer die angezeigte
 -- Seite. Varioton (wie XCSoar): Seite Thermik, beim Kreisen auf allen Seiten, auf Gleiten statt Sollfahrt bei Netto > MC. Wendeton, Start, Sektor und Ziel kommen immer, auch wenn am Sender ein anderer Bildschirm offen ist.
+-- Beim Start sagt das Widget "Einflug OK" bzw. "<n> Strafpunkte" (audio/einflug_ok.wav, strafpunkte.wav, Zahl vom Sender).
 --
 -- Optimaler Weg (Seite GLEITEN): Das Widget rechnet im Luftmassen-System. Dort sind Kurven echte
 -- Kreise mit dem aktuellen Wenderadius, die Wendepunkte wandern mit -Wind. Fuer die naechsten drei
@@ -2794,13 +2795,15 @@ local function wakeup(w)
     if w.eventsAlways or w.page == pg or e == "STA" or e == "TPC" or e == "FIN" then
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
       elseif e == "STA" then tone(w, nil, 1000, 150); tone(w, nil, 1400, 250)
-        if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0) end
+        -- Ansage "Einflug OK" bzw. "<n> Strafpunkte" (audio/einflug_ok.wav, strafpunkte.wav, Zahl vom Sender)
+        if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0); sayWord(w, nil, "strafpunkte.wav")
+        else sayWord(w, nil, "einflug_ok.wav") end
       elseif e == "TPC" then
         -- Sektor erreicht: deutlicher Dreiklang aufwaerts und Vibration
         tone(w, nil, 1000, 180); tone(w, nil, 1400, 180); tone(w, nil, 2000, 500); haptic(w, nil, 300)
       elseif e == "FIN" then tone(w, nil, 1200, 150); tone(w, nil, 1600, 300); sayNumber(w, nil, #w.laps, UNIT_RAW, 0)
       elseif e == "STP" then tone(w, nil, 600, 400) end
-      w.quietUntil = now + 1.5
+      w.quietUntil = now + (e == "STA" and 3 or 1.5)          -- nach dem Start Platz fuer die Einflug-Ansage
     end
   end
   if w.zoneEnterT == now then w.zoneDefer = true end
