@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.0
+-- @version 1.8
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -22,14 +22,16 @@
 --   Schnitt = Anzahl Dreiecke * Umfang / (letztes Ziel - Start), Umfang = dTP * (2 + 2*sqrt(2)).
 --
 -- Seiten (je Seite ein Schalter mit Stellung in der Konfiguration; Tippen auf die Kopfzeile geht
--- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Toene kommen nur fuer die angezeigte Seite.
+-- auch): START, GLEITEN, THERMIK, AUSWERTUNG. Laufende Toene (Sollfahrt, Start, Vario) kommen nur fuer die angezeigte
+-- Seite. Varioton (wie XCSoar): Seite Thermik, beim Kreisen auf allen Seiten, auf Gleiten statt Sollfahrt bei Netto > MC. Wendeton, Start, Sektor und Ziel kommen immer, auch wenn am Sender ein anderer Bildschirm offen ist.
 --
 -- Optimaler Weg (Seite GLEITEN): Das Widget rechnet im Luftmassen-System. Dort sind Kurven echte
 -- Kreise mit dem aktuellen Wenderadius, die Wendepunkte wandern mit -Wind. Fuer die naechsten drei
 -- Ecken liegt ein Kreis (Radius R) so, dass er den Sektor um "Reserve" Meter innen beruehrt. Der
 -- Weg = Tangente zum ersten Kreis, Bogen, Aussentangente zum naechsten Kreis ... Die Ankunftszeiten
 -- (und damit der Versatz der Ecken) werden dreimal nachgerechnet. Daraus kommen der Soll-Steuerkurs
--- (Kommando: Zwitscher steigend = rechts, fallend = links; Kurs-Ticker bei wachsender Ablage) und die Zeit bis zum Einleiten der Kurve (Piepse davor).
+-- (Ansage "xx links/rechts" vor allem bei wachsender Ablage, Sprachdateien in scripts/skynav/audio; Kurs-Ticker) und die
+-- Zeit bis zum Einleiten der Kurve (Wendeton: Countdown-Piepse, dann hoher Ton "jetzt wenden").
 --
 -- Restzeit-Sollfahrt (Zeit-MC): Aus Restzeit, Netto pro Schenkel, Wind, Hoehe und Steigen rechnet das Widget, wie
 -- viele Dreiecke noch passen, und zeigt statt des festen MC den MC, der sie am schnellsten schafft (Tippen auf das
@@ -39,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.0"
+local VERSION = "1.8"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -435,7 +437,11 @@ local function planPath(px, py, wx, wy, V, R, C, hdgNow, noPts)
         local th0 = phi + s1 * math.acos(clamp(R1 / d, -1, 1))
         local tx, ty = Z[1].x + R1 * math.cos(th0) - px, Z[1].y + R1 * math.sin(th0) - py
         local tl = math.sqrt(tx * tx + ty * ty)
-        late = tl > 1 and (tx * hx + ty * hy) / tl < 0.87             -- mehr als ~30 Grad abdrehen noetig
+        -- mehr als ~30 Grad abdrehen noetig, und zwar kurz vor dem Kreis (Tangentenpunkt hoechstens 3 s bzw.
+        -- 3 Radien entfernt). Weiter weg ist es nur ein Kursfehler, kein verpasster Kurvenbeginn: sonst schaltete
+        -- ein Pilot, der 150 m vor der Ecke 30 Grad neben dem Plan fliegt, auf "Ecke verpasst" (kein Wendeton,
+        -- keine Kurs-Ansagen mehr bis zum Sektor).
+        late = tl > 1 and (tx * hx + ty * hy) / tl < 0.87 and tl < math.max(3 * R1, 3 * V)
       end
       if late then
         -- geradeaus weiter (ueber Grund mit Wind), bis der Punkt margin tief im Sektor liegt, dann wenden
@@ -622,14 +628,19 @@ local function currentModelName()
   return nil
 end
 
--- ---------------------------------------------------------------- Ton (nur fuer die angezeigte Seite)
+-- ---------------------------------------------------------------- Ton
 
--- page = Seite, zu der der Ton gehoert (nil = Ereignis, siehe w.eventsAlways)
+-- page = Seite, zu der der Ton gehoert: kommt nur, wenn diese Seite angezeigt wird und das Widget auf dem
+-- Bildschirm ist. nil = Ereignis (Wendeton, Sektor, Start, Ziel, Zone): kommt auf jeder Seite und auch,
+-- wenn am Sender ein anderer Bildschirm offen ist (die Wertung laeuft ja weiter).
 local function audible(w, page)
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
-  if not widgetVisible() then return false end
+  -- Wendevorhersage hat Vorrang vor allem: rund um die Wende (w.prioUntil, siehe turnTone) schweigen alle anderen
+  -- Toene und Ansagen, nur die Wendetoene selbst (w.prioPlay) kommen durch
+  if w.prioUntil and not w.prioPlay and os.clock() < w.prioUntil then return false end
   if page == nil then return true end            -- Ereignis: Aufrufer hat die Seite schon geprueft
+  if not widgetVisible() then return false end
   return w.page == page
 end
 
@@ -1006,7 +1017,7 @@ local NUM_DEFS = {
   {key = "radMode",   def = 1},     -- ungenutzt (Wenderadius wird pro Modell gelernt), Platz fuer die Storage-Reihenfolge
   {key = "radFix",    def = 30},    -- ungenutzt
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
-  {key = "warnSec",   def = 2},     -- Wendeton: Laenge (s), endet am Wendepunkt
+  {key = "warnSec",   def = 2},     -- Wendeton: Countdown (s) vor "Jetzt wenden" am Kurvenbeginn
   {key = "lead",      def = 5},     -- Vorhalt Kurveneinleitung 0.1 s
   {key = "cmdMin",    def = 10},    -- Kommando ab x Grad
   {key = "cmdGap",    def = 8},     -- Kommando höchstens alle x s
@@ -1042,7 +1053,7 @@ local BOOL_DEFS = {
   {key = "eventsAlways", def = false},
   {key = "stfTone", def = true},
   {key = "navVoice", def = true},
-  {key = "varioTone", def = false},   -- Vario-Ton macht normalerweise der Sender selbst
+  {key = "varioTone", def = true},    -- Varioton des Widgets (dann Vario-Ton des Senders aus)
   {key = "startTone", def = true},
   {key = "autoPage", def = true},
   {key = "rzOn", def = true},        -- Restzeit-Sollfahrt (Zeit-MC) statt festem MC
@@ -1055,6 +1066,11 @@ local TEXT_DEFS = {
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 local BAL = {}
 
+-- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
+-- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
+-- zeigt nur die Restkorrektur. Ohne Sensor gilt die Drehrate aus dem GPS-Kurs (traeger, tau hoechstens 1 s).
+BAL.QL = {}                                                         -- in BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist
+
 -- Einstellungen aus der App (aufgaben.lua, Tabelle settings): Schluessel, Bereich. Am Sender stehen nur noch
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
 local APP_SETTINGS = {
@@ -1064,6 +1080,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20},
 }
 
 local function applyAppSettings(w, st)
@@ -1085,7 +1102,7 @@ local function resetFlight(w)
   w.state = S_IDLE
   w.flying, w.landedT, w.slowSince = false, nil, nil
   w.tp, w.laps, w.startT, w.startUtc, w.lapT = 0, {}, nil, nil, nil
-  w.cornerHold, w.badEntry = nil, nil
+  w.cornerHold, w.badEntry, w.cornerAfter = nil, nil, nil
   w.entry, w.penalty, w.zoneHit, w.altHit = nil, 0, false, false
   w.lastFix, w.lastInStart, w.stopReason = nil, nil, nil
   w.trail, w.ring = {}, {}
@@ -1098,7 +1115,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, vzLo = 3, vzHi = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1158,6 +1175,7 @@ local function loadRadii(w)
           local r = v[key]
           if type(r) == "number" and r >= 5 and r <= 200 then m[key] = r end
         end
+        if type(v.ql) == "number" and math.abs(v.ql) <= 45 then m.ql = v.ql end   -- Querlage-Nullpunkt (Grad)
         w.radii[k] = m
       end
     end
@@ -1168,10 +1186,10 @@ local function saveRadii(w)
   local keys = {}
   for k in pairs(w.radii) do keys[#keys + 1] = k end
   table.sort(keys)
-  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\nreturn {\n"}
+  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\nreturn {\n"}
   for _, k in ipairs(keys) do
     local m, parts = w.radii[k], {}
-    for _, key in ipairs({"all", "tp1", "tp2", "tp3"}) do
+    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql"}) do
       if m[key] then parts[#parts + 1] = string.format("%s = %.1f", key, m[key]) end
     end
     out[#out + 1] = string.format("  [%q] = {%s},\n", k, table.concat(parts, ", "))
@@ -1303,14 +1321,20 @@ local function readInputs(w, now, dt)
     x, y = (lon - (w.lon0 or lon)) * M_PER_DEG * math.cos(math.rad(lat)), (lat - (w.lat0 or lat)) * M_PER_DEG
     w.lat0, w.lon0 = w.lat0 or lat, w.lon0 or lon
   end
-  if w.ax == nil then w.ax, w.ay, w.aT = x, y, now end
-  local ddx, ddy = x - w.ax, y - w.ay
+  -- Kurs ueber eine Basis von 2 s: vom juengsten Fix, der mindestens 2 s alt ist, zum neuen Fix. Von Fix zu Fix
+  -- (0,5 bis 1 s, wenige Meter) macht die Aufloesung der Position (etwa 1 m) den Kurs unruhig, Kurszeiger,
+  -- 5-s-Vektor und links/rechts pendelten. 2 s kosten etwa 1 s Verzoegerung. Nach einer Luecke beginnt sie neu.
+  local h = w.crsHist
+  if not h or (#h > 0 and now - h[#h].t > 5) then h = {}; w.crsHist = h end
+  h[#h + 1] = {x = x, y = y, t = now}
+  while #h > 2 and now - h[2].t >= 2.0 do table.remove(h, 1) end
+  local b = h[1]
+  local ddx, ddy = x - b.x, y - b.y
   local dd = math.sqrt(ddx * ddx + ddy * ddy)
   local gsPos
   if dd >= 3 then
     w.crs = bearingOf(ddx, ddy)
-    gsPos = dd / math.max(now - w.aT, 0.05)
-    w.ax, w.ay, w.aT = x, y, now
+    gsPos = dd / math.max(now - b.t, 0.05)
   end
   local gs = speedMs(w.gpsSpd)
   if gs == nil then
@@ -1342,6 +1366,7 @@ local function readInputs(w, now, dt)
     w.turnSum = (w.turnSum or 0) + dA                              -- Drehung mit Vorzeichen, fuer die Kreiserkennung
     local omega = math.rad(math.abs(dA)) / dtFix
     w.omega = lpf(w.omega, omega, dtFix, 1.5)
+    w.omS = lpf(w.omS, math.rad(dA) / dtFix, dtFix, 0.7)            -- mit Vorzeichen (rechts +), fuer die Querlage
     -- Wenderadius nur aus Kurven ausserhalb der Thermik (Wenden an den Ecken), bei voller Drehrate
     if w.omega > math.rad(25) and omega > 0.8 * w.omega and tas > 3 and not w.therm then
       local r = clamp(tas / omega, 8, 200)
@@ -1403,6 +1428,9 @@ local function event(w, code, f, now)
     w.marks[#w.marks + 1] = {x = f.x, y = f.y, k = code}
   end
   if code == "STA" or code == "TPC" or code == "FIN" then w.cornerHold = nil end   -- Sektor erreicht
+  -- Nach der Wende bleibt die Eckansicht der eben erreichten Ecke noch 2 s stehen (man dreht noch)
+  if code == "TPC" and f and f.clk then w.cornerAfter = {k = w.tp, clk = f.clk} end
+  if code == "STA" or code == "FIN" then w.cornerAfter = nil end
   if code == "STP" then w.endClk = f and f.clk end
   if code == "PEV" or code == "STA" or code == "TPC" or code == "FIN" or code == "STP" then igcEvent(w, code, f) end
 end
@@ -1754,6 +1782,80 @@ end
 
 -- Weg, Querablage, Ankunftshoehe. Laeuft nur bei einem neuen GPS-Fix. full = eine sichtbare Seite zeigt den
 -- Weg (Gleiten, Uebersicht, Start nach dem Start); sonst nur Distanz und Zeit zur Ecke fuer die Eckansicht.
+-- pro wakeup: Querlage lesen, Nullpunkt (radien.lua, pro Modell) und Nachtrimmen im geraden Flug abziehen
+function BAL.QL.read(w, now, dt)
+  local v = readNumber(w.bankSrc)
+  if v == nil or math.abs(v) > 180 then w.qlPhi, w.qlRaw = nil, nil; return end
+  if w.bankInv then v = -v end
+  w.qlRaw = v
+  local m = w.radii and w.radii[w.modelName or "?"]
+  local phi = v - (m and m.ql or 0) - (w.qlTrimV or 0)
+  w.qlPhi = phi
+  -- gerade nach GPS (10 s, nicht im Bart, in Fahrt): dort muss die Querlage 0 sein
+  local f = w.cur
+  if f and w.flying and not w.therm and (f.gs or 0) > 5 and math.abs(w.omS or 1) < math.rad(3) then
+    w.qlStraight = (w.qlStraight or 0) + dt
+    if w.qlStraight >= 10 then
+      -- nur kleine Reste nachtrimmen; grosse Querlage heisst meist "Kurve beginnt" (der Sensor ist dem GPS voraus)
+      if w.qlTrim and math.abs(phi) < 8 then w.qlTrimV = clamp((w.qlTrimV or 0) + phi * dt / 20, -5, 5) end
+      -- bleibt sie 5 s am Stueck gross, passt der Sensor nicht (falsche Quelle, Achse): Drehrate dann aus GPS
+      if math.abs(phi) > 10 then w.qlBadT = (w.qlBadT or 0) + dt else w.qlBadT = math.max((w.qlBadT or 0) - dt, 0) end
+      if w.qlBadT >= 5 then w.qlBad = true elseif w.qlBadT == 0 then w.qlBad = nil end
+    end
+  else
+    w.qlStraight = 0
+    if math.abs(phi) <= 10 then w.qlBadT = math.max((w.qlBadT or 0) - dt, 0) end
+  end
+end
+
+-- Nullen: jetziger Rohwert wird der Nullpunkt dieses Modells (Fluegel waagrecht halten)
+function BAL.QL.zero(w)
+  if not w.qlRaw or not w.radii then return false end
+  local name = w.modelName or "?"
+  local m = w.radii[name] or {}
+  w.radii[name] = m
+  m.ql = math.floor(w.qlRaw * 10 + 0.5) / 10
+  w.qlTrimV, w.qlBad = 0, nil
+  saveRadii(w)
+  return true
+end
+
+-- Restkorrektur und gebogene Ablage-Vorhersage. g.rest = Kursfehler nach der Drehung in tau s,
+-- g.qlState = "hold" (Querlage reicht), "out" (zu viel: ausleiten) oder nil
+function BAL.QL.apply(w, g, f)
+  g.rest, g.qlState = nil, nil
+  local tau = (w.qlTau or 15) / 10
+  if not g.err or tau <= 0 then return end
+  local om
+  if w.qlPhi and not w.qlBad then
+    local phi = math.abs(w.qlPhi) < 3 and 0 or clamp(w.qlPhi, -60, 60)
+    om = 9.81 * math.tan(math.rad(phi)) / math.max(w.tasF or f.tas or 15, 8)
+  elseif w.omS then
+    om, tau = w.omS, math.min(tau, 1)
+  else
+    return
+  end
+  local turn = math.deg(om * tau)
+  local rest = g.err - turn
+  g.rest, g.turn = rest, turn
+  if math.abs(turn) >= 3 then
+    if math.abs(rest) < 5 then g.qlState = "hold"
+    elseif rest * turn < 0 and (g.err * turn > 0 or math.abs(g.err) < 5) then g.qlState = "out" end
+  end
+  -- Ablage in PRED_S s: tau s auf dem Bogen (Sehne), danach geradeaus mit dem neuen Kurs
+  if g.xt and f.ve and f.vn and w.ref then
+    local dx, dy = w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay
+    local l = math.sqrt(dx * dx + dy * dy)
+    if l >= 1 then
+      local t1 = math.min(tau, PRED_S)
+      local c1, s1, c2, s2 = math.cos(om * t1 / 2), math.sin(om * t1 / 2), math.cos(om * t1), math.sin(om * t1)
+      local se = (f.ve * c1 + f.vn * s1) * t1 + (f.ve * c2 + f.vn * s2) * (PRED_S - t1)
+      local sn = (-f.ve * s1 + f.vn * c1) * t1 + (-f.ve * s2 + f.vn * c2) * (PRED_S - t1)
+      g.xtPred = g.xt + (se * dy - sn * dx) / l
+    end
+  end
+end
+
 local function glideCalc(w, f, full)
   local T = w.task
   local g = {}
@@ -1765,6 +1867,7 @@ local function glideCalc(w, f, full)
     g.tCorner = g.dV / math.max(f.gs or w.tasF or f.tas or 20, 5)
     if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
     if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
+    if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
     return g
   end
   local R = radius(w, w.tp + 1)
@@ -1818,6 +1921,15 @@ local function glideCalc(w, f, full)
       if l >= 1 then g.xtPred = g.xt + (f.ve * dy - f.vn * dx) / l * PRED_S end
     end
   end
+  -- Kurs-Kommando (Anzeige "x° LINKS/RECHTS" und Ansage) passend zum Ablage-Balken: zurueck zur Soll-Linie, mit
+  -- einem Anschnitt, der mit der Ablage waechst (0.5 Grad pro Meter, hoechstens 30 Grad). Vorher zeigte das
+  -- Kommando direkt zum Wendekreis: links der Linie und schon kraeftig zur Linie unterwegs hiess es dann
+  -- "LINKS", obwohl der Balken "rechts" sagte. Kurz vor der Ecke (Kurve in weniger als 6 s) gilt der Plan.
+  if g.xt and f.crs and w.ref and not plan.inTurn and not missed and (plan.tT or 0) > 6 then
+    local lb = bearingOf(w.ref.bx - w.ref.ax, w.ref.by - w.ref.ay)
+    g.err = angDiff(lb - clamp(g.xt * 0.5, -30, 30), f.crs)
+  end
+  BAL.QL.apply(w, g, f)
   g.next = w.tp % 3 + 1
   local nxt = T.tp[g.next]
   g.dV = math.sqrt((f.x - nxt.x) ^ 2 + (f.y - nxt.y) ^ 2)
@@ -1847,63 +1959,207 @@ local function glideCalc(w, f, full)
   local sink = w.polar and polarSink(w.polar, V) or w.sinkAvg
   if sink then g.hFin, g.tFin = f.agl - sink * tRem, tRem end
   -- Eckansicht: zoomSec Sekunden vor der naechsten Ecke (Ankunft nach Plan). Sobald der Sektor erreicht ist,
-  -- zaehlt die naechste Ecke, die Seite ist sofort wieder Gleiten.
+  -- zaehlt die naechste Ecke, die Eckansicht der erreichten Ecke bleibt noch 2 s, dann wieder Gleiten.
   local gs = math.max(f.gs or V, 5)
   g.tCorner = plan.t1 or (g.dV / gs)
   if g.tCorner < w.zoomSec then g.corner = g.next; w.cornerHold = g.next end
   -- Ecke geschnitten (Sektor verpasst): Eckansicht bleibt, bis der Sektor erreicht ist (dann wechselt g.next)
   -- oder man sich mehr als 400 m vom TP entfernt hat
   if w.cornerHold == g.next and g.dV < 400 then g.corner = g.next end
+  -- Nach der Wende: Eckansicht der erreichten Ecke noch 2 s (siehe event)
+  if not g.corner and w.cornerAfter and f.clk and f.clk - w.cornerAfter.clk < 2 then g.corner = w.cornerAfter.k end
   return g
 end
 
--- Wendeton: ein langer Ton (warnSec), der beim Kurvenbeginn nach Plan (mit Vorhalt) endet. Ist er fertig,
--- wenden. Kommt auf Gleiten und Uebersicht. Liefert true, solange der Ton laeuft.
-local function turnTone(w, g, now, page)
-  if not g.plan then return false end
-  local tT = (g.plan.tT or 99) - w.lead / 10
-  if w.warnSec > 0 and not g.plan.inTurn and tT <= w.warnSec + 0.05 and tT > -0.5 then
-    if not w.warnOn then
-      w.warnOn = true
-      tone(w, page, 1700, math.max(tT, 0.4) * 1000)
+-- Wendeton: Countdown und ein deutliches "Jetzt wenden". warnSec Sekunden vor dem Kurvenbeginn kurze Piepse im
+-- Sekundentakt, beim Kurvenbeginn ein hoher langer Ton mit Vibration. Der Kurvenbeginn wird bei jedem Aufruf aus dem
+-- aktuellen Plan genommen (nicht im Voraus festgelegt): fliegt der Pilot neben dem Plan, verschiebt sich "Jetzt"
+-- (im Grenzfall "geradeaus bis in den Sektor, dann wenden"). Kommt auf jeder Seite und auch, wenn das Widget nicht auf
+-- dem Bildschirm ist (Ereignis). Genau einmal pro Ecke und Runde; kein Ton, wenn der Pilot schon kraeftig dreht.
+-- Liefert true, solange der Countdown laeuft. Vorrang: ab warnSec + 1.5 s vor dem Kurvenbeginn bis 1 s nach
+-- "Jetzt" (und 2.5 s ab jeder Kurs-Ansage vor der Ecke) schweigen alle anderen Toene und Ansagen auf allen Seiten
+-- (w.prioUntil, siehe audible). So ist auch die Warteschlange des Senders leer, wenn der Countdown beginnt;
+-- Ereignistoene aus dieser Zeit kommen danach.
+local turnTone
+do -- eigener Block: das Hauptkapitel ist am Limit von 200 lokalen Variablen
+-- Zeit (s) bis zum fruehesten Kurvenbeginn, bei dem eine Kurve vom JETZIGEN Steuerkurs aus (Radius R in der Luft,
+-- Drehsinn der Ecke, Wind als Versatz) sicher in den Sektor fuehrt: mindestens Reserve + 5 m tief. Frueher eingeleitet
+-- verfehlt sie den Sektor. 0 = jetzt; nil = auch 12 s geradeaus und dann wenden reicht nicht (Kurs korrigieren).
+-- Bogen in 15-Grad-Schritten bis 180 Grad, Kurvenbeginn per Halbierung (die Kurve wird mit spaeterem Beginn tiefer).
+-- Einmal pro GPS-Fix gerechnet.
+local function headingTurnT(w, g, f)
+  local c = g.C and g.C[1]
+  if not (c and c.tx and f and f.hdg) then return nil end
+  if w.htT and w.htT.clk == f.clk and w.htT.tp == w.tp then return w.htT.v end
+  local V = math.max(w.tasF or f.tas or 15, 5)
+  local R = c.R or R_DEFAULT
+  local s = c.s
+  local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
+  local h0 = math.rad(f.hdg)
+  local dep = (c.margin or w.margin) + 10
+  local om = V / R
+  local function ok(t0)
+    -- Kurvenbeginn nach t0 s geradeaus (Boden: Luft + Wind)
+    local sx, sy = f.x + (V * math.sin(h0) + wx) * t0, f.y + (V * math.cos(h0) + wy) * t0
+    for k = 1, 12 do
+      local a = k * math.rad(15)                                   -- gedrehter Winkel
+      local t = a / om
+      local h = h0 - s * a                                         -- Peilung: links = kleiner
+      -- Luftkreis: Versatz vom Kurvenbeginn = R * (Sehne), dazu Wind
+      local x = sx + s * R * (math.cos(h) - math.cos(h0)) + wx * t
+      local y = sy - s * R * (math.sin(h) - math.sin(h0)) + wy * t
+      local rx, ry = x - c.tx, y - c.ty
+      local d = rx * c.bx + ry * c.by
+      if d >= dep and d * d >= 0.5 * (rx * rx + ry * ry) then return true end
     end
-    w.quietUntil = now + 3
-    return true
+    return false
   end
-  if tT > w.warnSec + 1 then w.warnOn = nil end
-  return false
+  local v
+  if ok(0) then v = 0
+  elseif ok(12) then
+    local lo, hi = 0, 12
+    for _ = 1, 7 do
+      local mid = (lo + hi) / 2
+      if ok(mid) then hi = mid else lo = mid end
+    end
+    v = hi
+  end
+  w.htT = {clk = f.clk, tp = w.tp, v = v}
+  return v
 end
 
-local function glideTones(w, g, now)
+-- Vorrang mindestens bis now + s halten
+local function prioHold(w, now, s)
+  if not w.prioUntil or w.prioUntil < now + s then w.prioUntil = now + s end
+end
+
+-- eigene Toene der Wendevorhersage: kommen trotz Vorrang durch
+local function prioTone(w, f, len, hap)
+  w.prioPlay = true
+  tone(w, nil, f, len)
+  if hap then haptic(w, nil, hap) end
+  w.prioPlay = nil
+end
+
+function turnTone(w, g, now)
+  local p = g.plan
+  if not p or w.warnSec <= 0 or w.state ~= S_STARTED then return false end
+  if g.next ~= w.tp % 3 + 1 then return false end              -- Plan noch fuer die eben erreichte Ecke
+  local key = #w.laps * 4 + w.tp
+  local wt = w.warn
+  if wt and wt.key ~= key then wt = nil; w.warn = nil end
+  if wt and wt.done then
+    -- deutlich weg von der Kurve (abgebrochen, z. B. Bart): fuer diese Ecke wieder frei
+    if not (p.inTurn or p.missed or p.late) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warn = nil end
+    return false
+  end
+  -- Zeit bis zum Kurvenbeginn. Massgebend ist der jetzige Kurs: "Jetzt" kommt erst, wenn eine Kurve von hier aus
+  -- den Sektor sicher erreicht. Zeigt der Kurs so, dass keine Kurve den Zielpunkt erreicht, zaehlt der Plan (die
+  -- Kurs-Ansage sagt, wohin); bei "Ecke geschnitten" ohne erreichbaren Zielpunkt sofort.
+  local tT = p.tT or 99
+  local th = w.cur and headingTurnT(w, g, w.cur)
+  if th then tT = th
+  elseif p.missed then tT = (g.dV or 0) < 2 * ((g.C and g.C[1] and g.C[1].R) or R_DEFAULT) and 0 or 99
+  else
+    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: kein "Jetzt", dafuer kurz vor der Ecke die Kurs-Ansage
+    -- nach dem Plan ("15 rechts"), alle 3 s, auf jeder Seite
+    if (p.tT or 99) - w.lead / 10 <= w.warnSec + 3 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
+      w.crsT = now
+      local right = g.err > 0
+      local fn = right and "rechts.wav" or "links.wav"
+      prioHold(w, now, 2.5)
+      w.prioPlay = true
+      if audioFile(fn) then
+        sayNumber(w, nil, math.max(5, math.floor(math.abs(g.err) / 5 + 0.5) * 5), UNIT_RAW, 0); sayWord(w, nil, fn)
+      else
+        tone(w, nil, right and 2200 or 1500, 120)
+      end
+      w.prioPlay = nil
+    end
+    tT = 99
+  end
+  -- Kein Vorhalt mehr: "Jetzt" ist der frueheste sichere Kurvenbeginn. Wer langsamer reagiert, kommt nur tiefer in den
+  -- Sektor; ein Vorhalt liess schnelle Piloten den Sektor verfehlen (Simulation: 0.2 bis 1.2 s Reaktion alle drin).
+  tT = tT - (w.cur and (now - w.cur.clk) or 0)                 -- Fix ist bis zu einem GPS-Takt alt
+  local turning = (w.omega or 0) > math.rad(15)
+  -- Vorrang schon 1.5 s vor dem Countdown (Warteschlange leeren) und waehrend er laeuft
+  if (wt or tT <= w.warnSec + 1.5) and not turning then prioHold(w, now, 0.4) end
+  if not wt then
+    if tT > w.warnSec + 0.05 then return false end
+    wt = {key = key}
+    w.warn = wt
+    if turning then wt.done = true; return false end           -- dreht schon: kein Ton mehr
+  end
+  if tT <= 0.15 then
+    -- Jetzt wenden
+    wt.done = true
+    if not turning then
+      prioHold(w, now, 1.6)                                    -- 0.6 s Ton, danach noch 1 s still
+      prioTone(w, 2400, 600, 400)
+      w.quietUntil = now + 1.5
+    end
+    return false
+  end
+  if tT > w.warnSec + 1 then return false end                  -- Kurs passt gerade nicht: warten, Kurs-Ansage fuehrt
+  -- Countdown: ein kurzer Piep pro Sekunde, nicht mehr in der letzten halben Sekunde vor "Jetzt"
+  if (not wt.beepT or now - wt.beepT >= 1) and tT > 0.5 then
+    wt.beepT = now
+    prioTone(w, 1700, 90)
+  end
+  w.quietUntil = now + 1
+  return true
+end
+end
+
+local function glideTones(w, g, now, warn)
   if not g.plan then
     -- vor dem Start: nur Sollfahrt
   else
-    if turnTone(w, g, now, P_GLIDE) then return end
-    -- Kurs-Kommandos als kurzer Zwitscher (steigend = rechts, fallend = links), die Gradzahl steht im Display.
-    -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 3 s,
-    -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s.
+    if warn then return end
+    -- Kurs-Ansage "xx links" / "xx rechts" (Zahl ohne "Grad", dann links.wav/rechts.wav aus scripts/skynav/audio;
+    -- fehlen die Dateien, ein Zwitscher: steigend = rechts, fallend = links). Vor allem, wenn man immer mehr
+    -- vom Kurs wegdriftet:
+    -- Ausloeser 1 (Trend): die Ablage in PRED_S s ist >= 15 m und waechst, 0.6 s lang -> sofort, danach alle 4 s,
+    -- solange sie weiter waechst. Ausloeser 2 (Kurs): Kursfehler >= cmdMin fuer 2 s, hoechstens alle cmdGap s,
+    -- aber nicht, solange die Ablage schon kleiner wird (der Pilot korrigiert bereits).
     -- keine Kommandos in der Kurve und kurz nach einem Wendepunkt (dort zeigt die Eckansicht den Weg)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
-    if w.navVoice and g.err and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
-      local a, right = math.abs(g.err), g.err > 0
+    -- Mit Querlage: Kursfehler nach der vorausgerechneten Drehung (g.rest); HALTEN und AUSLEITEN ohne Kurs-Ansage
+    local ge = g.rest or g.err
+    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
+      local a, right = math.abs(ge), ge > 0
       local xt, xp = g.xt, g.xtPred
       local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
+      local closing = xt and xp and math.abs(xp) < math.abs(xt) - 2
       if drift then w.driftSince = w.driftSince or now else w.driftSince = nil end
-      local fire = false
-      if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 3) then
+      local fire, deg = false, a
+      if drift and now - w.driftSince >= 0.6 and (not w.cmdT or now - w.cmdT >= 4) then
         fire, right = true, xp < 0
+        if (ge > 0) ~= right or a < 5 then
+          -- Kursfehler zeigt nicht zur Linie zurueck: Winkel, mit dem man von der Linie wegdriftet
+          local gs = math.max(w.gsF or 10, 5)
+          deg = math.deg(math.asin(clamp((math.abs(xp) - math.abs(xt)) / (gs * PRED_S), 0, 1)))
+        end
       end
-      if a >= w.cmdMin then
+      if a >= w.cmdMin and not closing and not g.qlState then
         w.errSince = w.errSince or now
-        local changed = not w.cmdErr or math.abs(g.err - w.cmdErr) >= 10
-        if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 3)) then fire = true end
+        local changed = not w.cmdErr or math.abs(ge - w.cmdErr) >= 10
+        if not fire and now - w.errSince >= 2 and (not w.cmdT or now - w.cmdT >= w.cmdGap or (changed and now - w.cmdT >= 4)) then fire = true end
       else
         w.errSince = nil
       end
       if fire then
-        w.cmdT, w.cmdErr = now, g.err
-        w.cmdTones = {t = now, f = right and {1500, 2200} or {2200, 1500}}
-        w.quietUntil = now + 0.6
+        w.cmdT, w.cmdErr = now, ge
+        deg = math.max(5, math.floor(deg / 5 + 0.5) * 5)
+        if audioFile(right and "rechts.wav" or "links.wav") then
+          sayNumber(w, P_GLIDE, deg, UNIT_RAW, 0)
+          sayWord(w, P_GLIDE, right and "rechts.wav" or "links.wav")
+          w.quietUntil = now + 2
+        else
+          w.cmdTones = {t = now, f = right and {1500, 2200} or {2200, 1500}}
+          w.quietUntil = now + 0.6
+        end
+        return
       end
     end
   end
@@ -1994,20 +2250,75 @@ local function thermCalc(w, f, now, dt)
   end
 end
 
-local function thermTones(w, now)
-  if not w.varioTone or w.vFast == nil then return end
-  if w.varTT and now < w.varTT then return end
-  local v = w.vFast
-  if v > 0.2 then
-    local f = 600 + clamp(v, 0, 6) * 160
-    local period = clamp(0.55 - v * 0.07, 0.12, 0.55)
-    tone(w, P_THERM, f, period * 450)
-    w.varTT = now + period
-  elseif v < -1.5 then
-    tone(w, P_THERM, 300, 300)
-    w.varTT = now + 0.9
+-- Varioton des Widgets, Tonkurve wie XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
+-- Steigen: 500 Hz bei 0 bis 1500 Hz bei +5 m/s, Periode 600 ms bei 0 bis 150 ms bei +5 m/s, davon 2/3 Ton und
+-- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
+-- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
+-- Wann: auf der Seite Thermik immer; beim Kreisen auf allen Seiten (auch Start); auf der Seite Gleiten (mit
+-- Eckansicht) ersetzt er den Sollfahrt-Ton, solange das Netto-Steigen ueber dem eingestellten MC liegt (nicht mit
+-- MC ZEIT, das ist der Endanflug). Der Sollfahrt-Ton selbst bleibt unveraendert. Laeuft ueber tone(), darum gilt
+-- der Vorrang der Wendevorhersage. In BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist.
+BAL.VT = {}
+
+function BAL.VT.mode(w, now, dt)
+  if w.varioRaw ~= nil then w.vtV = lpf(w.vtV, w.varioRaw, dt, 0.3) end
+  -- Kreisen: Drehrate > 12 Grad/s und mehr als 200 Grad gedreht (mehr als eine Wende an der Ecke);
+  -- vorbei nach 2 s geradeaus
+  if (w.omega or 0) > math.rad(12) then
+    w.vtStr = nil
+    if not w.vtC0 then w.vtC0, w.vtTurn0 = now, w.turnSum or 0 end
+    if math.abs((w.turnSum or 0) - w.vtTurn0) >= 200 then w.vtCirc = true end
   else
-    w.varTT = now + 0.2
+    w.vtStr = w.vtStr or now
+    if now - w.vtStr > 2 then w.vtC0, w.vtCirc = nil, false end
+  end
+  -- Netto fuer die Umschaltung: TE plus Eigensinken aus der Polare, 1 s geglaettet (das Netto der Sollfahrt mit
+  -- 8 s ist fuer einen Bart, den man in 2 bis 3 s durchfliegt, zu traege). Rein bei Netto > MC + 0.1 fuer 0.5 s,
+  -- raus bei Netto < MC - 0.3 fuer 2 s. Mit MC ZEIT nie.
+  local p = w.polar
+  if p and w.varioRaw ~= nil and w.tasN and w.tasN * KMH > 15 then
+    w.vtNet = lpf(w.vtNet, w.varioRaw + polarSink(p, w.tasN), dt, 1)
+  else
+    w.vtNet = nil
+  end
+  local mc = w.mcValue or 0
+  if w.vtNet and (w.rzMan or w.rzOn == false) then
+    if w.vtTh then
+      if w.vtNet < mc - 0.3 then
+        w.vtOut = w.vtOut or now
+        if now - w.vtOut >= 2 then w.vtTh, w.vtOut = false, nil end
+      else w.vtOut = nil end
+    elseif w.vtNet > mc + 0.1 then
+      w.vtIn = w.vtIn or now
+      if now - w.vtIn >= 0.5 then w.vtTh, w.vtIn = true, nil end
+    else w.vtIn = nil end
+  else
+    w.vtTh, w.vtIn, w.vtOut = false, nil, nil
+  end
+  local pg = w.page
+  w.vtOn = w.varioTone and w.vtV ~= nil and (pg == P_THERM or w.vtCirc or (pg == P_GLIDE and w.vtTh)) or false
+end
+
+function BAL.VT.play(w, now)
+  local v = w.vtV
+  if not w.vtOn or v == nil then w.vtNext, w.vtEnd = nil, nil; return end
+  if w.quietUntil and now < w.quietUntil then return end      -- kurz nach Ereignistoenen (Sektor, Start ...)
+  local iv = clamp(v * 100, -500, 500)                        -- cm/s wie XCSoar
+  if iv >= -(w.vzLo or 3) * 10 and iv <= (w.vzHi or 1) * 10 then w.vtNext, w.vtEnd = nil, nil; return end
+  local busy = w.vtEnd or 0                                   -- bis dann klingt der zuletzt bestellte Ton
+  if iv > 0 then
+    if now < busy or (w.vtNext and now < w.vtNext) then return end
+    local per = 150 + (500 - iv) * 450 / 500                  -- ms
+    local on = per - math.floor(per / 3)
+    tone(w, w.page, 500 + iv * 1000 / 500, on)
+    -- Takt aus der geplanten Zeit (nicht aus "jetzt"), damit der Rhythmus im 50-ms-Raster von wakeup nicht driftet
+    local base = (w.vtNext and now - w.vtNext < 0.1) and w.vtNext or now
+    w.vtNext, w.vtEnd = base + per / 1000, now + on / 1000
+  else
+    -- durchgehender Ton: Stuecke von 250 ms, das naechste kurz vor dem Ende des laufenden bestellt
+    if now < busy - 0.08 then return end
+    tone(w, w.page, 500 + iv * 300 / 500, 250)
+    w.vtNext, w.vtEnd = nil, math.max(now, busy) + 0.25
   end
 end
 
@@ -2354,6 +2665,11 @@ local function wakeup(w)
   w.armOn, w.armInit = arm, true
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
+  BAL.QL.read(w, now, dt)
+  if w.qlPress and now - w.qlPress >= 2 then
+    w.qlPress = nil
+    if BAL.QL.zero(w) then tone(w, nil, 2000, 150); note(w, "Querlage genullt", now) end
+  end
   local f = readInputs(w, now, dt)
   if f then
     if w.armPending then
@@ -2396,16 +2712,25 @@ local function wakeup(w)
   -- ideale Runde (blau, vor dem Start) hier rechnen statt beim Zeichnen: eigene Instruktions-Portion
   if w.task and (pg == P_OVER or pg == P_START) and w.state ~= S_STARTED and w.state ~= S_STOPPED then lapRoute(w, w.task) end
   if redo then
-    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START)
+    -- Den ganzen Weg auch auf den anderen Seiten (und bei verstecktem Widget) rechnen, sobald eine Ecke naht:
+    -- der Wendeton kommt auf jeder Seite
+    local gc = w.gc
+    local near = w.state == S_STARTED and gc and gc.tCorner and gc.tCorner < w.zoomSec + w.warnSec + 8
+    w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START or near)
   end
   thermCalc(w, cur, now, dt)
 
-  -- Ereignistoene (nur auf der passenden Seite, ausser "Ereignisse immer melden")
-  if w.lastEvent and w.lastEventT == now then
-    local e = w.lastEvent
+  -- Ereignistoene. Start, Sektor und Ziel (Linie bzw. Sektor erreicht) immer, auf jeder Seite und auch bei
+  -- verstecktem Widget; Scharf (PEV) und Stopp nur auf der passenden Seite, ausser "Ereignisse immer melden".
+  -- In der Vorrangzeit der Wendevorhersage warten sie und kommen danach.
+  local prio = w.prioUntil and now < w.prioUntil
+  local e = w.lastEvent and w.lastEventT == now and w.lastEvent or nil
+  if e and prio then w.evDefer, e = e, nil
+  elseif not e and not prio and w.evDefer then e = w.evDefer end
+  if e then
+    w.evDefer = nil
     local pg = (e == "STA" or e == "PEV") and P_START or P_GLIDE
-    -- Sektor-Bestaetigung (TPC) auch auf der Uebersicht
-    if w.eventsAlways or w.page == pg or (e == "STA" and w.page == P_GLIDE) or (e == "TPC" and w.page == P_OVER) then
+    if w.eventsAlways or w.page == pg or e == "STA" or e == "TPC" or e == "FIN" then
       if e == "PEV" then tone(w, nil, 800, 120); tone(w, nil, 1000, 120)
       elseif e == "STA" then tone(w, nil, 1000, 150); tone(w, nil, 1400, 250)
         if w.penalty > 0 then sayNumber(w, nil, w.penalty, UNIT_RAW, 0) end
@@ -2417,13 +2742,19 @@ local function wakeup(w)
       w.quietUntil = now + 1.5
     end
   end
-  if w.zoneEnterT == now then tone(w, nil, 500, 600) end
+  if w.zoneEnterT == now then w.zoneDefer = true end
+  if w.zoneDefer and not prio then w.zoneDefer = nil; tone(w, nil, 500, 600) end
 
-  if cur then
-    if w.page == P_START then startTones(w, w.sc, now)
-    elseif w.page == P_GLIDE then glideTones(w, w.gc, now)
-    elseif w.page == P_OVER then turnTone(w, w.gc or {}, now, P_OVER)
-    elseif w.page == P_THERM then thermTones(w, now) end
+  BAL.VT.mode(w, now, dt)
+  local warn = cur and turnTone(w, w.gc or {}, now)           -- Wendeton auf jeder Seite
+  warn = warn or (w.prioUntil and now < w.prioUntil)          -- Vorrang: keine Seitentoene
+  if w.vtOn then
+    -- Varioton ersetzt Sollfahrt-, Start- und Kurs-Toene (Thermik-Seite, Kreisen, Gleiten mit Netto > MC)
+    w.cmdTones = nil
+    if not warn then BAL.VT.play(w, now) end
+  elseif cur then
+    if w.page == P_START then if not warn then startTones(w, w.sc, now) end
+    elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn) end
   end
 
   if now - w.lastInvalidate >= 0.15 then
@@ -3294,6 +3625,15 @@ local function paintStart(w, W, H, top)
     lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
     drawT(rx, yy + 4, rw, txt, bf, C_ORANGE, "c")
+    yy = yy + w.armBox.h + 6
+  end
+  -- Querlage nullen: nur am Boden (steht), Fluegel waagrecht halten, 2 s auf das Feld druecken
+  if w.qlRaw and not w.flying and (not f or (f.gs or 0) < 2) and w.state ~= S_STARTED then
+    local h = textH(FONT_S) + 8
+    w.qlBox = {x = rx, y = yy, w = rw, h = h}
+    lcd.color(w.qlPress and rgb(0, 70, 30) or rgb(40, 40, 40))
+    rect(rx, yy, rw, h)
+    drawT(rx, yy + 4, rw, string.format("QL %+.0f°  (2 s drücken = nullen)", w.qlPhi or 0), FONT_S, C_WHITE, "c")
   end
 end
 
@@ -3395,6 +3735,28 @@ local function stfBar(w, x0, y0, bw, bh)
   line(x0 - 3, mid, x0 + bw + 2, mid)
 end
 
+-- Flugzeug von hinten, um die Querlage gekippt, daneben die Gradzahl (grau, wenn der Sensor nicht passt)
+function BAL.QL.draw(w, px, py, k, side)
+  local phi = clamp(w.qlPhi, -80, 80)
+  if w.qlBad then lcd.color(C_DIM) end
+  local c, s = math.cos(math.rad(phi)), math.sin(math.rad(phi))
+  local L, t = 36 * k, 2.5 * k                                  -- halbe Spannweite, halbe Strichdicke
+  local ax, ay, bx, by = px - L * c, py - L * s, px + L * c, py + L * s
+  local nx, ny = -s * t, c * t
+  tri(ax + nx, ay + ny, bx + nx, by + ny, bx - nx, by - ny)
+  tri(ax + nx, ay + ny, bx - nx, by - ny, ax - nx, ay - ny)
+  lcd.drawFilledCircle(math.floor(px), math.floor(py), math.max(2, math.floor(7.5 * k)))
+  local fx, fy = px + 17 * k * s, py - 17 * k * c                -- Seitenleitwerk steht senkrecht zum Fluegel
+  local tx, ty = c * 2 * k, s * 2 * k
+  tri(px + tx, py + ty, px - tx, py - ty, fx, fy)
+  tri(px + tx, py + ty, fx, fy, fx + tx, fy + ty)
+  local a = math.floor(math.abs(w.qlPhi) + 0.5)
+  local txt = a < 1 and "0°" or string.format("%d° %s", a, w.qlPhi > 0 and "R" or "L")
+  local tw = 120
+  if side > 0 then drawT(px + 44 * k, py + 8 * k, tw, txt, FONT_S, w.qlBad and C_DIM or C_WHITE, "l")
+  else drawT(px - 44 * k - tw, py + 8 * k, tw, txt, FONT_S, w.qlBad and C_DIM or C_WHITE, "r") end
+end
+
 local function paintGlide(w, W, H, top)
   local T, f, g = w.task, w.cur, w.gc or {}
   local m = 6
@@ -3482,11 +3844,13 @@ local function paintGlide(w, W, H, top)
   local cx0, cw = nx + hb + 6, nw - hb - 6
   local ccx = cx0 + cw / 2
   -- Kommando gross; Rechts steht links der Mitte, Links rechts davon: > und < zeigen auf die Mitte
-  local err = g.err or 0
+  local err = g.rest or g.err or 0
   local a = math.abs(err)
   local cmd, col, side
   if g.plan.turnDir then cmd, col, side = g.plan.turnDir > 0 and "< KURVE LINKS" or "KURVE RECHTS >", C_ORANGE, g.plan.turnDir > 0 and 1 or -1
   elseif g.plan.inTurn then cmd, col, side = "KURVE", C_BLUE, 0
+  elseif g.qlState == "hold" then cmd, col, side = "QUERLAGE HALTEN", C_GREEN, 0
+  elseif g.qlState == "out" then cmd, col, side = "AUSLEITEN", C_BLUE, 0
   elseif a < 5 then cmd, col, side = "KURS OK", C_GREEN, 0
   elseif err > 0 then cmd, col, side = string.format("%d° RECHTS >", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, -1
   else cmd, col, side = string.format("< %d° LINKS", math.floor(a + 0.5)), a >= w.cmdMin and C_ORANGE or C_WHITE, 1 end
@@ -3543,7 +3907,8 @@ local function paintGlide(w, W, H, top)
     -- Flugzeug (Dreieck) bei der aktuellen Ablage, zwischen Balken und Seitenwindpfeil
     local ppx = ccx + clamp(xt / rng, -1, 1) * half
     lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
-    tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k)
+    if w.qlPhi then BAL.QL.draw(w, ppx, yy + 62 * k, k, ppx > ccx and -1 or 1)
+    else tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k) end
   end
   -- Seitenwind unten: Pfeil vom Rand her, von links nach rechts bei Wind von links und umgekehrt
   local cr = g.cross
@@ -4018,7 +4383,7 @@ local function paint(w)
   rect(0, 0, W, H)
   local top = header(w, W)
   H = tabBar(w, W, H)
-  w.armBox, w.resetBox, w.mcBox = nil, nil, nil
+  w.armBox, w.resetBox, w.mcBox, w.qlBox = nil, nil, nil, nil
   if w.page == P_OVER then paintOver(w, W, H, top)
   elseif w.page == P_START then paintStart(w, W, H, top)
   elseif w.page == P_GLIDE then paintGlide(w, W, H, top)
@@ -4034,11 +4399,22 @@ local function inside(b, x, y)
 end
 
 local function eventHandler(w, category, value, x, y)
+  if w.qlPress and EVT_TOUCH and category == EVT_TOUCH and TOUCH_END and value == TOUCH_END then w.qlPress = nil; lcd.invalidate() end
   if EVT_TOUCH and category == EVT_TOUCH and (TOUCH_START == nil or value == TOUCH_START) then
     if inside(w.hdrBox, x, y) then
       local tabW = w.hdrBox.w / #PAGE_NAMES
       local p = clamp(math.floor(x / tabW) + 1, 1, #PAGE_NAMES)
       w.manual, w.manualFrom, w.page = p, w.autoTarget, p
+      lcd.invalidate(); return true
+    end
+    if inside(w.qlBox, x, y) then
+      if TOUCH_END == nil then
+        -- ohne Loslassen-Ereignis: zweimal tippen innert 3 s
+        local now = os.clock()
+        if w.qlTap and now - w.qlTap < 3 then w.qlTap = nil; w.qlPress = now - 2 else w.qlTap = now end
+      else
+        w.qlPress = os.clock()
+      end
       lcd.invalidate(); return true
     end
     if inside(w.armBox, x, y) and w.task then
@@ -4128,6 +4504,15 @@ local function configure(w)
   addBool(w, "Gleiten: Kurs-Ticker (Klicks bei wachsender Ablage)", "ticker")
   addSource(w, "MC-Quelle (optional)", "mcSrc")
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
+  addSource(w, "Querlage (optional, Rollwinkel Grad)", "bankSrc")
+  addBool(w, "Querlage: Richtung umkehren", "bankInv")
+  l = form.addLine("Querlage nullen (Flügel waagrecht)")
+  if form.addTextButton then
+    form.addTextButton(l, nil, "Jetzt nullen", function()
+      if BAL.QL.zero(w) then note(w, "Querlage genullt", os.clock()) end
+      return true
+    end)
+  end
   local bf = addNumber(w, "Ballast maximal (ohne Quelle: fix)", "balMax", 0, 200)
   if bf then pcall(bf.decimals, bf, 1); pcall(bf.suffix, bf, " kg") end
   addNumber(w, "Übersicht: Spur der letzten x min (0 = aus)", "trackMin", 0, 5)
@@ -4148,6 +4533,7 @@ local function setDefaults(w)
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
   w.balSrc, w.balMax = nil, 0
   w.ticker = true
+  w.bankSrc, w.bankInv = nil, false
 end
 
 local function read(w)
@@ -4160,6 +4546,8 @@ local function read(w)
     w.balSrc = validSource(storage.read("balSrc"))
     local v = storage.read("balMax"); w.balMax = type(v) == "number" and v or 0
     v = storage.read("ticker"); w.ticker = v ~= false   -- steht zuletzt: aeltere Konfigurationen behalten ihre Reihenfolge
+    w.bankSrc = validSource(storage.read("bankSrc"))   -- Querlage: nach dem Ticker angehaengt
+    w.bankInv = storage.read("bankInv") == true
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4174,6 +4562,8 @@ local function write(w)
   storage.write("balSrc", w.balSrc)
   storage.write("balMax", w.balMax)
   storage.write("ticker", w.ticker ~= false)
+  storage.write("bankSrc", w.bankSrc)
+  storage.write("bankInv", w.bankInv == true)
 end
 
 local function init()
