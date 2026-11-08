@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.13
+-- @version 1.14
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.13"
+local VERSION = "1.14"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3775,6 +3775,15 @@ local function paintCorner(w, g, x0, y0, bw, bh)
     drawT(x0 + 4, y0 + 2 + textH(FONT_STD), bw, g.plan.turnDir > 0 and "VERPASST: < LINKS WENDEN" or "VERPASST: RECHTS WENDEN >", FONT_STD, C_ORANGE, "l")
   end
   drawT(x0, y0 + bh - textH(FONT_XS) - 2, bw - 4, string.format("%d m Raster", math.floor(span)), FONT_XS, C_DIM, "r")
+  -- Querlage unten links, bei jeder Ecke gleich (Christoph 2026-11-08), auf dunklem Kasten, ohne Gradzahl
+  if w.qlPhi then
+    local k = SMALL and 0.6 or 1
+    local bx, by = x0 + 6, y0 + bh - 6 - 64 * k
+    lcd.color(rgb(10, 10, 10))
+    rect(bx, by, 96 * k, 64 * k)
+    lcd.color(C_WHITE)
+    BAL.QL.draw(w, bx + 48 * k, by + 36 * k, k, 0)
+  end
 end
 
 -- Sollfahrt-Balken (Mitte = Soll), wie im Widget Sollfahrt
@@ -3814,6 +3823,7 @@ function BAL.QL.draw(w, px, py, k, side)
   local tx, ty = c * 2 * k, s * 2 * k
   tri(px + tx, py + ty, px - tx, py - ty, fx, fy)
   tri(px + tx, py + ty, fx, fy, fx + tx, fy + ty)
+  if side == 0 then return end                                  -- ohne Gradzahl (Eckansicht)
   local a = math.floor(math.abs(w.qlPhi) + 0.5)
   local txt = a < 1 and "0°" or string.format("%d° %s", a, w.qlPhi > 0 and "R" or "L")
   local tw = 120
