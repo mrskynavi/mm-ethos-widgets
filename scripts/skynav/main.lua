@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.16
+-- @version 1.17
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.16"
+local VERSION = "1.17"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1108,7 +1108,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3}, vDamp = {0, 20},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3}, vDamp = {0, 20}, vtRange = {3, 20},
 }
 
 local function applyAppSettings(w, st)
@@ -1143,7 +1143,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -2415,13 +2415,14 @@ function BAL.VT.play(w, now)
   local v = w.vtV
   if not w.vtOn or v == nil then w.vtNext, w.vtEnd = nil, nil; return end
   if w.quietUntil and now < w.quietUntil then return end      -- kurz nach Ereignistoenen (Sektor, Start ...)
-  local iv = clamp(v * 100, -500, 500)                        -- cm/s wie XCSoar
+  local rg = w.vtRange or 10                                  -- Tonbereich (App vtRange, m/s): bei rg klingt der Ton wie
+  local iv = clamp(v * 100, -rg * 100, rg * 100)              -- die Kurven bei 5 m/s (Steigen und Sinken gestreckt)
   if iv >= -(w.vzLo or 3) * 10 and iv <= (w.vzHi or 1) * 10 then w.vtNext, w.vtEnd = nil, nil; return end
   local busy = w.vtEnd or 0                                   -- bis dann klingt der zuletzt bestellte Ton
   local st = w.vtStyle or 1
   if iv > 0 then
     if now < busy or (w.vtNext and now < w.vtNext) then return end
-    local f, per, on = BAL.VT.climb(st, iv / 100)
+    local f, per, on = BAL.VT.climb(st, iv / 20 / rg)
     tone(w, w.page, f, on)
     -- Takt aus der geplanten Zeit (nicht aus "jetzt"), damit der Rhythmus im 50-ms-Raster von wakeup nicht driftet
     local base = (w.vtNext and now - w.vtNext < 0.1) and w.vtNext or now
@@ -2429,7 +2430,7 @@ function BAL.VT.play(w, now)
   else
     -- durchgehender Ton: Stuecke von 250 ms, das naechste kurz vor dem Ende des laufenden bestellt
     if now < busy - 0.08 then return end
-    tone(w, w.page, BAL.VT.sink(st, iv / 100), 250)
+    tone(w, w.page, BAL.VT.sink(st, iv / 20 / rg), 250)
     w.vtNext, w.vtEnd = nil, math.max(now, busy) + 0.25
   end
 end
