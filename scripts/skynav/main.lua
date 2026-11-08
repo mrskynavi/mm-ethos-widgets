@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.10.1
+-- @version 1.11
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.9.1"
+local VERSION = "1.11"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1071,6 +1071,16 @@ local BAL = {}
 -- zeigt nur die Restkorrektur. Ohne Sensor gilt die Drehrate aus dem GPS-Kurs (traeger, tau hoechstens 1 s).
 BAL.QL = {}
 
+-- Durchgehender tiefer Ton (Sinkton, Sollfahrt zu schnell, Einflug zu hoch): Stuecke von 250 ms, das naechste
+-- wird 80 ms vor dem Ende des laufenden bestellt. endKey = Feld in w mit dem Ende des zuletzt bestellten Stuecks.
+-- Liefert die Zeit fuer die naechste Bestellung.
+function BAL.hold(w, page, f, now, endKey)
+  local e = math.max(now, w[endKey] or 0) + 0.25
+  tone(w, page, f, 250)
+  w[endKey] = e
+  return e - 0.08
+end
+
 -- Kompensiertes Vario (Vario-Art "barometrisch"): TE = Vario + d(TAS^2 / 2g)/dt. Die Fahrt kommt pro GPS-Fix
 -- (GPS plus Wind, ohne Wind die Fahrt ueber Grund); die Aenderung der Energiehoehe ueber rund 1 s, auf +-4 m/s
 -- begrenzt und 0.5 s geglaettet (wie die App, aber nur rueckwaerts gerechnet). Am Boden (unter 5 m/s) keine.
@@ -1655,9 +1665,9 @@ local function startTones(w, c, now)
     tone(w, P_START, 900 + x * 15, 70)
     w.startBeepT = now + math.max(0.12, 0.5 - x * 0.007)
   else
+    -- tiefer Ton durchgehend (wie der Sinkton des Varios)
     local x = clamp(math.abs(e) - half, 0, 60)
-    tone(w, P_START, math.max(250, 450 - x * 3), 220)
-    w.startBeepT = now + math.max(0.3, 0.6 - x * 0.004)
+    w.startBeepT = BAL.hold(w, P_START, math.max(250, 450 - x * 3), now, "startLowEnd")
   end
 end
 
@@ -2201,10 +2211,9 @@ local function glideTones(w, g, now, warn)
         tone(w, P_GLIDE, 850 + excess * 20, len)
         w.stfBeepT, w.stfEnd = now + period, now + len / 1000
       else
-        local period = math.max(0.30, 0.50 - excess * 0.01)
-        local len = clamp(period * 600, 180, 300)
-        tone(w, P_GLIDE, math.max(220, 400 - excess * 8), len)
-        w.stfBeepT, w.stfEnd = now + period, now + len / 1000
+        -- zu schnell: tiefer Ton durchgehend (wie der Sinkton des Varios)
+        w.stfBeepT = BAL.hold(w, P_GLIDE, math.max(220, 400 - excess * 8), now, "stfLowEnd")
+        w.stfEnd = w.stfLowEnd
       end
       return
     end
