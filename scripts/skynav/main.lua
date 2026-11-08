@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.14
+-- @version 1.15
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.14"
+local VERSION = "1.15"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1852,6 +1852,15 @@ function BAL.QL.zero(w)
   return true
 end
 
+-- Drehrate (rad/s, rechts +) aus der Querlage; ohne brauchbaren Sensor aus dem GPS-Kurs, sonst 0
+function BAL.QL.omega(w, f)
+  if w.qlPhi and not w.qlBad then
+    local phi = math.abs(w.qlPhi) < 3 and 0 or clamp(w.qlPhi, -60, 60)
+    return 9.81 * math.tan(math.rad(phi)) / math.max(w.tasF or f.tas or 15, 8)
+  end
+  return w.omS or 0
+end
+
 -- Restkorrektur und gebogene Ablage-Vorhersage. g.rest = Kursfehler nach der Drehung in tau s,
 -- g.qlState = "hold" (Querlage reicht), "out" (zu viel: ausleiten) oder nil
 function BAL.QL.apply(w, g, f)
@@ -2946,18 +2955,29 @@ local function planeFlat(T, px, py, crs, s, color)
 end
 
 -- Vektor vor dem Flugzeug: wo es mit Kurs und Tempo ueber Grund in PRED_S s ist (Punkt jede Sekunde)
-local function predFlat(P, f, color)
+local function predFlat(P, f, color, w)
   if not (f and f.ve and f.vn) then return end
-  local ax, ay = P(f.x, f.y)
-  local bx, by = P(f.x + f.ve * PRED_S, f.y + f.vn * PRED_S)
+  -- Weg in PRED_S s mit der jetzigen Querlage (Drehrate konstant): Luftvektor drehen, Wind dazu.
+  -- Ohne Querlage geradeaus wie bisher.
+  local om = w and BAL.QL.omega(w, f) or 0
+  local wx, wy = 0, 0
+  if w and w.windOk then wx, wy = w.wx, w.wy end
+  local ae, an = f.ve - wx, f.vn - wy
+  local x, y = f.x, f.y
+  local ax, ay = P(x, y)
   lcd.color(color)
-  line(ax, ay, bx, by)
-  line(ax + 1, ay, bx + 1, by)
-  for k = 1, PRED_S - 1 do
-    local kx, ky = ax + (bx - ax) * k / PRED_S, ay + (by - ay) * k / PRED_S
-    rect(math.floor(kx) - 1, math.floor(ky) - 1, 3, 3)
+  local N, dt = PRED_S * 2, 0.5
+  for k = 1, N do
+    local a = om * (k - 0.5) * dt                                   -- Kurs in der Mitte des Schritts
+    local c, sn = math.cos(a), math.sin(a)
+    x, y = x + ((ae * c + an * sn) + wx) * dt, y + ((-ae * sn + an * c) + wy) * dt
+    local bx, by = P(x, y)
+    line(ax, ay, bx, by)
+    line(ax + 1, ay, bx + 1, by)
+    if k % 2 == 0 and k < N then rect(math.floor(bx) - 1, math.floor(by) - 1, 3, 3) end
+    ax, ay = bx, by
   end
-  disc(bx, by, 5)
+  disc(ax, ay, 5)
 end
 
 -- Windpfeil (wohin er blaest) mit Staerke links daneben, im Kartenbild
@@ -3407,7 +3427,7 @@ local function paintOver(w, W, H, top)
     local px, py = P(f.x, f.y)
     px, py = clamp(px, mx0 + 6, mx0 + mw - 6), clamp(py, y + 6, y + mh - 6)
     local fx, fy = P(f.x, f.y)
-    predFlat(function(x, yv) local qx, qy = P(x, yv); return qx + px - fx, qy + py - fy end, f, C_ORANGE)
+    predFlat(function(x, yv) local qx, qy = P(x, yv); return qx + px - fx, qy + py - fy end, f, C_ORANGE, w)
     planeFlat(T, px, py, f.crs, 8, C_WHITE)
     if px ~= fx or py ~= fy then
       local gx, gy = 0, 0
@@ -3764,7 +3784,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   lcd.color(C_YELLOW)
   if inClip(vx, vy) then disc(vx, vy, 4) end
   local ax, ay = P(f.x, f.y)
-  if inClip(ax, ay) then predFlat(P, f, C_ORANGE); planeFlat(T, ax, ay, f.crs, 8, C_WHITE)
+  if inClip(ax, ay) then predFlat(P, f, C_ORANGE, w); planeFlat(T, ax, ay, f.crs, 8, C_WHITE)
   else planeFlat(T, clamp(ax, x0 + 8, x0 + bw - 8), clamp(ay, y0 + 8, y0 + bh - 8), f.crs, 8, C_WHITE) end
   CLIP = nil
   -- Wind: Pfeil (wohin er blaest), Staerke daneben
