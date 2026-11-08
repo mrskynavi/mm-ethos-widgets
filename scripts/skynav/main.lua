@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.9
+-- @version 1.9.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.9"
+local VERSION = "1.9.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2629,8 +2629,11 @@ end
 -- ---------------------------------------------------------------- wakeup
 
 -- Scharf stellen oder, nach einem misslungenen Start (gestartet, noch keine Runde fertig), neu starten
-local function armOrRestart(w, now)
+-- viaSw = "up" (Schalter eingeschaltet) oder "down" (ausgeschaltet); nil = Tippen.
+local function armOrRestart(w, now, viaSw)
   if not w.task then return end
+  -- Ausschalten zaehlt nur als zweite Betaetigung beim Bestaetigen eines neuen Wertungsflugs
+  if viaSw == "down" and not (w.state == S_STARTED and #w.laps > 0) then return end
   if w.state == S_IDLE then
     w.state, w.armedAt, w.armPending = S_ARMED, now, true
   elseif w.state == S_STARTED and #w.laps == 0 then
@@ -2641,15 +2644,16 @@ local function armOrRestart(w, now)
     note(w, "Neustart: wieder scharf", now)
   elseif w.state == S_STOPPED or w.state == S_STARTED then
     -- Neuer Wertungsflug in der Luft (z. B. nach Motorsteigflug): bei fertigen Runden erst nach
-    -- zweiter Betaetigung innert 4 s. Das IGC des alten Versuchs wird geschlossen, ein neues beginnt.
-    if w.state == S_STARTED and not (w.rsArm and now - w.rsArm < 4) then
-      w.rsArm = now
+    -- zweiter Betaetigung (Tippen innert 4 s, Schalter: zwei Umschaltungen in beliebiger Richtung innert 3 s,
+    -- also ein-aus oder aus-ein). Das IGC des alten Versuchs wird geschlossen, ein neues beginnt.
+    if w.state == S_STARTED and not (w.rsArm and now - w.rsArm < (w.rsWin or 4)) then
+      w.rsArm, w.rsWin = now, viaSw and 3 or 4
       note(w, "Nochmal = neuer Wertungsflug", now)
       return
     end
     local fl, tk = w.flying, w.takeoffT
     resetFlight(w)
-    w.flying, w.takeoffT, w.rsArm = fl, tk, nil
+    w.flying, w.takeoffT, w.rsArm, w.rsWin = fl, tk, nil, nil
     w.state, w.armedAt, w.armPending = S_ARMED, now, true
     w.restarts = (w.restarts or 0) + 1
     note(w, "Neuer Wertungsflug: scharf", now)
@@ -2679,10 +2683,11 @@ local function wakeup(w)
     w.rzMan = not (v and v >= 1004)
   end
   -- ARM
-  -- Jede Betaetigung (Flanke) stellt scharf, nach einem misslungenen Start startet sie neu. Taster und
-  -- Kippschalter gehen beide; zurueckschalten tut nichts.
+  -- Jede Betaetigung (Einschalten) stellt scharf, nach einem misslungenen Start startet sie neu. Taster und
+  -- Kippschalter gehen beide. Nach fertigen Runden braucht ein neuer Wertungsflug zwei Umschaltungen; dort
+  -- zaehlt auch das Ausschalten, damit "2x schalten" mit einem Kippschalter aus jeder Stellung klappt.
   local arm = (readNumber(w.armSw) or -1) > 0
-  if arm and not w.armOn and w.armInit then armOrRestart(w, now) end
+  if w.armInit and arm ~= w.armOn then armOrRestart(w, now, arm and "up" or "down") end
   w.armOn, w.armInit = arm, true
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
@@ -3640,7 +3645,7 @@ local function paintStart(w, W, H, top)
     local bf = (canRestart and w.badEntry) and F_L or FONT_STD
     local txt = canRestart and "NEUSTART (tippen)" or "SCHARF (tippen)"
     if canRestart and #w.laps > 0 then
-      txt = (w.rsArm and os.clock() - w.rsArm < 4) and "NOCHMAL = NEUER FLUG" or "NEUSTART (2x tippen)"
+      txt = (w.rsArm and os.clock() - w.rsArm < (w.rsWin or 4)) and "NOCHMAL = NEUER FLUG" or "NEUSTART (2x tippen/schalten)"
     end
     w.armBox = {x = rx, y = yy, w = rw, h = textH(bf) + 8}
     lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
