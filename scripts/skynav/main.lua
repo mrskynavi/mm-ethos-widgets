@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.8
+-- @version 1.9
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -41,7 +41,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.8"
+local VERSION = "1.9"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1013,7 +1013,7 @@ local SOURCE_KEYS = {"gps", "gpsSpd", "gpsAlt", "relAlt", "vario", "swOver", "sw
 local NUM_DEFS = {
   {key = "taskIdx",   def = 0},     -- 0 = in der App als aktiv markierte Aufgabe
   {key = "altMode",   def = 1},     -- 1 = GPS minus Platzhoehe, 2 = relative Hoehe (Sensor)
-  {key = "varioType", def = 1},     -- 1 = TE, 2 = barometrisch
+  {key = "varioType", def = 1},     -- 1 = TE vom Sensor, 2 = barometrisch (Widget kompensiert mit der Fahrt, BAL.TE)
   {key = "radMode",   def = 1},     -- ungenutzt (Wenderadius wird pro Modell gelernt), Platz fuer die Storage-Reihenfolge
   {key = "radFix",    def = 30},    -- ungenutzt
   {key = "margin",    def = 5},     -- m Reserve im Sektor (Logger 12 Hz: 5 m reichen fuer sichere Treffer)
@@ -1069,7 +1069,24 @@ local BAL = {}
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
 -- zeigt nur die Restkorrektur. Ohne Sensor gilt die Drehrate aus dem GPS-Kurs (traeger, tau hoechstens 1 s).
-BAL.QL = {}                                                         -- in BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist
+BAL.QL = {}
+
+-- Kompensiertes Vario (Vario-Art "barometrisch"): TE = Vario + d(TAS^2 / 2g)/dt. Die Fahrt kommt pro GPS-Fix
+-- (GPS plus Wind, ohne Wind die Fahrt ueber Grund); die Aenderung der Energiehoehe ueber rund 1 s, auf +-4 m/s
+-- begrenzt und 0.5 s geglaettet (wie die App, aber nur rueckwaerts gerechnet). Am Boden (unter 5 m/s) keine.
+function BAL.TE(w, now, tas)
+  local h = w.teHist
+  if not h or (#h > 0 and now - h[#h].t > 3) then h = {}; w.teHist, w.teDE, w.teT = h, nil, nil end
+  if not tas or tas < 5 then w.teDE = 0; return end
+  h[#h + 1] = {t = now, e = tas * tas / (2 * G)}
+  while #h > 2 and now - h[2].t >= 1.0 do table.remove(h, 1) end
+  local a, b = h[1], h[#h]
+  if b.t - a.t >= 0.5 then
+    local de = clamp((b.e - a.e) / (b.t - a.t), -4, 4)
+    w.teDE = lpf(w.teDE, de, now - (w.teT or now), 0.5)
+    w.teT = now
+  end
+end                                                         -- in BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist
 
 -- Einstellungen aus der App (aufgaben.lua, Tabelle settings): Schluessel, Bereich. Am Sender stehen nur noch
 -- Aufgabe, Sensoren, Schalter und das Startfenster von Hand.
@@ -1282,8 +1299,11 @@ end
 local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
   local vario = readNumber(w.vario)
+  if vario ~= nil then w.vSlow2 = lpf(w.vSlow2, vario, dt, 2) end   -- Sensor wie er kommt (Vertikalgeschwindigkeit, 3D-Speed)
+  -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
+  if vario ~= nil and w.varioType == 2 then vario = vario + (w.teDE or 0) end
   w.varioRaw = vario
-  if vario ~= nil then w.vFast = lpf(w.vFast, vario, dt, 0.6); w.vSlow2 = lpf(w.vSlow2, vario, dt, 2) end
+  if vario ~= nil then w.vFast = lpf(w.vFast, vario, dt, 0.6) end
   if lat == nil then
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
     return nil
@@ -1360,6 +1380,7 @@ local function readInputs(w, now, dt)
     tas = math.sqrt(ax * ax + ay * ay)
     hdg = bearingOf(ax, ay)
   end
+  BAL.TE(w, now, tas)
   -- Drehrate -> Wenderadius
   if hdg and w.hdgPrev and dtFix > 0.05 then
     local dA = angDiff(hdg, w.hdgPrev)
@@ -4493,6 +4514,7 @@ local function configure(w)
   addSource(w, "Relative Höhe (optional)", "relAlt")
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addSource(w, "Vario", "vario")
+  addChoice(w, "Vario-Art", "varioType", {{"TE (Sensor kompensiert)", 1}, {"Barometrisch (Widget kompensiert)", 2}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
   addSwitch(w, "Schalter Seite Start", "swStart")
