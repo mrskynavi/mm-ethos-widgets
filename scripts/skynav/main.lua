@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.21
+-- @version 1.22
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.21"
+local VERSION = "1.22"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2786,7 +2786,11 @@ local function wakeup(w)
   if not validSource(w.mcSrc) then w.mcValue = w.mc / 10; w.rzMan = not w.rzTap else
     local v = readNumber(w.mcSrc)
     if v then w.mc = math.floor(clamp((v + 1024) / 2048, 0, 1) * w.mcMax + 0.5); w.mcValue = w.mc / 10 end
-    w.rzMan = not (v and v >= 1004)
+    -- Anschlag oben = MC ZEIT. Ab 97 % (v >= 962) ein, unter 94 % wieder aus: viele Potis erreichen nach der
+    -- Kalibrierung die 1024 nicht ganz (bis 1.21 brauchte es 99 %, darum liess sich MC ZEIT oft nicht waehlen).
+    if v then
+      if w.rzMan == false then w.rzMan = v < 901 else w.rzMan = v < 962 end
+    else w.rzMan = true end
   end
   -- ARM
   -- Jede Betaetigung (Einschalten) stellt scharf, nach einem misslungenen Start startet sie neu. Taster und
@@ -3922,10 +3926,13 @@ local function paintGlide(w, W, H, top)
   local tx, tw = m + barW + 8, lw - barW - 8
   local rz = w.rz
   local rzM = not w.rzMan and rz and rz.mcz
+  -- MC ZEIT gewaehlt (Poti oben oder Tippen), aber noch nicht gerechnet (vor dem Start, erste Sekunden):
+  -- trotzdem MC ZEIT zeigen, damit man die Wahl sieht
+  local rzSel = not w.rzMan and w.rzOn ~= false
   local leftVals = w.polar and {
     {"SOLL", w.vstf and string.format("%d", math.floor(w.vstf * KMH + 0.5)) or "--", C_WHITE},
     {"IST", w.tasF and string.format("%d", math.floor(w.tasF * KMH + 0.5)) or "--", (w.stfDv and math.abs(w.stfDv) <= w.dead) and C_GREEN or C_ORANGE},
-    rzM and {"MC ZEIT", string.format("%.1f", rzM), C_BLUE} or {"MC", string.format("%.1f", w.mcValue), C_WHITE},
+    rzSel and {"MC ZEIT", rzM and string.format("%.1f", rzM) or "--", C_BLUE} or {"MC", string.format("%.1f", w.mcValue), C_WHITE},
     {"NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE)},
   } or nil
   -- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen; alle gleich gross
@@ -4648,7 +4655,7 @@ local function eventHandler(w, category, value, x, y)
       armOrRestart(w, os.clock())
       lcd.invalidate(); return true
     end
-    if inside(w.mcBox, x, y) and w.rz and not validSource(w.mcSrc) then
+    if inside(w.mcBox, x, y) and not validSource(w.mcSrc) then
       w.rzTap = not w.rzTap
       lcd.invalidate(); return true
     end
