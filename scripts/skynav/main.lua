@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.19
+-- @version 1.20
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.19"
+local VERSION = "1.20"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1108,7 +1108,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 3}, vDamp = {0, 20}, vtRange = {3, 20},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20},
   thBest = true,
 }
 
@@ -2292,7 +2292,7 @@ local function thermCalc(w, f, now, dt)
   end
 end
 
--- Varioton des Widgets, Klang waehlbar (App vtStyle: XCSoar, OpenVario, XCVario, siehe BAL.VT.climb). Standard XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
+-- Varioton des Widgets, Klang waehlbar (App vtStyle: XCSoar, OpenVario, XCVario, Ethos/EdgeTX, siehe BAL.VT.climb). Standard XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
 -- Steigen: 500 Hz bei 0 bis 1500 Hz bei +5 m/s, Periode 600 ms bei 0 bis 150 ms bei +5 m/s, davon 2/3 Ton und
 -- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
 -- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
@@ -2393,8 +2393,15 @@ end
 -- 3 XCVario (ESPAudio.cpp, Standard: 500 Hz Mitte, 2 Oktaven, Bereich 5 m/s, Exponent 1, ein Ton mit Pausen):
 --   f = 500 + 500 * (1 + v/5) * v/5 (bis 1500 Hz), Sinken 500 - 125 * (1 + |v|/5) * |v|/5 (bis 250 Hz);
 --   Takt 1 + 9 v/5 pro s, Ton 90 % der Periode minus 40 ms, Pause 10 % plus 40 ms (Periode hier mind. 100 ms).
+-- 4 Ethos/EdgeTX (EdgeTX vario.cpp, Standardwerte Pitch zero 700 Hz, Pitch max 1700 Hz, Repeat 500 ms; Ethos ist
+--   nicht offen, hat aber dieselben Einstellungen): f = 700 + 1000 v/5, Periode 80 + 420 (1 - v/5)^2 ms (im
+--   50-ms-Takt von wakeup real mind. ~100 ms), nur 20 % Ton; Sinken 700 - 350 |v|/5 (bis 350 Hz).
 function BAL.VT.climb(st, v)
-  if st == 2 then
+  if st == 4 then
+    local x = v / 5
+    local per = 80 + 420 * (1 - x) ^ 2
+    return 700 + 1000 * x, per, math.max(20, per / 5)
+  elseif st == 2 then
     local per = v > 0.5 and 1088 / v or 2177
     return 350 + 120 * v, per, per * 0.51
   elseif st == 3 then
@@ -2409,6 +2416,7 @@ function BAL.VT.sink(st, v)
   local a = -v
   if st == 2 then return 350 / (1 + 0.85 * a) end
   if st == 3 then local x = a / 5; return 500 - 125 * (1 + x) * x end
+  if st == 4 then return 700 - 70 * a end
   return 500 - 60 * a
 end
 
