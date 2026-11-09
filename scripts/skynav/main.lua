@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.22
+-- @version 1.23
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.22"
+local VERSION = "1.23"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1138,7 +1138,7 @@ local function resetFlight(w)
   w.track, w.marks = {}, {}
   w.ref, w.tpT, w.tpPrev = nil, nil, nil
   w.therm = nil
-  w.rz, w.rzTap, w.rzPh = nil, nil, nil
+  w.rz, w.rzPh = nil, nil -- w.rzTap (MC ZEIT gewaehlt) bleibt: die Wahl des Piloten gilt weiter
   w.evalScroll = 0
   w.msg, w.msgT = nil, nil
 end
@@ -4670,7 +4670,12 @@ local function eventHandler(w, category, value, x, y)
     local dn = KEY_ROTARY_LEFT and value == KEY_ROTARY_LEFT
     if (up or dn) and w.page == P_EVAL then w.evalScroll = (w.evalScroll or 0) + (up and 1 or -1); lcd.invalidate(); return true end
     if (up or dn) and w.page == P_GLIDE and not validSource(w.mcSrc) then
-      w.mc = clamp(w.mc + (up and 1 or -1), 0, w.mcMax); w.mcValue = w.mc / 10; lcd.invalidate(); return true
+      -- Drehknopf: ueber das MC-Maximum hinaus nach rechts = MC ZEIT, von dort nach links zurueck auf das Maximum
+      if w.rzTap then
+        if dn then w.rzTap = false end
+      elseif up and w.mc >= w.mcMax and w.rzOn ~= false then w.rzTap = true
+      else w.mc = clamp(w.mc + (up and 1 or -1), 0, w.mcMax) end
+      w.mcValue = w.mc / 10; lcd.invalidate(); return true
     end
   end
   return false
