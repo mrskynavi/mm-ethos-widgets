@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.20
+-- @version 1.21
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.20"
+local VERSION = "1.21"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2349,6 +2349,9 @@ end
 
 function BAL.VT.mode(w, now, dt)
   w.vtV = BAL.VF(w, now, dt)
+  -- Klang 4 (Ethos/EdgeTX) wie am Sender: Sensorwert ungefiltert (Ethos filtert nicht, die Glaettung von BAL.VF
+  -- kostet rund 0.5 s). TE-Kompensation (Vario-Art barometrisch) bleibt. Christoph am Sender 9.11.2026.
+  if w.vtStyle == 4 and w.varioRaw ~= nil then w.vtV = w.varioRaw end
   -- Kreisen: Drehrate > 12 Grad/s und mehr als 200 Grad gedreht (mehr als eine Wende an der Ecke);
   -- vorbei nach 2 s geradeaus
   if (w.omega or 0) > math.rad(12) then
@@ -2437,10 +2440,12 @@ function BAL.VT.play(w, now)
     local base = (w.vtNext and now - w.vtNext < 0.1) and w.vtNext or now
     w.vtNext, w.vtEnd = base + per / 1000, now + on / 1000
   else
-    -- durchgehender Ton: Stuecke von 250 ms, das naechste kurz vor dem Ende des laufenden bestellt
+    -- durchgehender Ton: Stuecke von 250 ms (Klang 4: 150 ms, damit der Wechsel ins Steigen schneller kommt),
+    -- das naechste kurz vor dem Ende des laufenden bestellt
     if now < busy - 0.08 then return end
-    tone(w, w.page, BAL.VT.sink(st, iv / 20 / rg), 250)
-    w.vtNext, w.vtEnd = nil, math.max(now, busy) + 0.25
+    local len = st == 4 and 150 or 250
+    tone(w, w.page, BAL.VT.sink(st, iv / 20 / rg), len)
+    w.vtNext, w.vtEnd = nil, math.max(now, busy) + len / 1000
   end
 end
 
