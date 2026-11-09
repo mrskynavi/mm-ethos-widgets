@@ -1,5 +1,5 @@
 -- @widget  Polarflug
--- @version 1.2
+-- @version 1.3
 -- Polarflug fuer Ethos -- Vollbild-Widget, hilft beim Erfliegen der Polare.
 --
 -- Anzeige 1 (Balken): ein Balken pro Geschwindigkeitsbereich (Standard 20-30, 30-40 ... km/h).
@@ -507,7 +507,11 @@ local function evalPoint(w, now)
   local kin = 0
   if w.varioType == 2 then kin = w.teFactor / 100 * (b.v * b.v - a.v * a.v) / (2 * G * dt) end
   local sink = -(sw / n + kin)
-  if not (sink > -3 and sink < 5) then w.reason = "Ausreisser"; return end
+  if not (sink > -3 and sink < 5) then
+    -- Werte zeigen, damit sich ein falscher Sensor oder eine falsche Einheit erkennen laesst
+    w.reason = string.format("Ausreisser: Sinken %.1f (Vario %+.1f)", sink, sw / n)
+    return
+  end
   w.lastSec = sec
   w.reason = nil
   addPoint(w, vm * KMH, sink, now)
@@ -1038,6 +1042,7 @@ local function wakeup(w)
 
   -- Hoehe: GPS-Hoehe, sonst aus dem Vario aufintegriert (wie Sollfahrt)
   local vario = readNumber(w.vario)
+  w.varioNow = vario
   local alt = readNumber(w.gpsAlt)
   if alt == nil then
     w.altInt = (w.altInt or 0) + (vario or 0) * dt
@@ -1127,6 +1132,8 @@ local function paintHead(w, W, now)
   local tasStr = w.tasS and string.format("%.0f", w.tasS * KMH) or "--"
   local _, tw = drawT(m, 3, 120, tasStr, FONT_L, WHITE, "l")
   drawT(m + tw + 4, 3 + textHeight(FONT_L) - textHeight(FONT_XS) - 3, 60, "km/h TAS", FONT_XS, C.DIM, "l")
+  -- aktueller Vario-Wert klein ueber "km/h TAS": zeigt sofort, ob der richtige Sensor gewaehlt ist
+  drawT(m + tw + 4, 2, 90, w.varioNow and string.format("Vario %+.1f", w.varioNow) or "Vario --", FONT_XS, C.DIM, "l")
   local btnW = math.min(110, math.floor(W * 0.28))
   local b = {x = W - m - btnW, y = 3, w = btnW, h = headH - 6}
   w.button = b
