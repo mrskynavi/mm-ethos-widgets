@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.23
+-- @version 1.24
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.23"
+local VERSION = "1.24"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1108,7 +1108,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20},
+  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
   thBest = true,
 }
 
@@ -1144,7 +1144,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10, vtGlide = 5}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -2297,8 +2297,8 @@ end
 -- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
 -- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
 -- Wann: auf der Seite Thermik immer; beim Kreisen auf allen Seiten (auch Start); auf der Seite Gleiten (mit
--- Eckansicht) ersetzt er den Sollfahrt-Ton, solange das Netto-Steigen ueber dem eingestellten MC liegt (nicht mit
--- MC ZEIT, das ist der Endanflug). Der Sollfahrt-Ton selbst bleibt unveraendert. Laeuft ueber tone(), darum gilt
+-- Eckansicht) ersetzt er den Sollfahrt-Ton, solange das Netto-Steigen das Minimalsinken plus vtGlide uebersteigt
+-- (siehe BAL.VT.mode; nicht mit MC ZEIT, das ist der Endanflug). Der Sollfahrt-Ton selbst bleibt unveraendert. Laeuft ueber tone(), darum gilt
 -- der Vorrang der Wendevorhersage. In BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist.
 BAL.VT = {}
 
@@ -2363,22 +2363,23 @@ function BAL.VT.mode(w, now, dt)
     if now - w.vtStr > 2 then w.vtC0, w.vtCirc = nil, false end
   end
   -- Netto fuer die Umschaltung: TE plus Eigensinken aus der Polare, 1 s geglaettet (das Netto der Sollfahrt mit
-  -- 8 s ist fuer einen Bart, den man in 2 bis 3 s durchfliegt, zu traege). Rein bei Netto > MC + 0.1 fuer 0.5 s,
-  -- raus bei Netto < MC - 0.3 fuer 2 s. Mit MC ZEIT nie.
+  -- 8 s ist fuer einen Bart, den man in 2 bis 3 s durchfliegt, zu traege). Ab 1.24 (Christoph 9.11.2026): das Netto
+  -- muss zuerst das eigene Minimalsinken (Polare) ausgleichen. Rein bei Netto > Minimalsinken + vtGlide (App,
+  -- 0.1 m/s, Vorgabe 0.5) fuer 0.5 s, raus bei Netto < Minimalsinken fuer 2 s. Mit MC ZEIT nie.
   local p = w.polar
   if p and w.varioRaw ~= nil and w.tasN and w.tasN * KMH > 15 then
     w.vtNet = lpf(w.vtNet, w.varioRaw + polarSink(p, w.tasN), dt, 1)
   else
     w.vtNet = nil
   end
-  local mc = w.mcValue or 0
+  local sMin = p and polarSink(p, p.lo) or 0
   if w.vtNet and (w.rzMan or w.rzOn == false) then
     if w.vtTh then
-      if w.vtNet < mc - 0.3 then
+      if w.vtNet < sMin then
         w.vtOut = w.vtOut or now
         if now - w.vtOut >= 2 then w.vtTh, w.vtOut = false, nil end
       else w.vtOut = nil end
-    elseif w.vtNet > mc + 0.1 then
+    elseif w.vtNet > sMin + (w.vtGlide or 5) / 10 then
       w.vtIn = w.vtIn or now
       if now - w.vtIn >= 0.5 then w.vtTh, w.vtIn = true, nil end
     else w.vtIn = nil end
