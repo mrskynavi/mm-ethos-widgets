@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.24"
+local VERSION = "1.25"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1108,7 +1108,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
+  qlTau = {0, 30}, qlTrim = true, qaTau = {0, 60}, qaRate = {5, 300}, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
   thBest = true,
 }
 
@@ -1144,7 +1144,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10, vtGlide = 5}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, qaTau = 25, qaRate = 30, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10, vtGlide = 5}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -1205,6 +1205,7 @@ local function loadRadii(w)
           if type(r) == "number" and r >= 5 and r <= 200 then m[key] = r end
         end
         if type(v.ql) == "number" and math.abs(v.ql) <= 45 then m.ql = v.ql end   -- Querlage-Nullpunkt (Grad)
+        if type(v.qk) == "number" and math.abs(v.qk) >= 5 and math.abs(v.qk) <= 300 then m.qk = v.qk end   -- Rollrate Querruder (Grad/s voll)
         w.radii[k] = m
       end
     end
@@ -1215,10 +1216,10 @@ local function saveRadii(w)
   local keys = {}
   for k in pairs(w.radii) do keys[#keys + 1] = k end
   table.sort(keys)
-  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\nreturn {\n"}
+  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\n-- qk = Rollrate bei vollem Querruder (Grad/s), gelernt mit Lagesensor, fuer Fluege ohne.\nreturn {\n"}
   for _, k in ipairs(keys) do
     local m, parts = w.radii[k], {}
-    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql"}) do
+    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql", "qk"}) do
       if m[key] then parts[#parts + 1] = string.format("%s = %.1f", key, m[key]) end
     end
     out[#out + 1] = string.format("  [%q] = {%s},\n", k, table.concat(parts, ", "))
@@ -1821,7 +1822,7 @@ function BAL.QL.read(w, now, dt)
   local v = readNumber(w.bankSrc)
   if v == nil or math.abs(v) > 180 then w.qlPhi, w.qlRaw = nil, nil; return end
   if w.bankInv then v = -v end
-  w.qlRaw = v
+  w.qlRaw, w.qlEst = v, nil
   local m = w.radii and w.radii[w.modelName or "?"]
   local phi = v - (m and m.ql or 0) - (w.qlTrimV or 0)
   w.qlPhi = phi
@@ -1861,6 +1862,63 @@ function BAL.QL.omega(w, f)
     return 9.81 * math.tan(math.rad(phi)) / math.max(w.tasF or f.tas or 15, 8)
   end
   return w.omS or 0
+end
+
+-- Querlage ohne Lagesensor (Wettbewerb: keine Kreisel, Reglement 2.7). Der Querruder-Knueppel gibt die Rollrate
+-- (k Grad/s bei Vollausschlag), aufsummiert ist das die Querlage sofort beim Einleiten. Die Querlage aus der
+-- GPS-Drehrate (phi = atan(omega * v / g), traege und unruhig) zieht die Summe in qaTau s nach.
+-- k lernt das Widget, solange ein Lagesensor dran ist (Trainingsflug mit Stabi-Empfaenger): Aenderung der Querlage
+-- in 1.6 s gegen die Knueppel-Summe 0.4 s frueher, Vorzeichen inklusive; pro Modell in radien.lua (qk). Ohne
+-- gelernten Wert gilt qaRate aus der App. Log 7.11.: Verzug zum Stabi-Sensor 0.1-0.3 s statt 1.6 s mit GPS allein.
+BAL.QA = {}
+function BAL.QA.step(w, now, dt)
+  local f = w.cur
+  local q = w.ailSrc and readNumber(w.ailSrc)
+  if not q or not w.omS or not f or (w.qaTau or 25) <= 0 then w.qaB, w.qaH = nil, nil; return end
+  q = clamp(q / 1024, -1, 1)
+  local bg = math.deg(math.atan(w.omS * math.max(w.tasF or f.tas or 15, 8) / G))
+  local fly = w.flying and (f.gs or 0) > 8
+  local sens = w.qlPhi and not w.qlBad
+  -- Knueppel-Mitte (Trimmung): nach 5 s geradeaus nachgefuehrt
+  if fly and math.abs(w.omS) < math.rad(3) then w.qaStr = (w.qaStr or 0) + dt else w.qaStr = 0 end
+  if w.qaStr > 5 then w.qaZero = lpf(w.qaZero, q, dt, 10) end
+  local qq = q - (w.qaZero or 0)
+  if math.abs(qq) < 0.015 then qq = 0 end
+  w.qaI = (w.qaI or 0) + qq * dt
+  local m = w.radii and w.radii[w.modelName or "?"]
+  if not w.qaT or now - w.qaT >= 0.2 then
+    w.qaT = now
+    local h = w.qaH or {}
+    w.qaH = h
+    h[#h + 1] = {t = now, i = w.qaI, p = sens and w.qlPhi or nil}
+    while #h > 2 and now - h[2].t >= 2.2 do table.remove(h, 1) end
+    if fly and sens and h[1].t <= now - 1.95 then
+      local a, c, e
+      for _, x in ipairs(h) do
+        if not c and x.t >= now - 2.0 then c = x end
+        if not a and x.t >= now - 1.6 then a = x end
+        if not e and x.t >= now - 0.4 then e = x end
+      end
+      if a.p then
+        local x, y = e.i - c.i, w.qlPhi - a.p
+        w.qaSxy = (w.qaSxy or 0) * 0.9983 + x * y      -- vergisst in rund 2 min
+        w.qaSxx = (w.qaSxx or 0) * 0.9983 + x * x
+        if w.qaSxx > 2 and m == nil and w.radii then m = {}; w.radii[w.modelName or "?"] = m end
+        if w.qaSxx > 2 and m then
+          local kn = w.qaSxy / w.qaSxx
+          m.qk = math.floor((kn < 0 and -1 or 1) * clamp(math.abs(kn), 5, 300) + 0.5)
+          if math.abs(m.qk - (w.qkSaved or 0)) >= 2 and now - (w.qkSaveT or 0) >= 60 then
+            w.qkSaved, w.qkSaveT = m.qk, now
+            saveRadii(w)
+          end
+        end
+      end
+    end
+  end
+  local k = (m and m.qk) or w.qaRate or 30
+  if not fly then w.qaB = bg
+  else w.qaB = (w.qaB or bg) + dt * k * qq + dt / ((w.qaTau or 25) / 10) * (bg - w.qaB) end
+  if not sens then w.qlPhi, w.qlEst = clamp(w.qaB, -80, 80), true end
 end
 
 -- Restkorrektur und gebogene Ablage-Vorhersage. g.rest = Kursfehler nach der Drehung in tau s,
@@ -2803,6 +2861,7 @@ local function wakeup(w)
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
   BAL.QL.read(w, now, dt)
+  BAL.QA.step(w, now, dt)
   if w.qlPress and now - w.qlPress >= 2 then
     w.qlPress = nil
     if BAL.QL.zero(w) then tone(w, nil, 2000, 150); note(w, "Querlage genullt", now) end
@@ -4747,6 +4806,7 @@ local function configure(w)
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
   addSource(w, "Querlage (optional, Rollwinkel Grad)", "bankSrc")
   addBool(w, "Querlage: Richtung umkehren", "bankInv")
+  addSource(w, "Querruder-Knüppel (Querlage ohne Lagesensor)", "ailSrc")
   addSource(w, "AccZ (optional, Varioton schneller)", "accZSrc")
   addSource(w, "AccX (optional, mit AccZ)", "accXSrc")
   addSource(w, "Nickwinkel (optional, mit AccZ)", "pitchSrc")
@@ -4779,6 +4839,7 @@ local function setDefaults(w)
   w.ticker = true
   w.bankSrc, w.bankInv = nil, false
   w.accZSrc, w.accXSrc, w.pitchSrc = nil, nil, nil
+  w.ailSrc = nil
 end
 
 local function read(w)
@@ -4796,6 +4857,7 @@ local function read(w)
     w.accZSrc = validSource(storage.read("accZSrc"))   -- Fusion Varioton: nach der Querlage angehaengt
     w.accXSrc = validSource(storage.read("accXSrc"))
     w.pitchSrc = validSource(storage.read("pitchSrc"))
+    w.ailSrc = validSource(storage.read("ailSrc"))     -- Querruder-Knueppel: nach der Fusion angehaengt
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4815,6 +4877,7 @@ local function write(w)
   storage.write("accZSrc", w.accZSrc)
   storage.write("accXSrc", w.accXSrc)
   storage.write("pitchSrc", w.pitchSrc)
+  storage.write("ailSrc", w.ailSrc)
 end
 
 local function init()
