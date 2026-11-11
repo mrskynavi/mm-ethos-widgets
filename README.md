@@ -15,3 +15,5 @@ Ethos-Lua-Widgets von Mächler Modelle. Der MM Flight Analyzer holt sie von hier
 `scripts/skynav/aufgaben.lua` schreibt ebenfalls die App (Tab SkyNavigator), die Flüge legt das Widget in `scripts/skynav/fluege/` ab, die gelernten Wenderadien in `scripts/skynav/radien.lua`.
 
 `scripts/skynav/audio/links.wav` und `rechts.wav` sind die Sprachdateien für die Kurs-Ansage „xx links/rechts“ (16 kHz, 16 Bit, mono).
+
+`scripts/skynavtool/` ist kein Widget, sondern das Systemtool „SkyNav Aufgabe“ (am Sender unter System, Werkzeuge). Damit tippt man den Buchstaben-Code einer Aufgabe ab, den die App nach dem Scan des QR-Codes zeigt, und stellt vor jedem Durchgang das Startfenster ein. Es schreibt `scripts/skynav/feld.lua`; das Widget SkyNavigator liest diese Datei zusätzlich zu `aufgaben.lua`.

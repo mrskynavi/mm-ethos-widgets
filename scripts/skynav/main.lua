@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.24
+-- @version 1.26
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.25"
+local VERSION = "1.26"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -58,6 +58,9 @@ local PAGE_SHORT = {"ÜBER", "START", "GLEIT", "THERM", "WERT"}
 local S_IDLE, S_ARMED, S_STARTED, S_STOPPED = 0, 1, 2, 3
 
 local TASK_PATHS = {"/scripts/skynav/aufgaben.lua", "scripts/skynav/aufgaben.lua", "aufgaben.lua"}
+-- Vom Systemtool "SkyNav Aufgabe" (scripts/skynavtool): Aufgaben aus dem Code, aktive Aufgabe, Startfenster
+-- (eine Tabelle statt einzelner locals: der Hauptteil ist nahe an der Grenze von 200 locals)
+local FELD = {paths = {"/scripts/skynav/feld.lua", "scripts/skynav/feld.lua", "feld.lua"}}
 local POLAR_PATHS = {"/scripts/maccready/polaren.lua", "scripts/maccready/polaren.lua", "../maccready/polaren.lua"}
 local RADIUS_PATHS = {"/scripts/skynav/radien.lua", "scripts/skynav/radien.lua", "radien.lua"}
 local PRED_S = 5      -- s, Vorhersage in der Kursgrafik (Seite Gleiten)
@@ -308,7 +311,7 @@ local function buildTask(t)
       local zx = (num(z.lon, 0) - T.lon) * M_PER_DEG * T.cosLat
       local zy = (num(z.lat, 0) - T.lat) * M_PER_DEG
       T.zones[#T.zones + 1] = {
-        t = (z.t == "R") and "R" or "C", name = tostring(z.name or "Zone"), x = zx, y = zy,
+        t = (z.t == "R") and "R" or "C", name = tostring(z.name or "Zone"), x = zx, y = zy, lat = num(z.lat, 0), lon = num(z.lon, 0),
         r = num(z.r, 100), dir = num(z.dir, 0), len = num(z.len, 100), wid = num(z.wid, 50),
         lo = num(z.lo, 0), hi = num(z.hi, 9999),
       }
@@ -914,9 +917,24 @@ local function rctLines(T)
     for line in T.rct:gmatch("[^\r\n]+") do out[#out + 1] = line end
     return out
   end
+  -- Aufgabe vom Systemtool: Richtung mit einer Nachkommastelle wie im QR-Code, Zonen als C/R-Zeilen
   local r = function(v) return math.floor(v + 0.5) end
-  return {"V:02.0", string.format("T:%s,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%d", (T.name:gsub(",", " ")), T.lat, T.lon,
-    r(T.elev), r(T.dir), r(T.dist), r(T.maxH), r(T.maxV), r(T.minF), r(T.work))}
+  local function deg(v)
+    local d10 = r(v * 10)
+    if d10 % 10 == 0 then return string.format("%d", d10 // 10) end
+    return string.format("%.1f", d10 / 10)
+  end
+  local out = {"V:02.0", string.format("T:%s,%.6f,%.6f,%d,%s,%d,%d,%d,%d,%d", (T.name:gsub(",", " ")), T.lat, T.lon,
+    r(T.elev), deg(T.dir), r(T.dist), r(T.maxH), r(T.maxV), r(T.minF), r(T.work))}
+  for i, z in ipairs(T.zones or {}) do
+    local nm = "Zone " .. i
+    if z.t == "R" then
+      out[#out + 1] = string.format("R:%s,%.6f,%.6f,%s,%d,%d,%d,%d", nm, z.lat, z.lon, deg(z.dir), r(z.len), r(z.wid), r(z.lo), r(z.hi))
+    else
+      out[#out + 1] = string.format("C:%s,%.6f,%.6f,%d,%d,%d", nm, z.lat, z.lon, r(z.r), r(z.lo), r(z.hi))
+    end
+  end
+  return out
 end
 
 local function igcOpen(w, f)
@@ -1158,8 +1176,35 @@ end
 
 -- ---------------------------------------------------------------- Aufgaben-Datei
 
+-- feld.lua (Systemtool) alle 3 s als Text vergleichen: nach dem Schliessen des Tools soll die Aufgabe gleich da sein
+function FELD.changed(w, now)
+  if w.feldT and now - w.feldT < (w.feldText == "" and 10 or 3) and now >= w.feldT then return false end
+  w.feldT = now
+  local text = ""
+  for _, path in ipairs(FELD.paths) do
+    local okOpen, f = pcall(io.open, path, "r")
+    if okOpen and f then
+      local okRead, s = pcall(f.read, f, "*a")
+      pcall(f.close, f)
+      if okRead and type(s) == "string" then text = s; break end
+    end
+  end
+  if text == w.feldText then return false end
+  w.feldText = text
+  return true
+end
+
+function FELD.table(w)
+  if not w.feldText or w.feldText == "" or not load then return nil end
+  local okLoad, c = pcall(load, w.feldText, "=feld.lua", "t", {})
+  if not okLoad or type(c) ~= "function" then return nil end
+  local ok, t = pcall(c)
+  return ok and type(t) == "table" and t or nil
+end
+
 local function refreshTasks(w, now, force)
-  if not force and w.tasksT and now - w.tasksT < 20 then return end
+  local feldNew = FELD.changed(w, now)
+  if not force and not feldNew and w.tasksT and now - w.tasksT < 20 and now >= w.tasksT then return end
   w.tasksT = now
   local t = loadLuaTable(TASK_PATHS)
   local list = {}
@@ -1175,6 +1220,19 @@ local function refreshTasks(w, now, force)
     w.activeId = t.active and tostring(t.active) or nil
     applyAppSettings(w, t.settings)
   end
+  -- Aufgaben vom Systemtool; dessen aktive Aufgabe gilt, wenn sie neuer ist als die Datei der App
+  local fd = FELD.table(w)
+  w.feldSlot = nil
+  if fd then
+    for _, e in ipairs(type(fd.tasks) == "table" and fd.tasks or {}) do
+      local T = buildTask(e)
+      if T then T.feld = true; list[#list + 1] = T end
+    end
+    local off = (w.utcOver ~= -999) and w.utcOver or (w.utcFile or 0)
+    local fw, aw = tonumber(fd.written), t and tonumber(t.written)
+    if fd.active and fd.active ~= "" and (not aw or not fw or fw - off * 60 >= aw) then w.activeId = tostring(fd.active) end
+    if type(fd.slot) == "table" and tonumber(fd.slot.h) and tonumber(fd.slot.y) then w.feldSlot = fd.slot end
+  end
   w.tasks = list
   local idx = w.taskIdx or 0
   if idx == 0 then
@@ -1183,7 +1241,8 @@ local function refreshTasks(w, now, force)
   end
   idx = clamp(idx, 1, math.max(#list, 1))
   local T = list[idx]
-  local sig = T and (T.id .. T.lat .. T.lon .. T.dir .. T.dist .. tostring(T.slot and T.slot.h)) or "-"
+  local sig = T and (T.id .. T.lat .. T.lon .. T.dir .. T.dist .. T.elev .. T.maxH .. T.maxV .. T.minF .. T.work .. #T.zones
+    .. tostring(T.slot and T.slot.h)) or "-"
   if sig ~= w.taskSig then
     w.taskSig = sig
     -- Aufgabe gewechselt: nur ohne laufenden Flug uebernehmen
@@ -1292,18 +1351,28 @@ local function refreshPolar(w, now, force)
   BAL.polar(w)
 end
 
--- Startfenster in Senderuhr-Zeit: von Hand (Konfiguration) oder aus der Aufgabe (UTC)
+-- Startfenster als UTC-Epoche: vom Systemtool (Ortszeit, gilt bis 6 h nach dem Ende), von Hand (Konfiguration) oder
+-- aus der Aufgabe (UTC). Reglement: die letzte Minute zaehlt ganz, also Ende = Beginn + Laenge + 59 s.
 local function slotWindow(w)
+  local fs = w.feldSlot
+  if fs then
+    local a = slotEpoch(fs)
+    if a then
+      a = a - (w.utcOffset or 0) * 60
+      local b = a + num(fs.len, 10) * 60 + 59
+      if utcNow(w) < b + 6 * 3600 then return a, b, "sender" end
+    end
+  end
   if w.slotH >= 0 then
     local now = localNow(w)
     local t0 = now - now % 86400 + w.slotH * 3600 + w.slotM * 60 - (w.utcOffset or 0) * 60
-    return t0, t0 + w.slotLen * 60, "hand"
+    return t0, t0 + w.slotLen * 60 + 59, "hand"
   end
   local T = w.task
   if not T or not T.slot then return nil end
   local a, b = slotEpoch(T.slot)
   if not a then return nil end
-  return a, b, "aufgabe"
+  return a, b + 59, "aufgabe"
 end
 
 -- ---------------------------------------------------------------- Messwerte
@@ -4780,7 +4849,7 @@ local function configure(w)
     form.addStaticText(l, form.getFieldSlots(l)[0], "MM Flight Analyzer, Tab SkyNavigator: Aufgabe anlegen, Sender anschliessen")
   else
     local ch = {{"Aktive Aufgabe der App", 0}}
-    for i, T in ipairs(w.tasks) do ch[#ch + 1] = {string.format("%s (%s %dm)", T.name, T.cls, math.floor(T.dist + 0.5)), i} end
+    for i, T in ipairs(w.tasks) do ch[#ch + 1] = {string.format("%s (%s %dm)%s", T.name, T.cls, math.floor(T.dist + 0.5), T.feld and " Sender" or ""), i} end
     form.addChoiceField(l, nil, ch, function() return clamp(w.taskIdx, 0, #w.tasks) end, function(v)
       w.taskIdx = v; w.taskSig = nil; refreshTasks(w, os.clock(), true) end)
   end
@@ -4894,5 +4963,6 @@ M._test = {
   buildTask = buildTask, inSector = inSector, penaltyOf = penaltyOf, planPath = planPath, cornersFrom = cornersFrom,
   crossTrack = crossTrack, slotEpoch = slotEpoch, igcLat = igcLat, igcLon = igcLon, create = create, assess = assess,
   scoreOf = scoreOf, startCalc = startCalc, rz = RZ, angDiff = angDiff, bearingOf = bearingOf, toLocal = toLocal,
+  slotWindow = slotWindow, refreshTasks = refreshTasks, rctLines = rctLines,
 }
 return M
