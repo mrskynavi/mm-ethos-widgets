@@ -1,5 +1,5 @@
 -- @widget  SkyNav Aufgabe
--- @version 1.0
+-- @version 1.1
 -- Systemtool "SkyNav Aufgabe" (SYS -> Werkzeuge): Aufgaben fuer das Widget SkyNavigator am Sender erfassen,
 -- ohne PC. Der MM Flight Analyzer (Tab SkyNavigator, auch die Web-App) liest den QR-Code der Aufgabe und zeigt sie als
 -- Buchstaben-Code; hier wird er abgetippt. Vor jedem Durchgang stellst Du hier das Startfenster ein.
@@ -17,7 +17,7 @@
 -- Dateien: liest scripts/skynav/aufgaben.lua (von der App) und schreibt scripts/skynav/feld.lua (Aufgaben vom Sender,
 -- aktive Aufgabe, Startfenster in Senderzeit). Das Widget SkyNavigator liest beide.
 
-local VERSION = "1.0"
+local VERSION = "1.1"
 local FELD_PATHS = {"/scripts/skynav/feld.lua", "SCRIPTS:/skynav/feld.lua"}
 local TASK_PATHS = {"/scripts/skynav/aufgaben.lua", "SCRIPTS:/skynav/aufgaben.lua"}
 local CLASSES = {
@@ -105,20 +105,34 @@ local function rsDec(cw)
   return nil
 end
 
--- Ziffern zur Basis 23 (hoechste zuerst) <-> Bitfelder
+-- Ziffern zur Basis 23 (hoechste zuerst) <-> Bitfelder. Ethos-Lua rechnet mit 32-Bit-Ganzzahlen: darum jedes Feld
+-- in Stuecke von hoechstens 8 Bit zerlegen, so bleiben alle Zwischenwerte klein (unter 23 * 256).
+local function chunks(w)
+  local out, first = {}, w % 8
+  if first == 0 then first = 8 end
+  out[1] = math.min(first, w)
+  local rest = w - out[1]
+  while rest > 0 do out[#out + 1] = 8; rest = rest - 8 end
+  return out
+end
+
 local function pack(fields)
   local d = {0}
   for _, f in ipairs(fields) do
     local v, w = f[1], f[2]
-    local carry, mul = v, 1 << w
-    for i = #d, 1, -1 do
-      local x = d[i] * mul + carry
-      d[i] = x % P
-      carry = x // P
-    end
-    while carry > 0 do
-      table.insert(d, 1, carry % P)
-      carry = carry // P
+    local left = w
+    for _, c in ipairs(chunks(w)) do
+      left = left - c
+      local carry, mul = (v >> left) & ((1 << c) - 1), 1 << c
+      for i = #d, 1, -1 do
+        local x = d[i] * mul + carry
+        d[i] = x % P
+        carry = x // P
+      end
+      while carry > 0 do
+        table.insert(d, 1, carry % P)
+        carry = carry // P
+      end
     end
   end
   return d
@@ -127,18 +141,26 @@ end
 local function unpack(d0, widths)
   local d = {}
   for i = 1, #d0 do d[i] = d0[i] end
-  local out = {}
-  for k = #widths, 1, -1 do
-    local div = 1 << widths[k]
+  local cw = {}
+  for _, w in ipairs(widths) do for _, c in ipairs(chunks(w)) do cw[#cw + 1] = c end end
+  local parts = {}
+  for k = #cw, 1, -1 do
+    local div = 1 << cw[k]
     local rem = 0
     for i = 1, #d do
       local x = rem * P + d[i]
       d[i] = x // div
       rem = x % div
     end
-    out[k] = rem
+    parts[k] = rem
   end
   for i = 1, #d do if d[i] ~= 0 then return nil end end
+  local out, at = {}, 1
+  for n, w in ipairs(widths) do
+    local v = 0
+    for _, c in ipairs(chunks(w)) do v = (v << c) | parts[at]; at = at + 1 end
+    out[n] = v
+  end
   return out
 end
 
@@ -209,18 +231,20 @@ local CH_PARTS = {{28, 29}, {14}, {12}, {10}, {10, 10, 10, 7}}
 
 local function rnd(v) return math.floor(v + 0.5) end
 local function i6(v) return rnd((tonumber(v) or 0) * 1e6) end
+-- Koordinate als ganze Millionstel: aus dem Code (lat6/lon6) exakt, sonst aus der Kommazahl
+local function c6(t, k) return math.tointeger(t[k .. "6"]) or i6(t[k]) end
 local function i10(v) return rnd(((tonumber(v) or 0) % 360) * 10) end
 
 -- ganzzahlige Werte wie im Code; gleiche Reihenfolge wie canon() in der App
 local function canon(t)
-  local T = {i6(t.lat), i6(t.lon), rnd(t.elev or 0), i10(t.dir), rnd(t.dist or 0), rnd(t.maxH or 0), rnd(t.maxV or 0), rnd(t.minF or 0), rnd(t.work or 0)}
+  local T = {c6(t, "lat"), c6(t, "lon"), rnd(t.elev or 0), i10(t.dir), rnd(t.dist or 0), rnd(t.maxH or 0), rnd(t.maxV or 0), rnd(t.minF or 0), rnd(t.work or 0)}
   local Z = {}
   for i, z in ipairs(t.zones or {}) do
     if i > 5 then break end
     if z.t == "R" then
-      Z[i] = {"R", i6(z.lat), i6(z.lon), i10(z.dir), rnd(z.len or 0), rnd(z.wid or 0), rnd(z.lo or 0), rnd(z.hi or 0)}
+      Z[i] = {"R", c6(z, "lat"), c6(z, "lon"), i10(z.dir), rnd(z.len or 0), rnd(z.wid or 0), rnd(z.lo or 0), rnd(z.hi or 0)}
     else
-      Z[i] = {"C", i6(z.lat), i6(z.lon), rnd(z.r or 0), rnd(z.lo or 0), rnd(z.hi or 0)}
+      Z[i] = {"C", c6(z, "lat"), c6(z, "lon"), rnd(z.r or 0), rnd(z.lo or 0), rnd(z.hi or 0)}
     end
   end
   return T, Z
@@ -257,8 +281,14 @@ local function crc32(str)
 end
 
 local function crcOf(t) return crc32(canonStr(t)) end
+-- CRC als vorzeichenlose 32-Bit-Zahl modulo m, auch wenn Lua nur 32-Bit-Ganzzahlen mit Vorzeichen hat
+local function umod(n, m)
+  local r = 0
+  for b = 31, 0, -1 do r = (r * 2 + ((n >> b) & 1)) % m end
+  return r
+end
 local function word(t)
-  local n = crcOf(t) % 279841
+  local n = umod(crcOf(t), 279841)
   local s = ""
   for _ = 1, 4 do s = ALPHA_S:sub(n % P + 1, n % P + 1) .. s; n = n // P end
   return s
@@ -267,7 +297,7 @@ end
 local function decodeTask(text)
   local v, fx = decode(text, T_W)
   if not v then return nil, fx end
-  return {lat = (v[1] - 90000000) / 1e6, lon = (v[2] - 180000000) / 1e6, elev = v[3] - 1000, dir = v[4] / 10,
+  return {lat6 = v[1] - 90000000, lon6 = v[2] - 180000000, lat = (v[1] - 90000000) / 1e6, lon = (v[2] - 180000000) / 1e6, elev = v[3] - 1000, dir = v[4] / 10,
     dist = v[5], maxH = v[6], maxV = v[7], minF = v[8], work = v[9]}, fx, v[10]
 end
 
@@ -278,11 +308,12 @@ local function decodeZone(text, task)
   local v, fx = decode(s, isR and ZR_W or ZC_W)
   if not v then return nil, fx end
   if v[2] ~= (isR and 1 or 0) then return nil, "Art der Zone passt nicht" end
-  local lat = (i6(task.lat) + v[3] - OFF) / 1e6
-  local lon = (i6(task.lon) + v[4] - OFF) / 1e6
+  local lat6 = c6(task, "lat") + v[3] - OFF
+  local lon6 = c6(task, "lon") + v[4] - OFF
+  local lat, lon = lat6 / 1e6, lon6 / 1e6
   local z
-  if isR then z = {t = "R", lat = lat, lon = lon, dir = v[5] / 10, len = v[6], wid = v[7], lo = v[8], hi = v[9]}
-  else z = {t = "C", lat = lat, lon = lon, r = v[5], lo = v[6], hi = v[7]} end
+  if isR then z = {t = "R", lat6 = lat6, lon6 = lon6, lat = lat, lon = lon, dir = v[5] / 10, len = v[6], wid = v[7], lo = v[8], hi = v[9]}
+  else z = {t = "C", lat6 = lat6, lon6 = lon6, lat = lat, lon = lon, r = v[5], lo = v[6], hi = v[7]} end
   return z, fx, v[1]
 end
 
@@ -307,10 +338,14 @@ local function decodeChange(text, base)
       local v, fx = decode(s, w)
       if not v and fx and fx:find("Tippfehler") then return nil, fx end
       if v and v[2] == mask then
-        if v[1] ~= crcOf(base) % 4096 then return nil, "Code gehoert zu einer anderen Aufgabe" end
+        if v[1] ~= crcOf(base) & 4095 then return nil, "Code gehoert zu einer anderen Aufgabe" end
         local t = copyTask(base)
         local at = 3
-        if mask & 1 ~= 0 then t.lat = (v[at] - 90000000) / 1e6; t.lon = (v[at + 1] - 180000000) / 1e6; at = at + 2 end
+        if mask & 1 ~= 0 then
+          t.lat6, t.lon6 = v[at] - 90000000, v[at + 1] - 180000000
+          t.lat, t.lon = t.lat6 / 1e6, t.lon6 / 1e6
+          at = at + 2
+        end
         if mask & 2 ~= 0 then t.elev = v[at] - 1000; at = at + 1 end
         if mask & 4 ~= 0 then t.dir = v[at] / 10; at = at + 1 end
         if mask & 8 ~= 0 then t.dist = v[at]; at = at + 1 end
@@ -396,6 +431,7 @@ local function taskFromFile(e, src)
   if type(e) ~= "table" or tonumber(e.lat) == nil or tonumber(e.lon) == nil then return nil end
   local t = {}
   for _, k in ipairs({"lat", "lon", "elev", "dir", "dist", "maxH", "maxV", "minF", "work", "maxAlt"}) do t[k] = tonumber(e[k]) end
+  t.lat6, t.lon6 = math.tointeger(e.lat6), math.tointeger(e.lon6)
   t.id, t.name, t.cls, t.src = tostring(e.id or e.name or "?"), tostring(e.name or "Aufgabe"), tostring(e.cls or ""), src
   t.zones = {}
   for _, z in ipairs(type(e.zones) == "table" and e.zones or {}) do
@@ -481,11 +517,11 @@ local function save(s, withSlot)
   for _, x in ipairs(s.tasks) do
     if x.src == "feld" then
       local e = {}
-      for _, k in ipairs({"id", "name", "cls", "lat", "lon", "elev", "dir", "dist", "maxH", "maxV", "minF", "work", "maxAlt"}) do e[k] = x[k] end
+      for _, k in ipairs({"id", "name", "cls", "lat", "lon", "lat6", "lon6", "elev", "dir", "dist", "maxH", "maxV", "minF", "work", "maxAlt"}) do e[k] = x[k] end
       e.zones = x.zones
       if x.base then
         local b = {}
-        for _, k in ipairs({"lat", "lon", "elev", "dir", "dist", "maxH", "maxV", "minF", "work"}) do b[k] = x.base[k] end
+        for _, k in ipairs({"lat", "lon", "lat6", "lon6", "elev", "dir", "dist", "maxH", "maxV", "minF", "work"}) do b[k] = x.base[k] end
         b.zones = x.base.zones
         e.base = b
       end
@@ -542,10 +578,11 @@ local function grouped(s)
 end
 
 -- Knoepfe: {x, y, w, h, label, fn, style}
-local function button(s, x, y, w, h, label, fn, style)
+local function button(s, x, y, w, h, label, fn, style, fonts)
   local col = style == "pri" and C.pri or (style == "off" and C.panel or C.key)
   box(x, y, w, h, col)
-  local f = fit(label, w - 8, {FONT_STD, FONT_S, FONT_XS})
+  local f = fit(label, w - 8, fonts or {FONT_STD, FONT_S, FONT_XS})
+  if fonts and th(f) > h - 6 then f = fit(label, w - 8, {FONT_STD, FONT_S, FONT_XS}) end
   text(x, y + (h - th(f)) / 2, w, label, f, style == "off" and C.dim or C.white, "c")
   if style ~= "off" then s.hits[#s.hits + 1] = {x = x, y = y, w = w, h = h, fn = fn} end
 end
@@ -711,15 +748,43 @@ local KB_NAME = {}
 for c in ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -"):gmatch(".") do KB_NAME[#KB_NAME + 1] = c end
 KB_NAME[#KB_NAME + 1] = "DEL"
 
+-- Tastatur ueber die ganze Breite; die letzte Taste (DEL) fuellt den Rest der letzten Zeile
 local function keyboard(s, x, y, w, h, keys, cols, fn)
   local rows = math.ceil(#keys / cols)
-  local gap = 4
+  local gap = math.max(4, fl(W * 0.008))
   local kw, kh = (w - gap * (cols - 1)) / cols, (h - gap * (rows - 1)) / rows
+  local fonts = {FONT_XL, FONT_L, FONT_STD}
   for i, k in ipairs(keys) do
     local r, c = (i - 1) // cols, (i - 1) % cols
     local label = k == " " and "Leer" or k
-    button(s, x + c * (kw + gap), y + r * (kh + gap), kw, kh, label, function() fn(k) end)
+    local bw = kw
+    if i == #keys then bw = w - c * (kw + gap) end
+    button(s, x + c * (kw + gap), y + r * (kh + gap), bw, kh, label, function() fn(k) end, k == "DEL" and "pri" or nil,
+      (k == "DEL" or k == " ") and {FONT_STD, FONT_S} or fonts)
   end
+end
+
+-- Eingabezeile: getippter Code gross, in Vierergruppen; zu lang -> vorne Gruppen weglassen, das Ende bleibt sichtbar
+local function codeLine(x, y, w, h, str, isCode, col)
+  local fonts = H >= 400 and {FONT_XXL, FONT_XL, FONT_L} or {FONT_XL, FONT_L, FONT_STD}
+  local disp = isCode and grouped(str) or str
+  local font = fonts[#fonts]
+  for _, f in ipairs(fonts) do if th(f) <= h - 6 and txtSize(disp .. "_", f) <= w then font = f; break end end
+  if isCode then
+    local g, full = 0, disp
+    while #disp > 6 and txtSize(disp .. "_", font) > w do g = g + 1; disp = ".." .. full:sub(5 * g + 1) end
+  end
+  local tw = text(x, y + (h - th(font)) / 2, w, disp, font, col or C.white, "l")
+  box(x + tw + 3, y + 6, 3, h - 12, C.blue)
+end
+
+-- Text auf hoechstens zwei Zeilen umbrechen
+local function wrap2(str, w, font)
+  if txtSize(str, font) <= w then return {str} end
+  local cut = #str
+  while cut > 1 and (str:sub(cut, cut) ~= " " or txtSize(str:sub(1, cut - 1), font) > w) do cut = cut - 1 end
+  if cut <= 1 then return {str} end
+  return {str:sub(1, cut - 1), str:sub(cut + 1)}
 end
 
 -- ---------------------------------------------------------------- Seite: neue Aufgabe
@@ -779,96 +844,68 @@ local function typeKey(s, k)
   if n.focus >= 2 and fieldDone(s, n.focus) and n.focus < #n.fields then n.focus = n.focus + 1 end
 end
 
+-- Aufbau beider Eingabe-Seiten: Kopf, Zeile mit Reitern, grosse Eingabezeile, Status mit Knopf, Tastatur unten
+local function entryLayout()
+  local pad = math.max(5, fl(W * 0.01))
+  local bigF = H >= 400 and FONT_XXL or FONT_XL
+  return pad, th(FONT_S) + 14, math.max(th(bigF) + 12, fl(H * 0.13)), th(FONT_S) * 2 + 8
+end
+
 local function paintNew(s)
   local n = s.new
-  local hb = header(s, "SkyNav Aufgabe - Neu", "Zurück")
-  local pad = math.max(6, fl(W * 0.012))
-  local lw = fl(W * 0.55)
-  local lx, rx = pad, pad + lw + pad
-  local rw = W - rx - pad
+  local hb = header(s, "Neue Aufgabe", "Zurück")
+  local pad, tabH, inH, stH = entryLayout()
   local y = hb + pad
-  local labW = txtSize("ZONE 5", FONT_XS) + 12
-  local rowH = th(FONT_STD) + 12
+  -- Reiter: Name, Aufgabe, Zonen; Farbe = Zustand
+  local tx = pad
   for i, f in ipairs(n.fields) do
-    local ry = y + (i - 1) * (rowH + 4)
-    text(lx, ry + (rowH - th(FONT_XS)) / 2, labW, (f.label):upper(), FONT_XS, C.dim, "l")
-    local fx, fw = lx + labW, lw - labW
-    box(fx, ry, fw, rowH, C.panel)
-    if i == n.focus then frame(fx, ry, fw, rowH, C.blue) end
-    local str = i == 1 and f.text or grouped(clean(f.text))
-    local mark, mcol = "", C.green
-    if i == 2 and n.task then mark = "OK"; if n.fix and #n.fix > 0 then mcol = C.orange end
-    elseif i == 2 and n.err then mark, mcol = "X", C.red
-    elseif i >= 3 and n.zones[i - 2] then mark = "OK"; if f.fix and #f.fix > 0 then mcol = C.orange end
-    elseif i >= 3 and n.zerr[i - 2] then mark, mcol = "X", C.red end
-    if i >= 2 and mark == "" and #clean(f.text) > 0 then
-      mark, mcol = string.format("%d/%d", #clean(f.text), i == 2 and 36 or (#clean(f.text) > 25 and 30 or 25)), C.dim
-    end
-    local mw = math.max(txtSize("OK", FONT_STD), txtSize("00/00", FONT_XS)) + 10
-    local avail = fw - 16 - mw
-    local font = fit(str .. "_", avail, {FONT_STD, FONT_S, FONT_XS})
-    if i >= 2 then   -- zu lang: vorne ganze Vierergruppen weglassen, das Ende (wo getippt wird) bleibt sichtbar
-      local g, full = 0, str
-      while #str > 6 and txtSize(str .. "_", font) > avail do g = g + 1; str = ".." .. full:sub(5 * g + 1) end
-    end
-    local tw = text(fx + 8, ry + (rowH - th(font)) / 2, fw - 16, str, font, C.white, "l")
-    if i == n.focus then box(fx + 10 + tw, ry + 5, 3, rowH - 10, C.blue) end
-    if mark ~= "" then
-      local mf = mcol == C.dim and FONT_XS or FONT_STD
-      text(fx + fw - mw, ry + (rowH - th(mf)) / 2, mw - 6, mark, mf, mcol, "r")
-    end
-    hit(s, fx, ry, fw, rowH, function() n.focus = i end)
+    local done = (i == 2 and n.task) or (i >= 3 and n.zones[i - 2])
+    local bad = (i == 2 and n.err) or (i >= 3 and n.zerr[i - 2])
+    local fixed = (i == 2 and n.fix and #n.fix > 0) or (i >= 3 and f.fix and #f.fix > 0)
+    local label = f.label .. (done and " OK" or "")
+    local tw = txtSize(label, FONT_S) + 20
+    box(tx, y, tw, tabH, i == n.focus and C.head or C.panel)
+    if i == n.focus then frame(tx, y, tw, tabH, C.blue) end
+    text(tx, y + (tabH - th(FONT_S)) / 2, tw, label, FONT_S, bad and C.red or (fixed and C.orange or (done and C.green or C.white)), "c")
+    hit(s, tx, y, tw, tabH, function() n.focus = i end)
+    tx = tx + tw + 4
   end
-  -- Zusammenfassung
-  local sy = y + #n.fields * (rowH + 4) + 4
-  local lines = {}
-  if n.task then
+  y = y + tabH + pad
+  -- Eingabezeile
+  local f = n.fields[n.focus]
+  local need = n.focus == 2 and 36 or (#clean(f.text) > 25 and 30 or 25)
+  local rw = math.max(txtSize("PRÜFWORT", FONT_XS), txtSize("WWWW", FONT_L)) + 20
+  box(pad, y, W - 2 * pad, inH, C.panel)
+  frame(pad, y, W - 2 * pad - rw - pad, inH, C.blue)
+  if n.focus == 1 then codeLine(pad + 10, y, W - 3 * pad - rw - 24, inH, f.text, false)
+  else codeLine(pad + 10, y, W - 3 * pad - rw - 24, inH, clean(f.text), true) end
+  local rx = W - pad - rw
+  if n.word then
+    text(rx, y + 4, rw, "PRÜFWORT", FONT_XS, C.dim, "c")
+    text(rx, y + 6 + th(FONT_XS), rw, n.word, FONT_L, C.green, "c")
+  elseif n.focus >= 2 then
+    text(rx, y + (inH - th(FONT_L)) / 2, rw, string.format("%d/%d", #clean(f.text), need), FONT_L, C.dim, "c")
+  end
+  y = y + inH + pad
+  -- Status: Fehler, Korrektur oder Zusammenfassung; rechts Speichern
+  local bw = txtSize("Speichern", FONT_STD) + 30
+  local msg, mcol = nil, C.dim
+  local fx = n.focus == 2 and n.fix or (n.focus >= 3 and f.fix)
+  if n.focus == 2 and n.err then msg, mcol = n.err, C.red
+  elseif n.focus >= 3 and n.zerr[n.focus - 2] then msg, mcol = n.zerr[n.focus - 2], C.red
+  elseif fx and #fx > 0 then msg, mcol = string.format("Tippfehler korrigiert: Zeichen %d %s -> %s", fx[1].pos, fx[1].was, fx[1].now), C.orange
+  elseif n.task then
     local t = n.task
     local cl = clsOf(t)
-    lines[#lines + 1] = {string.format("%s, O %.6f / %.6f, %s", cl ~= "" and cl or "dTP " .. t.dist, t.lat, t.lon, fmtDir(t.dir)), C.white}
-    lines[#lines + 1] = {string.format("dTP %d, Einflug %d m / %d km/h, Ziel %d km/h, %d min", t.dist, t.maxH, t.maxV, t.minF, t.work), C.white}
-    lines[#lines + 1] = {string.format("Platzhöhe %d m, %d Zonen", t.elev, n.nz), t.elev == 0 and C.orange or C.white}
-    if t.elev == 0 then lines[#lines + 1] = {"Platzhöhe 0 m - stimmt das?", C.orange} end
-  elseif n.err then lines[#lines + 1] = {"Aufgabe: " .. n.err, C.red}
-  else lines[#lines + 1] = {"Code der Aufgabe: 36 Buchstaben", C.dim} end
-  local fixes = {}
-  if n.fix then for _, f in ipairs(n.fix) do fixes[#fixes + 1] = string.format("Aufgabe Zeichen %d: %s -> %s", f.pos, f.was, f.now) end end
-  for i = 3, #n.fields do
-    local f = n.fields[i]
-    if n.zerr[i - 2] then lines[#lines + 1] = {f.label .. ": " .. n.zerr[i - 2], C.red} end
-    if n.zones[i - 2] and f.fix then for _, x in ipairs(f.fix) do fixes[#fixes + 1] = string.format("%s Zeichen %d: %s -> %s", f.label, x.pos, x.was, x.now) end end
-  end
-  if #fixes > 0 then lines[#lines + 1] = {"korrigiert: " .. table.concat(fixes, ", "), C.orange} end
-  for i, l in ipairs(lines) do
-    if sy + th(FONT_S) > H - pad then break end
-    text(lx, sy, lw, l[1], fit(l[1], lw, {FONT_S, FONT_XS}), l[2], "l")
-    sy = sy + th(FONT_S) + 2
-  end
-  -- rechts: Pruefwort, Tastatur, Knoepfe
-  local wh = th(FONT_XS) + th(FONT_XL) + th(FONT_XS) + 18
-  box(rx, y, rw, wh, C.panel)
-  text(rx, y + 4, rw, "PRÜFWORT", FONT_XS, C.dim, "c")
-  local status
-  if n.word then
-    text(rx, y + 8 + th(FONT_XS), rw, n.word, FONT_XL, C.green, "c")
-    status = {"gleich wie in der App?", C.dim}
-  else
-    text(rx, y + 8 + th(FONT_XS), rw, "- - - -", FONT_XL, C.dim, "c")
-    if n.task then
-      local missing
-      for i = 1, n.nz do if not n.zones[i] then missing = i; break end end
-      status = {missing and string.format("Zone %d von %d fehlt", missing, n.nz) or "", C.red}
-    else status = {"Code fehlt", C.dim} end
-  end
-  text(rx, y + 12 + th(FONT_XS) + th(FONT_XL), rw, status[1], FONT_XS, status[2], "c")
-  local btnH = math.max(34, th(FONT_STD) + 14)
-  local ky = y + wh + pad
-  local kh = H - pad - btnH - pad - ky
-  if n.focus == 1 then keyboard(s, rx, ky, rw, kh, KB_NAME, 8, function(k) typeKey(s, k) end)
-  else keyboard(s, rx, ky, rw, kh, KB_CODE, 6, function(k) typeKey(s, k) end) end
-  local half = (rw - pad) / 2
-  button(s, rx, H - pad - btnH, half, btnH, "Abbrechen", function() s.screen = "main" end)
-  button(s, rx + half + pad, H - pad - btnH, half, btnH, "Speichern", n.word and function()
+    msg = string.format("%s, %s, dTP %d, Platzhöhe %d m, %d Zonen", cl ~= "" and cl or "eigene Werte", fmtDir(t.dir), t.dist, t.elev, n.nz)
+    if t.elev == 0 then msg, mcol = msg .. ". Platzhöhe 0 m: stimmt das?", C.orange end
+    if not n.complete then
+      for i = 1, n.nz do if not n.zones[i] then msg = msg .. string.format(". Jetzt Zone %d eintippen.", i); break end end
+    else msg = msg .. ". Prüfwort mit der App vergleichen." end
+  else msg = "Code der Aufgabe aus der App eintippen (36 Buchstaben)." end
+  local lines = wrap2(msg, W - 3 * pad - bw, FONT_S)
+  for k, l in ipairs(lines) do text(pad, y + (k - 1) * (th(FONT_S) + 2), W - 3 * pad - bw, l, fit(l, W - 3 * pad - bw, {FONT_S, FONT_XS}), mcol, "l") end
+  button(s, W - pad - bw, y, bw, stH, "Speichern", n.word and function()
     local t = copyTask(n.task)
     t.zones = n.zones
     local name = n.fields[1].text:gsub("^%s+", ""):gsub("%s+$", "")
@@ -885,6 +922,10 @@ local function paintNew(s)
     if not saveTasks(s) then s.msg = "Schreiben fehlgeschlagen (scripts/skynav/feld.lua)" end
     s.screen = "main"
   end or nil, n.word and "pri" or "off")
+  y = y + stH + pad
+  -- Tastatur ueber die ganze Breite
+  if n.focus == 1 then keyboard(s, pad, y, W - 2 * pad, H - pad - y, KB_NAME, 10, function(k) typeKey(s, k) end)
+  else keyboard(s, pad, y, W - 2 * pad, H - pad - y, KB_CODE, 8, function(k) typeKey(s, k) end) end
 end
 
 -- ---------------------------------------------------------------- Seite: Aenderung
@@ -901,54 +942,38 @@ end
 
 local function paintChange(s)
   local c = s.chg
-  local hb = header(s, "Änderung - " .. c.orig.name, "Zurück")
-  local pad = math.max(6, fl(W * 0.012))
-  local lw = fl(W * 0.55)
-  local lx, rx = pad, pad + lw + pad
-  local rw = W - rx - pad
+  local hb = header(s, "Änderung", "Zurück")
+  local pad, tabH, inH, stH = entryLayout()
   local y = hb + pad
-  local rowH = th(FONT_STD) + 12
-  local labW = txtSize("CODE", FONT_XS) + 12
-  text(lx, y + (rowH - th(FONT_XS)) / 2, labW, "CODE", FONT_XS, C.dim, "l")
-  box(lx + labW, y, lw - labW, rowH, C.panel)
-  frame(lx + labW, y, lw - labW, rowH, C.blue)
-  local str = grouped(clean(c.text))
-  local tw = text(lx + labW + 8, y + (rowH - th(FONT_STD)) / 2, lw - labW - 16, str, fit(str .. "_", lw - labW - 40, {FONT_STD, FONT_S}), C.white, "l")
-  box(lx + labW + 10 + tw, y + 5, 3, rowH - 10, C.blue)
-  if c.task then text(lx + lw - 30, y + (rowH - th(FONT_STD)) / 2, 24, "OK", FONT_STD, (c.fix and #c.fix > 0) and C.orange or C.green, "r") end
-  local sy = y + rowH + pad
-  text(lx, sy, lw, "WAS SICH ÄNDERT", FONT_XS, C.dim, "l")
-  sy = sy + th(FONT_XS) + 4
-  local lines = {}
-  local b, t = c.base, c.task
+  local info = string.format("%s, Grundlage %s", c.orig.name, word(c.base))
+  text(pad, y + (tabH - th(FONT_S)) / 2, W - 2 * pad, info, fit(info, W - 2 * pad, {FONT_S, FONT_XS}), C.dim, "l")
+  y = y + tabH + pad
+  local t = c.task
+  local rw = math.max(txtSize("PRÜFWORT", FONT_XS), txtSize("WWWW", FONT_L)) + 20
+  box(pad, y, W - 2 * pad, inH, C.panel)
+  frame(pad, y, W - 2 * pad - rw - pad, inH, C.blue)
+  codeLine(pad + 10, y, W - 3 * pad - rw - 24, inH, clean(c.text), true)
+  local rx = W - pad - rw
   if t then
-    if c.mask & 1 ~= 0 then lines[#lines + 1] = string.format("Ursprung -> %.6f / %.6f", t.lat, t.lon) end
-    if c.mask & 2 ~= 0 then lines[#lines + 1] = string.format("Platzhöhe %d -> %d m", rnd(c.orig.elev or 0), t.elev) end
-    if c.mask & 4 ~= 0 then lines[#lines + 1] = string.format("Richtung %s -> %s", fmtDir(c.orig.dir), fmtDir(t.dir)) end
-    if c.mask & 8 ~= 0 then lines[#lines + 1] = string.format("dTP %d -> %d m", rnd(c.orig.dist or 0), t.dist) end
-    if c.mask & 16 ~= 0 then lines[#lines + 1] = string.format("Limits -> %d m / %d km/h, Ziel %d km/h, %d min", t.maxH, t.maxV, t.minF, t.work) end
-    if c.fix and #c.fix > 0 then lines[#lines + 1] = string.format("korrigiert: %s -> %s", c.fix[1].was, c.fix[1].now) end
-  elseif c.err then lines[#lines + 1] = c.err
-  else lines[#lines + 1] = "Änderungs-Code aus der App eintippen" end
-  for _, l in ipairs(lines) do
-    text(lx, sy, lw, l, fit(l, lw, {FONT_STD, FONT_S, FONT_XS}), t and C.blue or (c.err and C.red or C.dim), "l")
-    sy = sy + th(FONT_STD) + 4
+    text(rx, y + 4, rw, "PRÜFWORT", FONT_XS, C.dim, "c")
+    text(rx, y + 6 + th(FONT_XS), rw, c.word, FONT_L, C.green, "c")
+  else text(rx, y + (inH - th(FONT_L)) / 2, rw, tostring(#clean(c.text)), FONT_L, C.dim, "c") end
+  y = y + inH + pad
+  local parts = {}
+  if t then
+    if c.mask & 1 ~= 0 then parts[#parts + 1] = string.format("Ursprung %.6f / %.6f", t.lat, t.lon) end
+    if c.mask & 2 ~= 0 then parts[#parts + 1] = string.format("Platzhöhe %d -> %d m", rnd(c.orig.elev or 0), t.elev) end
+    if c.mask & 4 ~= 0 then parts[#parts + 1] = string.format("Richtung %s -> %s", fmtDir(c.orig.dir), fmtDir(t.dir)) end
+    if c.mask & 8 ~= 0 then parts[#parts + 1] = string.format("dTP %d -> %d m", rnd(c.orig.dist or 0), t.dist) end
+    if c.mask & 16 ~= 0 then parts[#parts + 1] = string.format("Limits %d m, %d km/h, Ziel %d km/h, %d min", t.maxH, t.maxV, t.minF, t.work) end
+    if c.fix and #c.fix > 0 then parts[#parts + 1] = string.format("korrigiert: Zeichen %d %s -> %s", c.fix[1].pos, c.fix[1].was, c.fix[1].now) end
   end
-  text(lx, sy + 4, lw, "Grundlage: " .. c.orig.name .. " (" .. word(c.base) .. ")", FONT_XS, C.dim, "l")
-  local wh = th(FONT_XS) + th(FONT_XL) + th(FONT_XS) + 18
-  box(rx, y, rw, wh, C.panel)
-  text(rx, y + 4, rw, "NEUES PRÜFWORT", FONT_XS, C.dim, "c")
-  text(rx, y + 8 + th(FONT_XS), rw, t and c.word or "- - - -", FONT_XL, t and C.green or C.dim, "c")
-  text(rx, y + 12 + th(FONT_XS) + th(FONT_XL), rw, t and "gleich wie in der App?" or "", FONT_XS, C.dim, "c")
-  local btnH = math.max(34, th(FONT_STD) + 14)
-  local ky = y + wh + pad
-  keyboard(s, rx, ky, rw, H - pad - btnH - pad - ky, KB_CODE, 6, function(k)
-    if k == "DEL" then c.text = c.text:sub(1, -2) elseif #clean(c.text) < 40 then c.text = c.text .. k end
-    checkChange(s)
-  end)
-  local half = (rw - pad) / 2
-  button(s, rx, H - pad - btnH, half, btnH, "Abbrechen", function() s.screen = "main" end)
-  button(s, rx + half + pad, H - pad - btnH, half, btnH, "Übernehmen", t and function()
+  local msg = t and table.concat(parts, ", ") or (c.err or "Änderungs-Code aus der App eintippen.")
+  local mcol = t and C.blue or (c.err and C.red or C.dim)
+  local bw = txtSize("Übernehmen", FONT_STD) + 30
+  local lines = wrap2(msg, W - 3 * pad - bw, FONT_S)
+  for k, l in ipairs(lines) do text(pad, y + (k - 1) * (th(FONT_S) + 2), W - 3 * pad - bw, l, fit(l, W - 3 * pad - bw, {FONT_S, FONT_XS}), mcol, "l") end
+  button(s, W - pad - bw, y, bw, stH, "Übernehmen", t and function()
     local o = c.orig
     local nt = copyTask(t)
     nt.name, nt.cls, nt.src = o.name, clsOf(t), "feld"
@@ -960,6 +985,11 @@ local function paintChange(s)
     if not saveTasks(s) then s.msg = "Schreiben fehlgeschlagen (scripts/skynav/feld.lua)" end
     s.screen = "main"
   end or nil, t and "pri" or "off")
+  y = y + stH + pad
+  keyboard(s, pad, y, W - 2 * pad, H - pad - y, KB_CODE, 8, function(k)
+    if k == "DEL" then c.text = c.text:sub(1, -2) elseif #clean(c.text) < 40 then c.text = c.text .. k end
+    checkChange(s)
+  end)
 end
 
 -- ---------------------------------------------------------------- Ethos
