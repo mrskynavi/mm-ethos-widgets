@@ -14,6 +14,8 @@ Ethos-Lua-Widgets von Mächler Modelle. Der MM Flight Analyzer holt sie von hier
 
 `scripts/skynav/aufgaben.lua` schreibt ebenfalls die App (Tab SkyNavigator), die Flüge legt das Widget in `scripts/skynav/fluege/` ab, die gelernten Wenderadien in `scripts/skynav/radien.lua`.
 
+SkyNavigator ab 1.30: In der Konfiguration wählt man das angeschlossene Sensor-Gerät (SM GPS-Logger 3 oder FrSky Vario mit FrSky-GPS) und ob zusätzlich ein Stabi-Empfänger dran ist. Das Widget sucht GPS, Höhe, Vario, Fahrt, Kurs, Satelliten, Querlage, Nickwinkel und Beschleunigung selbst (S.Port-AppID, sonst Ethos-Name). Gibt es `scripts/tekkal/korrektur_<Modell>.txt`, nimmt es mit dem Logger „TEK korr.“ und „Fahrt korr.“. Einzelne Quellen von Hand gehen vor (Schalter „Einzelne Quellen von Hand“).
+
 `scripts/skynav/audio/links.wav` und `rechts.wav` sind die Sprachdateien für die Kurs-Ansage „xx links/rechts“ (16 kHz, 16 Bit, mono).
 
 `scripts/skynavtool/` ist kein Widget, sondern das Systemtool „SkyNav Aufgabe“ (am Sender unter System, Werkzeuge). Damit tippt man den Buchstaben-Code einer Aufgabe ab, den die App nach dem Scan des QR-Codes zeigt, und stellt vor jedem Durchgang das Startfenster ein. Es schreibt `scripts/skynav/feld.lua`; das Widget SkyNavigator liest diese Datei zusätzlich zu `aufgaben.lua`.

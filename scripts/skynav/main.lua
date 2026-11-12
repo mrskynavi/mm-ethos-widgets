@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.29
+-- @version 1.30
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.29"
+local VERSION = "1.30"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1427,6 +1427,208 @@ function BAL.satText(w)
   local n = readNumber(w.satSrc)
   if n and w.gpsOk and n < 6 then return string.format("  GPS %d SAT", math.floor(n + 0.5)) end
   return nil
+end
+
+-- ---------------------------------------------------------------- Sensoren automatisch (1.30)
+-- Statt jede Quelle einzeln zu waehlen, gibt man in der Konfiguration die angeschlossenen Geraete an:
+-- devMain 0 = keines (alle Quellen von Hand), 1 = SM GPS-Logger 3, 2 = FrSky Vario (dazu ein FrSky-GPS, falls
+-- vorhanden); devStabi = FrSky-Stabi-Empfaenger zusaetzlich (Querlage, Nickwinkel, Beschleunigung). Das Widget
+-- sucht die Telemetrie-Quellen selbst: zuerst ueber die S.Port-AppID mit Instanz 0..15 (sprachunabhaengig),
+-- dann ueber die Ethos-Namen (deutsch/englisch). Mit Logger UND Stabi muss der Logger laut SM eine andere
+-- Instanz haben (z.B. 1), darum wird dann bei Vario/Hoehe die hoechste Instanz genommen.
+-- Eine Quelle "von Hand" (Konfiguration, Einzelne Quellen) geht immer vor. Gibt es fuer das Modell
+-- scripts/tekkal/korrektur_<Modell>.txt (TEK-Kalibrierung), gelten mit dem Logger "TEK korr." als Vario und
+-- "Fahrt korr." als Fahrt. Vario-Art "Automatisch": Logger (TEK-Duese) und TEK korr. = TE, FrSky Vario =
+-- barometrisch. Gesucht wird beim Lesen und Oeffnen der Konfiguration sowie im Flug eine Rolle pro wakeup,
+-- alle 10 s (fehlt etwas) bzw. 30 s.
+BAL.SN = {
+  KEYS = {"gps", "gpsSpd", "gpsAlt", "gpsTime", "satSrc", "crsSrc", "relAlt", "vario", "airSrc", "bankSrc", "pitchSrc", "accZSrc", "accXSrc"},
+  ROLE = {
+    gps      = {dev = "gps",   lbl = "GPS",      ids = {0x0800}, names = {"GPS"}},
+    gpsSpd   = {dev = "gps",   lbl = "Geschw.",  ids = {0x0830}, names = {"GPS-Geschw.", "GSpd", "GPS Speed"}},
+    gpsAlt   = {dev = "gps",   lbl = "GPS-Höhe", ids = {0x0820}, names = {"GAlt", "GPS-Höhe", "GPS Alt"}},
+    gpsTime  = {dev = "gps",   lbl = "Zeit",     ids = {0x0850}, names = {"GPS-Zeit", "GPS Clock", "GPS Time"}},
+    satSrc   = {dev = "gps",   lbl = "Sats",     ids = {0x0860}, names = {"Satelliten", "Sats", "GPS Sats"}},
+    crsSrc   = {dev = "gps",   lbl = "Kurs",     ids = {0x5220, 0x0840}, names = {"Flugrichtung", "Flugr.", "Richtung", "GPS-Kurs", "Hdg", "GPS Course"}},
+    relAlt   = {dev = "baro",  lbl = "Höhe",     ids = {0x0100}, names = {"Altitude", "Flughöhe", "Höhe"}},
+    vario    = {dev = "baro",  lbl = "Vario",    ids = {0x0110}, names = {"Steigr. Vario", "VSpeed", "Vario"}, korr = "TEK korr."},
+    airSrc   = {dev = "sm",    lbl = "Fahrt",    ids = {0x0A00}, names = {"Airspeed", "ASpd"}, korr = "Fahrt korr."},
+    bankSrc  = {dev = "stabi", lbl = "Querlage", names = {"R.Winkel", "R.Angle", "Roll", "Rollwinkel"}},
+    pitchSrc = {dev = "stabi", lbl = "Nick",     names = {"P.Winkel", "P.Angle", "Pitch", "Nickwinkel"}},
+    accZSrc  = {dev = "acc",   lbl = "AccZ",     ids = {0x0720}, names = {"AccZ", "Acc Z"}},
+    accXSrc  = {dev = "acc",   lbl = "AccX",     ids = {0x0700}, names = {"AccX", "Acc X"}},
+  },
+  KORR_DIRS = {"/scripts/tekkal/", "scripts/tekkal/", "../tekkal/"},
+}
+
+-- Methode einer Ethos-Quelle sicher aufrufen (nil, wenn es sie nicht gibt)
+function BAL.SN.call(s, m)
+  local okF, f = pcall(function() return s[m] end)
+  if not (okF and type(f) == "function") then return nil end
+  local ok, v = pcall(f, s)
+  if ok then return v end
+  return nil
+end
+
+-- echte Quelle? (Ethos liefert fuer ein leeres Feld je nach Version nil, false oder eine Quelle "---")
+function BAL.SN.isSet(s)
+  if not validSource(s) then return false end
+  local none = rawget(_G, "CATEGORY_NONE")
+  if none ~= nil and BAL.SN.call(s, "category") == none then return false end
+  local n = BAL.SN.call(s, "name")
+  if n == "" or n == "---" then return false end
+  return true
+end
+
+function BAL.SN.on(w) return (w.devMain or 0) >= 1 or w.devStabi == true end
+
+-- Quelle ueber AppID (Zahl) oder Namen suchen; tele = nur Telemetrie-Sensoren annehmen
+function BAL.SN.get(spec, tele)
+  if not (system and system.getSource) then return nil end
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local ok, s
+  if type(spec) == "number" then
+    if not cat then return nil end
+    ok, s = pcall(system.getSource, {category = cat, appId = spec})
+  else
+    if tele and cat then ok, s = pcall(system.getSource, {category = cat, name = spec}) end
+    if not (ok and BAL.SN.isSet(s)) then ok, s = pcall(system.getSource, spec) end
+  end
+  if not (ok and BAL.SN.isSet(s)) then return nil end
+  if tele and cat then
+    local c = BAL.SN.call(s, "category")
+    local c2 = rawget(_G, "CATEGORY_TELEMETRY")
+    if c ~= nil and c ~= cat and c ~= c2 then return nil end   -- z.B. ein Kanal, der zufaellig so heisst
+  end
+  return s
+end
+
+-- Gibt es eine Korrektur der TEK-Kalibrierung fuer dieses Modell? (gleicher Dateiname wie in scripts/tekkal)
+function BAL.SN.korrFile()
+  if not (io and io.open) then return false end
+  local name = "korrektur_" .. tostring(currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
+  for _, d in ipairs(BAL.SN.KORR_DIRS) do
+    local ok, f = pcall(io.open, d .. name, "r")
+    if ok and f then pcall(f.close, f); return true end
+  end
+  return false
+end
+
+function BAL.SN.wanted(w, R)
+  local dm, st = w.devMain or 0, w.devStabi == true
+  if R.dev == "gps" or R.dev == "baro" then return dm >= 1 end
+  if R.dev == "sm" then return dm == 1 end
+  if R.dev == "stabi" then return st end
+  if R.dev == "acc" then return st or dm == 1 end
+  return false
+end
+
+-- wirksame Quelle einer Rolle setzen (w[k] liest der Rest des Widgets wie bisher)
+function BAL.SN.applyKey(w, k)
+  local man = w.man
+  if not man then return end
+  local m = man[k]
+  local f = BAL.SN.on(w) and w.snFound and w.snFound[k] or nil
+  w.snKorrK = w.snKorrK or {}
+  if BAL.SN.isSet(m) or not f then w[k] = m else w[k] = f end
+  if k == "vario" then
+    local vt = man.varioType or 0
+    if vt ~= 1 and vt ~= 2 then vt = (w.devMain == 2 and not (w[k] == f and w.snKorrK.vario)) and 2 or 1 end
+    w.varioType = vt
+  elseif k == "airSrc" then
+    w.airUnit = (w[k] == m) and (man.airUnit or 1) or 1   -- automatisch: Einheit der Quelle (ohne Einheit = Knoten)
+  end
+end
+
+function BAL.SN.apply(w)
+  for _, k in ipairs(BAL.SN.KEYS) do BAL.SN.applyKey(w, k) end
+end
+
+function BAL.SN.resolve(w, k)
+  local R = BAL.SN.ROLE[k]
+  local found, korr = nil, false
+  if BAL.SN.wanted(w, R) then
+    if R.korr and w.devMain == 1 and w.snKorr then found = BAL.SN.get(R.korr, false); korr = found ~= nil end
+    local desc = R.dev == "baro" and w.devMain == 1 and w.devStabi == true
+    for _, id in ipairs(R.ids or {}) do
+      if found then break end
+      for j = 0, 15 do
+        found = BAL.SN.get(id + (desc and 15 - j or j))
+        if found then break end
+      end
+    end
+    for _, n in ipairs(R.names) do
+      if found then break end
+      found = BAL.SN.get(n, true)
+    end
+  end
+  w.snFound[k] = found
+  w.snKorrK[k] = korr
+  BAL.SN.applyKey(w, k)
+end
+
+function BAL.SN.resolveAll(w)
+  if not w.man then return end
+  w.snFound, w.snKorrK = w.snFound or {}, w.snKorrK or {}
+  w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false
+  for _, k in ipairs(BAL.SN.KEYS) do BAL.SN.resolve(w, k) end
+end
+
+-- im Flug: eine Rolle pro wakeup, dann Pause (neu gefundene Sensoren, Modellwechsel, neue Korrektur-Datei)
+function BAL.SN.step(w, now)
+  if not w.man or not BAL.SN.on(w) then return end
+  if w.snNext and now < w.snNext then return end
+  local i = (w.snI or 0) + 1
+  local k = BAL.SN.KEYS[i]
+  if not k then
+    w.snI = 0
+    local miss = false
+    for _, kk in ipairs(BAL.SN.KEYS) do
+      if BAL.SN.wanted(w, BAL.SN.ROLE[kk]) and not BAL.SN.isSet(w[kk]) then miss = true end
+    end
+    w.snNext = now + (miss and 10 or 30)
+    return
+  end
+  w.snFound, w.snKorrK = w.snFound or {}, w.snKorrK or {}
+  if i == 1 then w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false end
+  BAL.SN.resolve(w, k)
+  w.snI = i
+end
+
+-- von Hand gewaehlte Werte merken (read) und fuer den Speicher zurueckgeben (write)
+function BAL.SN.load(w)
+  local man = {varioType = w.varioType, airUnit = w.airUnit}
+  for _, k in ipairs(BAL.SN.KEYS) do man[k] = w[k] end
+  w.man, w.snFound, w.snKorrK, w.snI, w.snNext = man, {}, {}, 0, nil
+  BAL.SN.resolveAll(w)
+end
+function BAL.SN.stored(w, k)
+  if w.man and (BAL.SN.ROLE[k] or k == "varioType" or k == "airUnit") then return w.man[k] end
+  return w[k]
+end
+
+-- Zusammenfassung fuer die Konfiguration: Zeilen mit je bis 4 Eintraegen
+function BAL.SN.summary(w)
+  local found, miss = {}, {}
+  for _, k in ipairs(BAL.SN.KEYS) do
+    local R = BAL.SN.ROLE[k]
+    local hand = w.man and BAL.SN.isSet(w.man[k])
+    if hand then found[#found + 1] = R.lbl .. " (Hand)"
+    elseif BAL.SN.wanted(w, R) then
+      local s = w.snFound and w.snFound[k]
+      if s then
+        local txt = R.lbl
+        if w.snKorrK and w.snKorrK[k] then txt = R.lbl .. " (" .. R.korr .. ")" end
+        found[#found + 1] = txt
+      elseif k ~= "satSrc" and k ~= "crsSrc" and k ~= "gpsSpd" then miss[#miss + 1] = R.lbl end
+    end
+  end
+  local function rows(t)
+    local r = {}
+    for i = 1, #t, 4 do r[#r + 1] = table.concat(t, ", ", i, math.min(i + 3, #t)) end
+    return r
+  end
+  return rows(found), rows(miss)
 end
 
 -- Liefert eine neue Messung (fix) oder nil, wenn kein frischer GPS-Fix kam.
@@ -3010,6 +3212,7 @@ local function wakeup(w)
   w.armOn, w.armInit = arm, true
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
+  BAL.SN.step(w, now)
   BAL.AS.read(w, now, dt)
   BAL.QL.read(w, now, dt)
   BAL.QA.step(w, now, dt)
@@ -4938,15 +5141,22 @@ local function configure(w)
     form.addChoiceField(l, nil, ch, function() return clamp(w.taskIdx, 0, #w.tasks) end, function(v)
       w.taskIdx = v; w.taskSig = nil; refreshTasks(w, os.clock(), true) end)
   end
-  -- Sensoren
-  addSource(w, "GPS", "gps")
-  addSource(w, "GPS-Geschw. (empfohlen)", "gpsSpd")
-  addSource(w, "GPS-Höhe (ü. M.)", "gpsAlt")
-  addSource(w, "GPS-Zeit (sonst Senderuhr, Uhr mit *)", "gpsTime")
-  addSource(w, "Relative Höhe (optional)", "relAlt")
+  -- Sensoren: Geraete waehlen, das Widget sucht die Quellen selbst (BAL.SN)
+  if not w.man then BAL.SN.load(w) else BAL.SN.resolveAll(w) end
+  local function rebuild()
+    BAL.SN.resolveAll(w)
+    if form.clear then pcall(form.clear); configure(w) end
+  end
+  addChoice(w, "Sensor-Gerät", "devMain", {{"SM GPS-Logger 3", 1}, {"FrSky Vario (+ FrSky-GPS)", 2}, {"keines (Quellen von Hand)", 0}}, rebuild)
+  l = form.addLine("Zusätzlich Stabi-Empfänger (Querlage, Lage)")
+  form.addBooleanField(l, form.getFieldSlots(l)[0], function() return w.devStabi == true end, function(v) w.devStabi = v; rebuild() end)
+  if BAL.SN.on(w) then
+    local fr, mi = BAL.SN.summary(w)
+    for i, t in ipairs(fr) do l = form.addLine(i == 1 and "  gefunden" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+    for i, t in ipairs(mi) do l = form.addLine(i == 1 and "  fehlt" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+  end
+  if w.devStabi or BAL.SN.isSet(w.man.bankSrc) then addBool(w, "Querlage: Richtung umkehren", "bankInv") end
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
-  addSource(w, "Vario", "vario")
-  addChoice(w, "Vario-Art", "varioType", {{"TE (Sensor kompensiert)", 1}, {"Barometrisch (Widget kompensiert)", 2}})
   addChoice(w, "Varioton-Ausgabe", "vtDev", {{"Widget-Toene", 1}, {"Ethos-Vario (Quelle SkyNav Vario)", 2}})
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
@@ -4960,16 +5170,7 @@ local function configure(w)
   addBool(w, "Gleiten: Kurs-Ticker (Klicks bei wachsender Ablage)", "ticker")
   addSource(w, "MC-Quelle (optional)", "mcSrc")
   addSource(w, "Ballast-Quelle (optional, 0 bis 100 %)", "balSrc")
-  addSource(w, "Querlage (optional, Rollwinkel Grad)", "bankSrc")
-  addBool(w, "Querlage: Richtung umkehren", "bankInv")
   addSource(w, "Querruder-Knüppel (Querlage ohne Lagesensor)", "ailSrc")
-  addSource(w, "AccZ (optional, Varioton schneller)", "accZSrc")
-  addSource(w, "AccX (optional, mit AccZ)", "accXSrc")
-  addSource(w, "Nickwinkel (optional, mit AccZ)", "pitchSrc")
-  addSource(w, "Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
-  addChoice(w, "Fahrt-Sensor: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
-  addSource(w, "Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
-  addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
   l = form.addLine("Querlage nullen (Flügel waagrecht)")
   if form.addTextButton then
     form.addTextButton(l, nil, "Jetzt nullen", function()
@@ -4984,6 +5185,40 @@ local function configure(w)
   addNumber(w, "Startfenster von Hand: Stunde (-1 = Aufgabe)", "slotH", -1, 23)
   addNumber(w, "Startfenster von Hand: Minute", "slotM", 0, 59)
   addNumber(w, "Startfenster von Hand: Länge (min)", "slotLen", 1, 120)
+  -- Einzelne Quellen von Hand: gehen der Automatik vor (leer = automatisch)
+  local hand = not BAL.SN.on(w)
+  if not hand and form.clear then
+    l = form.addLine("Einzelne Quellen von Hand")
+    form.addBooleanField(l, form.getFieldSlots(l)[0], function() return w.snShow == true end, function(v)
+      w.snShow = v; pcall(form.clear); configure(w) end)
+  end
+  if hand or w.snShow or not form.clear then
+    local function man(label, k)
+      local ln = form.addLine(label)
+      return form.addSourceField(ln, nil, function() return w.man[k] end, function(v) w.man[k] = v; BAL.SN.applyKey(w, k) end)
+    end
+    local function manCh(label, k, ch)
+      local ln = form.addLine(label)
+      return form.addChoiceField(ln, nil, ch, function() return w.man[k] end, function(v) w.man[k] = v; BAL.SN.apply(w) end)
+    end
+    if not hand then l = form.addLine("  (leer = automatisch)") end
+    man("GPS", "gps")
+    man("GPS-Geschw. (empfohlen)", "gpsSpd")
+    man("GPS-Höhe (ü. M.)", "gpsAlt")
+    man("GPS-Zeit (sonst Senderuhr, Uhr mit *)", "gpsTime")
+    man("Relative Höhe (optional)", "relAlt")
+    man("Vario", "vario")
+    manCh("Vario-Art", "varioType", {{"Automatisch (nach Gerät)", 0}, {"TE (Sensor kompensiert)", 1}, {"Barometrisch (Widget kompensiert)", 2}})
+    man("Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
+    manCh("Fahrt-Sensor: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
+    man("Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
+    man("GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
+    man("Querlage (optional, Rollwinkel Grad)", "bankSrc")
+    if not (w.devStabi or BAL.SN.isSet(w.man.bankSrc)) then addBool(w, "Querlage: Richtung umkehren", "bankInv") end
+    man("Nickwinkel (optional, mit AccZ)", "pitchSrc")
+    man("AccZ (optional, Varioton schneller)", "accZSrc")
+    man("AccX (optional, mit AccZ)", "accXSrc")
+  end
   l = form.addLine("Weitere Einstellungen")
   form.addStaticText(l, form.getFieldSlots(l)[0], "in der App (Tab SkyNavigator)")
   l = form.addLine("Version")
@@ -5002,6 +5237,7 @@ local function setDefaults(w)
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
   w.vtStyle, w.vtDev = 1, 1
+  w.devMain, w.devStabi, w.varioType = 1, false, 0   -- 1.30: neue Widgets suchen die Sensoren des SM GPS-Logger 3
 end
 
 local function read(w)
@@ -5026,32 +5262,37 @@ local function read(w)
     w.satSrc = validSource(storage.read("satSrc"))
     v = storage.read("vtStyle"); w.vtStyle = (type(v) == "number" and v >= 1 and v <= 4) and v or 1  -- 1.28: Klang am Sender
     v = storage.read("vtDev"); w.vtDev = v == 2 and 2 or 1                                              -- 1.29
+    v = storage.read("devMain"); w.devMain = (v == 1 or v == 2) and v or 0                             -- 1.30: Geraete, aeltere
+    w.devStabi = storage.read("devStabi") == true                                                       -- Konfigurationen: von Hand
   end
+  BAL.SN.load(w)
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
 end
 
 local function write(w)
   storage.write("ver", STORE_VER)
-  for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
-  for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
+  for _, k in ipairs(SOURCE_KEYS) do storage.write(k, BAL.SN.stored(w, k)) end
+  for _, d in ipairs(NUM_DEFS) do storage.write(d.key, BAL.SN.stored(w, d.key)) end
   for _, d in ipairs(BOOL_DEFS) do storage.write(d.key, w[d.key]) end
   for _, d in ipairs(TEXT_DEFS) do storage.write(d.key, w[d.key] or "") end
   storage.write("balSrc", w.balSrc)
   storage.write("balMax", w.balMax)
   storage.write("ticker", w.ticker ~= false)
-  storage.write("bankSrc", w.bankSrc)
+  storage.write("bankSrc", BAL.SN.stored(w, "bankSrc"))
   storage.write("bankInv", w.bankInv == true)
-  storage.write("accZSrc", w.accZSrc)
-  storage.write("accXSrc", w.accXSrc)
-  storage.write("pitchSrc", w.pitchSrc)
+  storage.write("accZSrc", BAL.SN.stored(w, "accZSrc"))
+  storage.write("accXSrc", BAL.SN.stored(w, "accXSrc"))
+  storage.write("pitchSrc", BAL.SN.stored(w, "pitchSrc"))
   storage.write("ailSrc", w.ailSrc)
-  storage.write("airSrc", w.airSrc)
-  storage.write("airUnit", w.airUnit or 1)
-  storage.write("crsSrc", w.crsSrc)
-  storage.write("satSrc", w.satSrc)
+  storage.write("airSrc", BAL.SN.stored(w, "airSrc"))
+  storage.write("airUnit", BAL.SN.stored(w, "airUnit") or 1)
+  storage.write("crsSrc", BAL.SN.stored(w, "crsSrc"))
+  storage.write("satSrc", BAL.SN.stored(w, "satSrc"))
   storage.write("vtStyle", w.vtStyle or 1)
   storage.write("vtDev", w.vtDev or 1)
+  storage.write("devMain", w.devMain or 0)
+  storage.write("devStabi", w.devStabi == true)
 end
 
 local function init()
