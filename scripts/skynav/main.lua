@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.27
+-- @version 1.27.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.27"
+local VERSION = "1.27.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1498,7 +1498,9 @@ local function readInputs(w, now, dt)
   end
   -- Kurs vom GPS-Empfaenger (Quelle "GPS-Kurs", aus der Doppler-Geschwindigkeit, ohne die rund 1 s Verzug der
   -- 2-s-Basis); erst ab 3 m/s, darunter ist er unruhig
+  -- (SM GPS-Logger 3: DIY-Wert 0522 "Flugrichtung"; kommt er roh in 0.1 Grad, wird er umgerechnet)
   local cs = readNumber(w.crsSrc)
+  if cs and cs > 360 and cs <= 3600 then cs = cs / 10 end
   if cs and gs >= 3 and cs >= 0 and cs <= 360 then w.crs = cs % 360 end
   local ve, vn = nil, nil
   if w.crs then local sx, sy = dirVec(w.crs); ve, vn = gs * sx, gs * sy end
@@ -4940,7 +4942,7 @@ local function configure(w)
   addSource(w, "Nickwinkel (optional, mit AccZ)", "pitchSrc")
   addSource(w, "Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
   addChoice(w, "Fahrt-Sensor: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
-  addSource(w, "GPS-Kurs (optional, Richtung)", "crsSrc")
+  addSource(w, "Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
   addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
   l = form.addLine("Querlage nullen (Flügel waagrecht)")
   if form.addTextButton then
