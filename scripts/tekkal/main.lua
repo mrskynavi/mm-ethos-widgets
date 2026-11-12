@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.1
+-- @version 1.2
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -14,10 +14,16 @@
 --   Fahrt:  k = v_wahr / v_mess. Neuer Logger-Faktor = alter Faktor * k.
 --   TEK:    TE_wahr = TE_mess + x * d(v_mess^2/2g)/dt mit x = (1 - c)/c. Ist die Fahrt richtig gemessen
 --           (statischer Druck im Rumpf stimmt), ist x = k^2 - 1. Das Widget misst x zusaetzlich direkt.
---   Elektronische Korrektur statt Duese aendern: Quelle "TEK korr." (registriert dieses Skript) =
---   TEK-Vario + x * d(v^2/2g)/dt aus der Logger-Fahrt. In SkyNavigator (Vario-Art TE) oder im
---   Ethos-Vario als Quelle waehlen. x stellt man in der Konfiguration ein ("TEK-Korrektur %"),
---   oder man uebernimmt den gemessenen Wert mit dem Knopf UEBERNEHMEN.
+--   Elektronische Korrektur pro Modell statt Duese oder Logger aendern (1.2): dieses Skript registriert
+--   zwei Quellen. "Fahrt korr." = Logger-Fahrt * airK (IAS in m/s, als "Fahrt Staudruck" in SkyNavigator,
+--   Sollfahrt, Polarflug waehlen), "TEK korr." = TEK-Vario + x * d(v^2/2g)/dt aus der Logger-Fahrt (als
+--   Vario mit Vario-Art TE oder im Ethos-Vario). Beide Werte stellt man in der Konfiguration ein oder
+--   uebernimmt die Messung mit UEBERNEHMEN. Gemessen wird immer gegen die rohe Logger-Fahrt, eine schon
+--   eingestellte Korrektur verfaelscht die neue Messung also nicht. Der Logger-Faktor muss dann so bleiben,
+--   wie er beim Messen war (Vorgabe 100 %).
+--   Die Korrekturen, die Fahrt-Einstellungen und die Sensornamen liegen in korrektur_<Modell>.txt. Damit
+--   rechnen die Quellen auch, wenn das Widget nicht auf einem Bildschirm des Modells liegt (es muss nur
+--   einmal konfiguriert worden sein).
 --
 -- Fahrt-Faktor (Kreise): pro voller Kreis (360 Grad, Drehrate ueber 6 Grad/s) Fit
 --   |Bodenvektor - Wind| = k * Fahrt_horizontal ueber Wind Ost/Nord und k (Kasa-Startwert, dann
@@ -56,6 +62,7 @@ local NUM_DEFS = {
   {key = "tones",     def = 1},    -- Toene bei Kreis gezaehlt / verworfen
   {key = "circles",   def = 3},    -- so viele Kreise braucht der Fahrt-Faktor
   {key = "manSec",    def = 30},   -- so viele Sekunden Fahrtwechsel braucht die TEK-Messung
+  {key = "airK",      def = 1000}, -- Fahrt-Korrektur fuer die Quelle "Fahrt korr." (0.1 %, auf die Logger-Fahrt)
 }
 
 local function clamp(x, lo, hi)
@@ -160,17 +167,100 @@ local function currentModelName()
 end
 
 -- ---------------------------------------------------------------- Zustand (einmal pro Skript)
--- Widget und Quelle "TEK korr." teilen sich Messung und Einstellungen. Die Einstellungen kommen vom
--- Widget (das muss dafuer auf einem Bildschirm des Modells liegen).
+-- Widget und Quellen ("TEK korr.", "Fahrt korr.") teilen sich Messung und Einstellungen. Die Einstellungen
+-- kommen vom Widget; liegt es nicht auf einem Bildschirm des aktiven Modells, aus korrektur_<Modell>.txt.
 
-local CFG = nil          -- Einstellungen des (letzten) Widgets
+local CFG = nil          -- Einstellungen des (letzten) Widgets, CFG.model = sein Modell
 local S = nil            -- Messzustand
+local FC = nil           -- Einstellungen aus der Datei (ohne Widget), {model, t, cfg}
 
 local CIRCLE_DT = 0.3    -- Abstand der Kreis-Stuetzwerte (s)
 local CIRCLE_MAX = 200   -- hoechstens so viele Stuetzwerte pro Kreis (60 s)
 local GRID = 0.1         -- Raster der TEK-Messung (s)
 local LAG_MIN, LAG_MAX = -5, 10   -- Verzoegerungen in Rasterschritten
 local RING = 16
+
+-- ---------------------------------------------------------------- Korrekturen pro Modell
+-- korrektur_<Modell>.txt neben diesem Skript, Zeilen key=wert: Korrekturen (tekX, tekLag, airK), Einstellungen der
+-- Fahrt und die Namen der Sensoren (air, vario, alt). Damit rechnen die Quellen auch ohne das Widget auf dem
+-- Bildschirm. UEBERNEHMEN kann den Widget-Speicher nicht schreiben (das macht Ethos nur beim Schliessen der
+-- Konfiguration), deshalb gilt die Datei: read() liest sie, UEBERNEHMEN und write() schreiben sie.
+local KORR_NUM = {"tekX", "tekLag", "airK", "airUnit", "airKind", "altKind", "fieldAlt"}
+local KORR_SRC = {"air", "vario", "alt"}
+
+local function korrName(mname)
+  return "korrektur_" .. tostring(mname or currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
+end
+
+local function srcName(src)
+  if not validSource(src) then return "" end
+  local ok, n = pcall(src.name, src)
+  if ok and type(n) == "string" then return (n:gsub("[\r\n]", " ")) end
+  return ""
+end
+
+local function readKorr(mname)
+  if not (io and io.open) then return nil end
+  local ok, f = pcall(io.open, korrName(mname), "r")
+  if not (ok and f) then return nil end
+  local okR, text = pcall(f.read, f, "*a")
+  pcall(f.close, f)
+  text = okR and tostring(text or "") or ""
+  local r = {}
+  local a, b = text:match("^(%-?%d+);(%d+)")                  -- Format 1.1: tekX;tekLag
+  if a then r.tekX, r.tekLag = a, b end
+  for k, v in text:gmatch("([%w]+)=([^\r\n]*)") do r[k] = v end
+  return r
+end
+
+local function saveKorr(w)
+  if not (io and io.open) then return end
+  local t = {}
+  for _, k in ipairs(KORR_NUM) do t[#t + 1] = string.format("%s=%d", k, math.floor((w[k] or 0) + 0.5)) end
+  local old = readKorr()
+  for _, k in ipairs(KORR_SRC) do
+    local n = srcName(w[k])
+    if n == "" and old and old[k] then n = old[k] end      -- Sensor (noch) nicht gewaehlt: alten Namen behalten
+    t[#t + 1] = k .. "=" .. n
+  end
+  local ok, f = pcall(io.open, korrName(), "w")
+  if ok and f then
+    pcall(f.write, f, table.concat(t, "\n") .. "\n")
+    pcall(f.close, f)
+  end
+  FC = nil
+end
+
+local function applyKorrNums(w, r)
+  if not r then return end
+  local v = tonumber(r.tekX); if v then w.tekX = clamp(v, -500, 500) end
+  v = tonumber(r.tekLag); if v then w.tekLag = clamp(v, 0, RING - 1) end
+  v = tonumber(r.airK); if v then w.airK = clamp(v, 500, 2000) end
+end
+
+local function loadKorr(w) applyKorrNums(w, readKorr()) end
+
+-- Einstellungen aus der Datei, wenn kein Widget des aktiven Modells laeuft (alle 10 s neu gelesen)
+local function fileCfg(now, mname)
+  if FC and FC.model == mname and now - FC.t < 10 then return FC.cfg end
+  local r = readKorr(mname)
+  local cfg = nil
+  if r then
+    cfg = {tones = 2, model = mname, fromFile = true}
+    for _, d in ipairs(NUM_DEFS) do cfg[d.key] = d.def end
+    for _, k in ipairs(KORR_NUM) do local v = tonumber(r[k]); if v then cfg[k] = v end end
+    applyKorrNums(cfg, r)
+    for _, k in ipairs(KORR_SRC) do
+      local n = r[k]
+      if n and n ~= "" and system and system.getSource then
+        local ok, src = pcall(system.getSource, n)
+        if ok then cfg[k] = validSource(src) end
+      end
+    end
+  end
+  FC = {model = mname, t = now, cfg = cfg}
+  return cfg
+end
 
 local function newState()
   local s = {
@@ -284,7 +374,7 @@ local function fitStep(s, now)
   if why then
     s.rejects = s.rejects + 1
     s.lastReject = {t = now, why = why}
-    if CFG and CFG.tones == 1 then playToneSafe(400, 300) end
+    if s.tones == 1 then playToneSafe(400, 300) end
     return
   end
   local c = {k = f.k, wx = f.wx, wy = f.wy, wind = wind, from = (math.deg(atan2(f.wx, f.wy)) + 180) % 360,
@@ -293,7 +383,7 @@ local function fitStep(s, now)
   cs[#cs + 1] = c
   if #cs > 30 then table.remove(cs, 1) end
   s.lastCircle = c
-  if CFG and CFG.tones == 1 then
+  if s.tones == 1 then
     playToneSafe(1200, 80)
     playToneSafe(1600, 120)
   end
@@ -362,17 +452,19 @@ end
 -- Ein Schritt der Messung. Laeuft aus dem Widget und aus der Quelle "TEK korr.", rechnet aber nur einmal
 -- pro Zeitpunkt.
 local function measure(now)
-  if not CFG then return end
+  local mname = currentModelName()
+  local w = CFG
+  if not w or w.model ~= mname then w = fileCfg(now, mname) end
+  if not w then return end
   if not S then resetAll() end
   local s = S
   if s.lastT == now then return end
+  s.tones = w.tones
   local dt = s.lastT and (now - s.lastT) or 0
   s.lastT = now
   if dt > 0.5 then dt = 0.5 end
-  local w = CFG
 
   -- Modellwechsel: neu beginnen
-  local mname = currentModelName()
   if s.model == nil then s.model = mname
   elseif mname ~= s.model then resetAll(); S.model = mname; return end
 
@@ -392,6 +484,7 @@ local function measure(now)
     end
   end
   s.ias, s.tas = ias, tas
+  s.airKorr = ias and ias * (w.airK or 1000) / 1000     -- Quelle "Fahrt korr." (IAS wie der Logger, in m/s)
   local vario = readNumber(w.vario)
   s.vario = vario
   local gs = speedMs(w.gpsSpd, 1, 2)                 -- GPS-Geschw.: ohne Einheit km/h
@@ -538,8 +631,8 @@ local function resultText(w)
   if os and os.date then lines[#lines + 1] = os.date("%Y-%m-%d %H:%M") end
   local k, sp, n = airResult(s)
   if k then
-    lines[#lines + 1] = string.format("Fahrt: k %.3f +-%.3f aus %d Kreisen, Logger-Faktor %d %% -> %d %%",
-      k, sp, n, w.curFactor, math.floor(w.curFactor * k + 0.5))
+    lines[#lines + 1] = string.format("Fahrt: Korrektur %.1f %% +-%.1f aus %d Kreisen (Quelle Fahrt korr.: %.1f %%), oder Logger-Faktor %d %% -> %d %%",
+      100 * k, 100 * sp, n, (w.airK or 1000) / 10, w.curFactor, math.floor(w.curFactor * k + 0.5))
   else
     lines[#lines + 1] = "Fahrt: noch kein Kreis"
   end
@@ -582,42 +675,17 @@ local function saveResult(w, now)
   end
 end
 
--- Korrektur fuer die Quelle "TEK korr.": UEBERNEHMEN kann den Widget-Speicher nicht schreiben (das macht Ethos
--- nur beim Schliessen der Konfiguration), deshalb liegt der zuletzt gesetzte Wert auch in korrektur_<Modell>.txt.
--- write() (Konfiguration geschlossen) schreibt die Datei ebenfalls, so gilt immer der letzte Wert.
-local function korrName()
-  return "korrektur_" .. tostring(currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
-end
-
-local function saveKorr(w)
-  if not (io and io.open) then return end
-  local ok, f = pcall(io.open, korrName(), "w")
-  if ok and f then
-    pcall(f.write, f, string.format("%d;%d\n", w.tekX or 0, w.tekLag or 0))
-    pcall(f.close, f)
-  end
-end
-
-local function loadKorr(w)
-  if not (io and io.open) then return end
-  local ok, f = pcall(io.open, korrName(), "r")
-  if not (ok and f) then return end
-  local okR, text = pcall(f.read, f, "*a")
-  pcall(f.close, f)
-  local a, b = tostring(okR and text or ""):match("(%-?%d+);(%d+)")
-  if a then w.tekX, w.tekLag = clamp(tonumber(a), -500, 500), clamp(tonumber(b), 0, RING - 1) end
-end
-
 -- ---------------------------------------------------------------- Widget
 
 local function create()
-  local w = {lastInvalidate = 0}
+  local w = {lastInvalidate = 0, model = currentModelName()}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   CFG = w
   return w
 end
 
 local function wakeup(w)
+  w.model = currentModelName()
   CFG = w
   local now = os.clock()
   measure(now)
@@ -711,21 +779,28 @@ local function paint(w)
 
   -- ---- links: Fahrt
   y = top
-  drawT(xL, y, colW, "AIRSPEED-FAKTOR", FONT_XS, C.DIM, "l")
+  drawT(xL, y, colW, "FAHRT-KORREKTUR", FONT_XS, C.DIM, "l")
   y = y + xsH + 2
   local k, sp, n = airResult(s)
+  w.btnTakeAir = nil
   if k then
-    local nf = w.curFactor * k
     local col = (n >= w.circles and sp < 0.02) and C.GREEN or C.ORANGE
-    if nf < 80 or nf > 120 then col = C.RED end
-    local _, tw = drawT(xL, y, colW, string.format("%d %%", math.floor(nf + 0.5)), FONT_XL, col, "l")
-    drawT(xL + tw + 8, y + 2, colW - tw - 8, string.format("im Logger (jetzt %d %%)", w.curFactor), FONT_XS, C.DIM, "l")
-    drawT(xL + tw + 8, y + 2 + xsH, colW - tw - 8, string.format("k %.3f +-%.3f, %d Kreise", k, sp, n), FONT_XS, C.TXT, "l")
+    if k < 0.8 or k > 1.25 then col = C.RED end
+    local _, tw = drawT(xL, y, colW, string.format("%.1f %%", 100 * k), FONT_XL, col, "l")
+    drawT(xL + tw + 8, y + 2, colW - tw - 8, string.format("+-%.1f %%, %d Kreise", 100 * sp, n), FONT_XS, C.TXT, "l")
+    drawT(xL + tw + 8, y + 2 + xsH, colW - tw - 8, string.format("oder im Logger %d %%", math.floor(w.curFactor * k + 0.5)),
+      FONT_XS, C.DIM, "l")
     y = y + textHeight(FONT_XL) + 2
+    local aAsk = w.takeAirAsk and now - w.takeAirAsk < 4
+    w.btnTakeAir = button(xL, y, math.min(colW, 200), sH + 6, aAsk and "SICHER?" or "UEBERNEHMEN",
+      aAsk and C.ORANGE or C.BOX, aAsk and C.BG)
+    y = y + sH + 10
   else
     drawT(xL, y, colW, "--", FONT_XL, C.DIM, "l")
     y = y + textHeight(FONT_XL) + 2
   end
+  drawT(xL, y, colW, string.format("Quelle Fahrt korr.: %.1f %%", (w.airK or 1000) / 10), FONT_XS, C.DIM, "l")
+  y = y + xsH
   -- letzte Kreise
   local cs = s.circles
   for i = #cs, math.max(1, #cs - 2), -1 do
@@ -804,6 +879,18 @@ local function event(w, category, value, x, y)
       lcd.invalidate()
       return true
     end
+    if inBtn(w.btnTakeAir, x, y) then
+      if w.takeAirAsk and now - w.takeAirAsk < 4 then
+        w.takeAirAsk = nil
+        local k = airResult(S)
+        if k then
+          w.airK = clamp(math.floor(1000 * k + 0.5), 500, 2000)
+          saveKorr(w)
+        end
+      else w.takeAirAsk = now end
+      lcd.invalidate()
+      return true
+    end
     if inBtn(w.btnTake, x, y) then
       if w.takeAsk and now - w.takeAsk < 4 then
         w.takeAsk = nil
@@ -840,17 +927,18 @@ local function addChoice(w, label, prop, list)
 end
 
 local function configure(w)
-  addSource(w, "Fahrt (Airspeed des Loggers)", "air")
+  addSource(w, "Fahrt (Airspeed des Loggers, nicht Fahrt korr.)", "air")
   addChoice(w, "Fahrt: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
   addChoice(w, "Fahrt: Logger liefert", "airKind", {{"IAS (Normdichte)", 1}, {"TAS", 2}})
-  addNumber(w, "Airspeed-Faktor im Logger jetzt (%)", "curFactor", 50, 200)
-  addSource(w, "TEK-Vario des Loggers", "vario")
+  addNumber(w, "Airspeed-Faktor im Logger (%)", "curFactor", 50, 200)
+  addSource(w, "TEK-Vario des Loggers (nicht TEK korr.)", "vario")
   addSource(w, "GPS-Geschwindigkeit", "gpsSpd")
   addSource(w, "Flugrichtung / GPS-Kurs (empfohlen)", "gpsCrs")
   addSource(w, "GPS-Position (ohne GPS-Kurs)", "gps")
   addSource(w, "Hoehe (Luftdichte)", "alt")
   addChoice(w, "Hoehe ist", "altKind", {{"ueber Meer (GPS)", 1}, {"ueber Start + Platzhoehe", 2}})
   addNumber(w, "Platzhoehe ue. M. (m)", "fieldAlt", -400, 5000)
+  addNumber(w, "Quelle Fahrt korr.: Faktor (0.1 %)", "airK", 500, 2000)
   addNumber(w, "Quelle TEK korr.: Korrektur (0.1 %)", "tekX", -500, 500)
   addNumber(w, "Quelle TEK korr.: Verzoegerung (0.1 s)", "tekLag", 0, RING - 1)
   addChoice(w, "Toene bei Kreis", "tones", {{"Ein", 1}, {"Aus", 2}})
@@ -874,7 +962,9 @@ local function read(w)
     end
   end
   loadKorr(w)
+  w.model = currentModelName()
   CFG = w
+  saveKorr(w)                 -- Sensornamen fuer die Quellen ohne Widget
 end
 
 local function write(w)
@@ -898,6 +988,18 @@ local function srcWakeup(source)
   source:value(v or 0)
 end
 
+local function airInit(source)
+  source:value(0)
+  source:decimals(1)
+  if UNIT_METER_PER_SECOND then pcall(source.unit, source, UNIT_METER_PER_SECOND) end
+end
+
+local function airWakeup(source)
+  measure(os.clock())
+  local v = S and S.airKorr
+  source:value(v or 0)
+end
+
 local function init()
   -- Ethos akzeptiert Schluessel nur mit weniger als 8 Zeichen.
   system.registerWidget({
@@ -913,6 +1015,7 @@ local function init()
   })
   if system.registerSource then
     system.registerSource({key = "TEKkorr", name = "TEK korr.", init = srcInit, wakeup = srcWakeup})
+    system.registerSource({key = "AIRkorr", name = "Fahrt korr.", init = airInit, wakeup = airWakeup})
   end
 end
 
@@ -920,6 +1023,6 @@ local M = {init = init}
 M._test = {
   measure = measure, state = function() return S end, setCfg = function(w) CFG = w end, reset = resetAll,
   airResult = airResult, tekResult = tekResult, classResult = classResult, resultText = resultText,
-  create = create, wakeup = wakeup, paint = paint, event = event,
+  create = create, wakeup = wakeup, paint = paint, event = event, read = read, write = write,
 }
 return M
