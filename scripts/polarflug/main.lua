@@ -1,5 +1,5 @@
 -- @widget  Polarflug
--- @version 1.3
+-- @version 1.4
 -- Polarflug fuer Ethos -- Vollbild-Widget, hilft beim Erfliegen der Polare.
 --
 -- Anzeige 1 (Balken): ein Balken pro Geschwindigkeitsbereich (Standard 20-30, 30-40 ... km/h).
@@ -13,7 +13,8 @@
 --   Polare des MM Flight Analyzers, mit allen Messpunkten, Klassen-Medianen und der aktuellen TAS.
 --   Violett: die Polare aus scripts/maccready/polaren.lua. Knopf "-> polaren.lua" (zweimal tippen)
 --   aktualisiert dort den Eintrag dieses Modells (alte Datei: polaren_alt.lua): im erflogenen
---   Bereich gilt die Messung, ausserhalb bleibt die alte Polare ("Bereich ergaenzen").
+--   Bereich gilt die Messung, ausserhalb bleibt die alte Polare ("Bereich ergaenzen"). Uebrige Felder
+--   des Eintrags (mass = Leergewicht, ver, fix) und alle anderen Modelle bleiben unveraendert.
 --
 -- Messpunkt (gleiche Filter wie der Tab Polare der App): eine Sekunde Gleitflug,
 --   Motor aus und 15 s danach, geradeaus (Kurs aendert unter 8 Grad/s), Fahrt aendert unter
@@ -917,6 +918,30 @@ end
 
 local function g5(x) return (string.format("%.5g", x):gsub("^%-0$", "0")) end
 
+-- Ein Eintrag als Lua-Text: zuerst a, b, c, vMin, vMax, dann alle uebrigen Felder (Zahlen, Texte, ja/nein)
+-- alphabetisch, damit nichts verloren geht, was die App oder andere Widgets dort ablegen (mass, ver, fix ...).
+local MAIN_FIELDS = {"a", "b", "c", "vMin", "vMax"}
+local function entryText(e)
+  local parts = {
+    "a = " .. g5(tonumber(e.a) or 0), "b = " .. g5(tonumber(e.b) or 0), "c = " .. g5(tonumber(e.c) or 0),
+    string.format("vMin = %.1f", tonumber(e.vMin) or 0), string.format("vMax = %.1f", tonumber(e.vMax) or 0),
+  }
+  local main, rest = {}, {}
+  for _, f in ipairs(MAIN_FIELDS) do main[f] = true end
+  for f, v in pairs(e) do
+    local t = type(v)
+    if type(f) == "string" and not main[f] and (t == "number" or t == "string" or t == "boolean") then rest[#rest + 1] = f end
+  end
+  table.sort(rest)
+  for _, f in ipairs(rest) do
+    local v, val = e[f], nil
+    if type(v) == "number" then val = g5(v) elseif type(v) == "string" then val = string.format("%q", v) else val = tostring(v) end
+    local name = f:match("^[%a_][%w_]*$") and f or string.format("[%q]", f)
+    parts[#parts + 1] = name .. " = " .. val
+  end
+  return "{ " .. table.concat(parts, ", ") .. " }"
+end
+
 -- Schreibt die gemessene Polare. Liefert Meldung (Erfolg) oder nil, Fehler.
 local function writeMeasuredPolar(w)
   local f, bs = w.polarFit, w.classes or {}
@@ -928,7 +953,10 @@ local function writeMeasuredPolar(w)
   local key = findKey(all, name) or name
   local p = newPolar(f, bs, oldFromEntry(all[key]))
   if not p then return nil, "Parabel nicht moeglich" end
-  all[key] = {a = -p.a, b = -p.b, c = -p.c, vMin = p.lo, vMax = p.hi}
+  -- Nur die Polare ersetzen; uebrige Felder des Eintrags (mass = Leergewicht, ver, fix ...) bleiben.
+  local e = type(all[key]) == "table" and all[key] or {}
+  e.a, e.b, e.c, e.vMin, e.vMax = -p.a, -p.b, -p.c, p.lo, p.hi
+  all[key] = e
   if oldText then
     local backup = path:gsub("polaren%.lua$", "polaren_alt.lua")
     writeText(backup, oldText)
@@ -945,9 +973,7 @@ local function writeMeasuredPolar(w)
     "return {",
   }
   for _, k in ipairs(keys) do
-    local e = all[k]
-    out[#out + 1] = string.format("  [%q] = { a = %s, b = %s, c = %s, vMin = %.1f, vMax = %.1f },",
-      k, g5(e.a or 0), g5(e.b or 0), g5(e.c or 0), tonumber(e.vMin) or 0, tonumber(e.vMax) or 0)
+    out[#out + 1] = string.format("  [%q] = %s,", k, entryText(all[k]))
   end
   out[#out + 1] = "}"
   local err = writeText(path, table.concat(out, "\n") .. "\n")
