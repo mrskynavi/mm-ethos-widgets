@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.28
+-- @version 1.29
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.28"
+local VERSION = "1.29"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1164,7 +1164,7 @@ local function resetFlight(w)
 end
 
 local function create()
-  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, qaTau = 25, qaRate = 30, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vDamp = 4, vtRange = 10, vtGlide = 5}
+  local w = {win = {}, lastInvalidate = 0, page = P_OVER, mcValue = 1.0, qlTau = 15, qlTrim = true, qaTau = 25, qaRate = 30, zoomAfter = 5, vzLo = 3, vzHi = 1, vtStyle = 1, vtDev = 1, vDamp = 4, vtRange = 10, vtGlide = 5}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(BOOL_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(TEXT_DEFS) do w[d.key] = d.def end
@@ -2609,6 +2609,29 @@ function BAL.VT.sink(st, v)
   return 500 - 60 * a
 end
 
+-- Ausgabe ueber das Ethos-Vario (Konfiguration "Varioton-Ausgabe" = Ethos, vtDev 2), ab 1.29: Das Widget spielt
+-- dann keinen eigenen Varioton, sondern liefert den Wert in die Lua-Quelle "SkyNav Vario" (m/s). Die
+-- Sonderfunktion "Vario abspielen" mit dieser Quelle (Mitte: Still) macht daraus den Ton des Senders: durchgehender
+-- Sinkton und gleichmaessiger Takt, weil Ethos den Ton selbst im Audio-Takt erzeugt. Lua kann das nicht: playTone
+-- startet einen Ton nur in einem wakeup (Abstaende schwanken), darum Luecken oder Ueberlappungen im Sinkton und
+-- unruhiger Takt im Steigen (Christoph 12.11.2026). Wenn das Widget nicht spielen soll (Sollfahrt, Wendeton
+-- hat Vorrang, Ereignistoene), liefert die Quelle 0, das liegt in der stillen Mitte. Wert ungefiltert wie Klang 4.
+BAL.VO = {v = 0, t = -1}
+function BAL.VO.set(w, now, on)
+  local v = on and w.varioRaw or 0
+  BAL.VO.v, BAL.VO.t = clamp(v, -20, 20), now
+end
+function BAL.VO.init(source)
+  source:value(0)
+  source:decimals(2)
+  if UNIT_METER_PER_SECOND then pcall(source.unit, source, UNIT_METER_PER_SECOND) end
+end
+function BAL.VO.wakeup(source)
+  local o = BAL.VO
+  -- Widget laeuft nicht (andere Seite der Bildschirme, Modell gewechselt): still
+  source:value(os.clock() - o.t < 1 and o.v or 0)
+end
+
 function BAL.VT.play(w, now)
   local v = w.vtV
   if not w.vtOn or v == nil then w.vtNext, w.vtEnd = nil, nil; return end
@@ -3074,10 +3097,11 @@ local function wakeup(w)
   BAL.VT.mode(w, now, dt)
   local warn = cur and turnTone(w, w.gc or {}, now)           -- Wendeton auf jeder Seite
   warn = warn or (w.prioUntil and now < w.prioUntil)          -- Vorrang: keine Seitentoene
+  if w.vtDev == 2 then BAL.VO.set(w, now, w.vtOn and not warn and not (w.quietUntil and now < w.quietUntil)) end
   if w.vtOn then
     -- Varioton ersetzt Sollfahrt-, Start- und Kurs-Toene (Thermik-Seite, Kreisen, Gleiten mit Netto > MC)
     w.cmdTones = nil
-    if not warn then BAL.VT.play(w, now) end
+    if not warn and w.vtDev ~= 2 then BAL.VT.play(w, now) end
   elseif cur then
     if w.page == P_START then if not warn then startTones(w, w.sc, now) end
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn) end
@@ -4923,7 +4947,8 @@ local function configure(w)
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addSource(w, "Vario", "vario")
   addChoice(w, "Vario-Art", "varioType", {{"TE (Sensor kompensiert)", 1}, {"Barometrisch (Widget kompensiert)", 2}})
-  addChoice(w, "Varioton-Klang", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
+  addChoice(w, "Varioton-Ausgabe", "vtDev", {{"Widget-Toene", 1}, {"Ethos-Vario (Quelle SkyNav Vario)", 2}})
+  addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
   addSwitch(w, "Schalter Seite Start", "swStart")
@@ -4976,7 +5001,7 @@ local function setDefaults(w)
   w.accZSrc, w.accXSrc, w.pitchSrc = nil, nil, nil
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
-  w.vtStyle = 1
+  w.vtStyle, w.vtDev = 1, 1
 end
 
 local function read(w)
@@ -5000,6 +5025,7 @@ local function read(w)
     w.crsSrc = validSource(storage.read("crsSrc"))
     w.satSrc = validSource(storage.read("satSrc"))
     v = storage.read("vtStyle"); w.vtStyle = (type(v) == "number" and v >= 1 and v <= 4) and v or 1  -- 1.28: Klang am Sender
+    v = storage.read("vtDev"); w.vtDev = v == 2 and 2 or 1                                              -- 1.29
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -5025,6 +5051,7 @@ local function write(w)
   storage.write("crsSrc", w.crsSrc)
   storage.write("satSrc", w.satSrc)
   storage.write("vtStyle", w.vtStyle or 1)
+  storage.write("vtDev", w.vtDev or 1)
 end
 
 local function init()
@@ -5034,6 +5061,9 @@ local function init()
     create = create, paint = paint, wakeup = wakeup, event = eventHandler,
     configure = configure, read = read, write = write,
   })
+  if system.registerSource then
+    system.registerSource({key = "SNVario", name = "SkyNav Vario", init = BAL.VO.init, wakeup = BAL.VO.wakeup})
+  end
 end
 
 local M = {init = init}
