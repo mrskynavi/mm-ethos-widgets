@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.26
+-- @version 1.27
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.26"
+local VERSION = "1.27"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1103,16 +1103,18 @@ end
 -- Kompensiertes Vario (Vario-Art "barometrisch"): TE = Vario + d(TAS^2 / 2g)/dt. Die Fahrt kommt pro GPS-Fix
 -- (GPS plus Wind, ohne Wind die Fahrt ueber Grund); die Aenderung der Energiehoehe ueber rund 1 s, auf +-4 m/s
 -- begrenzt und 0.5 s geglaettet (wie die App, aber nur rueckwaerts gerechnet). Am Boden (unter 5 m/s) keine.
-function BAL.TE(w, now, tas)
+-- Mit Staudruck-Fahrt (BAL.AS) laeuft es in jedem wakeup mit Basis 0.5 s und Glaettung 0.3 s statt pro GPS-Fix.
+function BAL.TE(w, now, tas, base)
+  base = base or 1.0
   local h = w.teHist
   if not h or (#h > 0 and now - h[#h].t > 3) then h = {}; w.teHist, w.teDE, w.teT = h, nil, nil end
   if not tas or tas < 5 then w.teDE = 0; return end
   h[#h + 1] = {t = now, e = tas * tas / (2 * G)}
-  while #h > 2 and now - h[2].t >= 1.0 do table.remove(h, 1) end
+  while #h > 2 and now - h[2].t >= base do table.remove(h, 1) end
   local a, b = h[1], h[#h]
-  if b.t - a.t >= 0.5 then
+  if b.t - a.t >= base / 2 then
     local de = clamp((b.e - a.e) / (b.t - a.t), -4, 4)
-    w.teDE = lpf(w.teDE, de, now - (w.teT or now), 0.5)
+    w.teDE = lpf(w.teDE, de, now - (w.teT or now), base < 1 and 0.3 or 0.5)
     w.teT = now
   end
 end                                                         -- in BAL, weil das Hauptkapitel am Limit von 200 lokalen Variablen ist
@@ -1377,6 +1379,56 @@ end
 
 -- ---------------------------------------------------------------- Messwerte
 
+-- Fahrt vom Staudruck-Sensor (Quelle "Fahrt Staudruck", z.B. SM GPS-Logger 3 mit Prandtl-Rohr, Wert 0A0 Airspeed
+-- in Knoten). Gemessen wird die angezeigte Fahrt (IAS), die wahre ist um die Luftdichte groesser:
+-- TAS = IAS / sqrt(sigma), sigma = (1 - 2.2558e-5 * h)^4.2559 (Normatmosphaere, h ue. M.); auf 500 m +2.5 %,
+-- auf 1500 m +7.5 %. Gilt (w.asOk), solange der Wert sich innert 5 s aendert und nicht unter 5 m/s liegt, waehrend
+-- das GPS ueber 12 m/s zeigt (Rohr verstopft, Schlauch ab). Dann ersetzt sie die Fahrt aus GPS und Wind ueberall
+-- (TAS, Sollfahrt IST, Netto, Querlage aus der Drehrate) und gibt die TE-Kompensation (Vario-Art barometrisch)
+-- in jedem wakeup. Plausibilitaet: im Flug ist das Mittel der Fahrt etwa das Mittel der GPS-Geschwindigkeit
+-- (Wind mittelt sich in Kreisen und Schenkeln weg); nach 2 min ausserhalb 0.6..1.7 kommt "Fahrt-Sensor pruefen".
+BAL.AS = {}
+function BAL.AS.read(w, now, dt)
+  local src = validSource(w.airSrc)
+  local v = src and readNumber(src)
+  if not v then w.asOk, w.asTas = false, nil; return end
+  local u = w.airUnit or 1
+  if u == 1 then
+    local ok, un = pcall(src.unit, src)
+    if not ok then un = nil end
+    local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
+    if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
+    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
+    elseif is("UNIT_MPH", "mph") then u = 5
+    else u = 3 end                                            -- Knoten oder ohne Einheit (DIY-Sensor): Knoten
+  end
+  local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
+  if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
+  local f = w.cur
+  local h = f and f.msl or 0
+  local sigma = (1 - 2.2558e-5 * clamp(h, -500, 6000)) ^ 4.2559
+  local tas = ias / math.sqrt(sigma)
+  w.asTas = lpf(w.asTas, tas, dt, 0.2)
+  local gs = f and f.gs or 0
+  w.asOk = now - (w.asChg or now) < 5 and not (tas < 5 and gs > 12)
+  if w.asOk and w.flying and gs > 8 then
+    w.asSa, w.asSg = (w.asSa or 0) + tas * dt, (w.asSg or 0) + gs * dt
+    w.asN = (w.asN or 0) + dt
+    if w.asN > 120 and not w.asWarned then
+      local r = w.asSa / math.max(w.asSg, 1)
+      if r < 0.6 or r > 1.7 then w.asWarned = true; note(w, string.format("Fahrt-Sensor pruefen (x%.1f GPS)", r), now) end
+    end
+  end
+  if w.asOk then BAL.TE(w, now, w.asTas, 0.5) end
+end
+
+-- GPS-Satelliten (Quelle optional): Warnung in der Kopfzeile unter 6
+function BAL.satText(w)
+  local n = readNumber(w.satSrc)
+  if n and w.gpsOk and n < 6 then return string.format("  GPS %d SAT", math.floor(n + 0.5)) end
+  return nil
+end
+
 -- Liefert eine neue Messung (fix) oder nil, wenn kein frischer GPS-Fix kam.
 local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
@@ -1444,6 +1496,10 @@ local function readInputs(w, now, dt)
     if gsPos then w.gsPos = lpf(w.gsPos, gsPos, dtFix, 1.5) end
     gs = w.gsPos or 0
   end
+  -- Kurs vom GPS-Empfaenger (Quelle "GPS-Kurs", aus der Doppler-Geschwindigkeit, ohne die rund 1 s Verzug der
+  -- 2-s-Basis); erst ab 3 m/s, darunter ist er unruhig
+  local cs = readNumber(w.crsSrc)
+  if cs and gs >= 3 and cs >= 0 and cs <= 360 then w.crs = cs % 360 end
   local ve, vn = nil, nil
   if w.crs then local sx, sy = dirVec(w.crs); ve, vn = gs * sx, gs * sy end
   if ve then windStep(w, ve, vn, now) end
@@ -1463,7 +1519,7 @@ local function readInputs(w, now, dt)
     tas = math.sqrt(ax * ax + ay * ay)
     hdg = bearingOf(ax, ay)
   end
-  BAL.TE(w, now, tas)
+  if w.asOk and w.asTas then tas = w.asTas else BAL.TE(w, now, tas) end   -- Staudruck: Fahrt und TE aus BAL.AS
   -- Drehrate -> Wenderadius
   if hdg and w.hdgPrev and dtFix > 0.05 then
     local dA = angDiff(hdg, w.hdgPrev)
@@ -2457,7 +2513,7 @@ function BAL.VF(w, now, dt)
     w.fuY = y
     local c = w.teDE or 0
     local ax, tas = readNumber(w.accXSrc), w.tasF
-    if ax and tas and tas > 5 then
+    if ax and tas and tas > 5 and not w.asOk then             -- mit Staudruck ist teDE schon schnell (BAL.AS)
       if math.abs(ax) > 4 then ax = ax / G end
       local cf = tas * (-ax + math.sin(p))
       w.fuCs = lpf(w.fuCs, cf, dt, 1.5)
@@ -2929,6 +2985,7 @@ local function wakeup(w)
   w.armOn, w.armInit = arm, true
   if not w.gpsClkPoll or now - w.gpsClkPoll >= 1 then w.gpsClkPoll = now; updateGpsClock(w, now) end
 
+  BAL.AS.read(w, now, dt)
   BAL.QL.read(w, now, dt)
   BAL.QA.step(w, now, dt)
   if w.qlPress and now - w.qlPress >= 2 then
@@ -3241,6 +3298,8 @@ local function header(w, W)
   if w.gpsOk and (w.state == S_ARMED or w.state == S_STARTED) and w.posMoveT and os.clock() - w.posMoveT > 8 then
     st, col = st .. "  GPS STEHT", C_RED
   end
+  local sat = BAL.satText(w)
+  if sat then st, col = st .. sat, col == C_RED and C_RED or C_ORANGE end
   clock = clock .. (gpsClock(w) and "" or "*")
   local _, stW = drawT(W * 0.4, 2, W * 0.6 - 6, st .. "  " .. clock, FONT_S, col, "r")
   -- Restzeit prominent links
@@ -4879,6 +4938,10 @@ local function configure(w)
   addSource(w, "AccZ (optional, Varioton schneller)", "accZSrc")
   addSource(w, "AccX (optional, mit AccZ)", "accXSrc")
   addSource(w, "Nickwinkel (optional, mit AccZ)", "pitchSrc")
+  addSource(w, "Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
+  addChoice(w, "Fahrt-Sensor: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
+  addSource(w, "GPS-Kurs (optional, Richtung)", "crsSrc")
+  addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
   l = form.addLine("Querlage nullen (Flügel waagrecht)")
   if form.addTextButton then
     form.addTextButton(l, nil, "Jetzt nullen", function()
@@ -4909,6 +4972,7 @@ local function setDefaults(w)
   w.bankSrc, w.bankInv = nil, false
   w.accZSrc, w.accXSrc, w.pitchSrc = nil, nil, nil
   w.ailSrc = nil
+  w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
 end
 
 local function read(w)
@@ -4927,6 +4991,10 @@ local function read(w)
     w.accXSrc = validSource(storage.read("accXSrc"))
     w.pitchSrc = validSource(storage.read("pitchSrc"))
     w.ailSrc = validSource(storage.read("ailSrc"))     -- Querruder-Knueppel: nach der Fusion angehaengt
+    w.airSrc = validSource(storage.read("airSrc"))     -- GPS-Logger 3 (1.27): Staudruck, Einheit, Kurs, Satelliten
+    v = storage.read("airUnit"); w.airUnit = type(v) == "number" and v or 1
+    w.crsSrc = validSource(storage.read("crsSrc"))
+    w.satSrc = validSource(storage.read("satSrc"))
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -4947,6 +5015,10 @@ local function write(w)
   storage.write("accXSrc", w.accXSrc)
   storage.write("pitchSrc", w.pitchSrc)
   storage.write("ailSrc", w.ailSrc)
+  storage.write("airSrc", w.airSrc)
+  storage.write("airUnit", w.airUnit or 1)
+  storage.write("crsSrc", w.crsSrc)
+  storage.write("satSrc", w.satSrc)
 end
 
 local function init()
