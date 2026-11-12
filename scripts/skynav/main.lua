@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.27.1
+-- @version 1.28
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.27.1"
+local VERSION = "1.28"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1128,7 +1128,7 @@ local APP_SETTINGS = {
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
   rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
-  qlTau = {0, 30}, qlTrim = true, qaTau = {0, 60}, qaRate = {5, 300}, vzLo = {0, 20}, vzHi = {0, 20}, vtStyle = {1, 4}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
+  qlTau = {0, 30}, qlTrim = true, qaTau = {0, 60}, qaRate = {5, 300}, vzLo = {0, 20}, vzHi = {0, 20}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
   thBest = true,
 }
 
@@ -2477,7 +2477,7 @@ local function thermCalc(w, f, now, dt)
   end
 end
 
--- Varioton des Widgets, Klang waehlbar (App vtStyle: XCSoar, OpenVario, XCVario, Ethos/EdgeTX, siehe BAL.VT.climb). Standard XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
+-- Varioton des Widgets, Klang waehlbar (Widget-Konfiguration vtStyle, ab 1.28 nicht mehr aus der App: XCSoar, OpenVario, XCVario, Ethos/EdgeTX, siehe BAL.VT.climb). Standard XCSoar (VarioSynthesiser, Standardwerte): TE-Vario v auf +-5 m/s begrenzt.
 -- Steigen: 500 Hz bei 0 bis 1500 Hz bei +5 m/s, Periode 600 ms bei 0 bis 150 ms bei +5 m/s, davon 2/3 Ton und
 -- 1/3 Pause. Sinken: durchgehender Ton, 500 Hz bei 0 bis 200 Hz bei -5 m/s. Totzone (still) von -vzLo bis
 -- +vzHi (App, 0.1 m/s; Vorgabe wie XCSoar -0.3 bis +0.1).
@@ -2575,7 +2575,7 @@ function BAL.VT.mode(w, now, dt)
   w.vtOn = w.varioTone and w.vtV ~= nil and (pg == P_THERM or w.vtCirc or (pg == P_GLIDE and w.vtTh)) or false
 end
 
--- Klang (App, vtStyle): Frequenz f (Hz), Periode und Tondauer (ms) beim Steigen v (m/s, 0..5), Frequenz beim Sinken.
+-- Klang (Widget-Konfiguration, vtStyle): Frequenz f (Hz), Periode und Tondauer (ms) beim Steigen v (m/s, 0..5), Frequenz beim Sinken.
 -- 1 XCSoar (VarioSynthesiser): 500..1500 Hz linear, Periode 600..150 ms, 2/3 Ton.
 -- 2 OpenVario (variod audiovario.c): 350 + 120 Hz pro m/s; Periode 1.088 s / v (bis 0.5 m/s: 2.18 s), gut 51 % Ton;
 --   Sinken 350 / (1 + 0.85 |v|) Hz.
@@ -4923,6 +4923,7 @@ local function configure(w)
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addSource(w, "Vario", "vario")
   addChoice(w, "Vario-Art", "varioType", {{"TE (Sensor kompensiert)", 1}, {"Barometrisch (Widget kompensiert)", 2}})
+  addChoice(w, "Varioton-Klang", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
   addSwitch(w, "Schalter Seite Start", "swStart")
@@ -4975,6 +4976,7 @@ local function setDefaults(w)
   w.accZSrc, w.accXSrc, w.pitchSrc = nil, nil, nil
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
+  w.vtStyle = 1
 end
 
 local function read(w)
@@ -4997,6 +4999,7 @@ local function read(w)
     v = storage.read("airUnit"); w.airUnit = type(v) == "number" and v or 1
     w.crsSrc = validSource(storage.read("crsSrc"))
     w.satSrc = validSource(storage.read("satSrc"))
+    v = storage.read("vtStyle"); w.vtStyle = (type(v) == "number" and v >= 1 and v <= 4) and v or 1  -- 1.28: Klang am Sender
   end
   w.mcValue = w.mc / 10
   w.tasksT, w.taskSig, w.polarT = nil, nil, nil
@@ -5021,6 +5024,7 @@ local function write(w)
   storage.write("airUnit", w.airUnit or 1)
   storage.write("crsSrc", w.crsSrc)
   storage.write("satSrc", w.satSrc)
+  storage.write("vtStyle", w.vtStyle or 1)
 end
 
 local function init()
