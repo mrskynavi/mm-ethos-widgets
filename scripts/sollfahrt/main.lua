@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.6
+-- @version 1.7
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -21,6 +21,15 @@
 --              Energiekompensation, wie der MM Flight Analyzer seine Polare. So passen Polare und
 --              Netto zusammen, auch wenn das Vario zu wenig Sinken zeigt (Shark 16.10.: ~20 %).
 --              Vario-Anzeige und Toene bleiben beim Vario. Ohne diesen Sensor: Netto aus dem Vario.
+--   Fahrt Staudruck  optional (ab 1.7, z.B. SM GPS-Logger 3, Airspeed 0A0 in Knoten): gemessene Fahrt
+--              (IAS) statt |Grundgeschwindigkeit - Wind|. TAS = IAS / sqrt(sigma), Normatmosphaere mit
+--              der GPS-Hoehe (500 m: +2.5 %). Damit stimmen Fahrt, Polaren-Sinken, Netto und die
+--              Energiekompensation (barometrisch) auch im Geradeausflug ohne gefitteten Wind. Gilt, solange
+--              der Wert sich innert 5 s aendert und nicht unter 5 m/s liegt, waehrend das GPS ueber 12 m/s
+--              zeigt; sonst wieder GPS und Wind. Der Wind kommt weiter aus dem Kreisfit (Gegenwind).
+--   Flugrichtung / GPS-Kurs  optional (ab 1.7, SM GPS-Logger 3: DIY 0522): Kurs vom Empfaenger statt
+--              aus den Positionen (nur mit GPS-Geschw., ab 3 m/s; Rohwert in 0.1 Grad wird umgerechnet).
+--   GPS-Satelliten  optional (ab 1.7): unter 6 steht "GPS n SAT" orange unter der Ist-Fahrt.
 --   Motor      optional, Strom oder Drehzahl. Motor an und 6 s danach: keine Auswertung, danach
 --              beginnen Netto, Fahrt und Vario neu. Ohne Sensor: nach mehr als 5 s Steigen ueber
 --              5 m/s (TE) startet Netto neu, sobald das Steigen unter 2 m/s faellt.
@@ -605,6 +614,9 @@ end
 -- gute Fits gehen wie bisher in die Windtabelle (Hoehenbereich des Fensters).
 local function sensorUpdate(w, lat, lon, spd, now)
   courseUpdate(w, lat, lon, now)
+  local cs = readNumber(w.crsSrc)
+  if cs and cs > 360 and cs <= 3600 then cs = cs / 10 end
+  if cs and spd and spd >= 3 and cs >= 0 and cs <= 360 then w.crs = cs % 360 end
   if spd ~= nil and w.crs ~= nil then
     local c = math.rad(w.crs)
     w.gve, w.gvn = spd * math.sin(c), spd * math.cos(c)
@@ -796,6 +808,29 @@ local function kineticStep(w, tas, dt, now)
   end
 end
 
+-- Fahrt vom Staudruck-Sensor in m/s (wahre Fahrt), nil wenn keiner oder unplausibel (siehe Kopf)
+local function airspeedTas(w, now, dt, gs)
+  local src = validSource(w.airSrc)
+  local v = src and readNumber(src)
+  if not v then w.asTas = nil; return nil end
+  local u = w.airUnit or 1
+  if u == 1 then
+    local ok, un = pcall(src.unit, src)
+    if not ok then un = nil end
+    local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
+    if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
+    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
+    elseif is("UNIT_MPH", "mph") then u = 5
+    else u = 3 end                                     -- Knoten oder ohne Einheit (DIY-Sensor)
+  end
+  local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
+  if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
+  local sigma = (1 - 2.2558e-5 * clamp(w.alt or 0, -500, 6000)) ^ 4.2559
+  w.asTas = lpf(w.asTas, ias / math.sqrt(sigma), dt, 0.2)
+  if now - (w.asChg or now) >= 5 or (w.asTas < 5 and (gs or 0) > 12) then return nil end
+  return w.asTas
+end
+
 -- Alle Messwerte -> TE (m/s), TAS (m/s), Gegenwind (m/s) und ein Hinweistext, falls Daten fehlen.
 local function inputsStep(w, now, dt)
   -- Hoehe: GPS-Hoehe, sonst aus dem Vario aufintegriert (relativ, nur Notbehelf)
@@ -814,6 +849,12 @@ local function inputsStep(w, now, dt)
   end
   local air = airData(w, now)
   local tas = air and air.tas or nil
+  local ast = airspeedTas(w, now, dt, air and air.gs)
+  w.asOk = ast ~= nil
+  if ast then
+    tas = ast
+    if air then air.tas = ast end
+  end
   w.air = air
   kineticStep(w, tas, dt, now)
   local kin = w.kin or 0
@@ -855,7 +896,7 @@ local function viewSignature(w)
   local a = w.air and w.air.wind
   return table.concat({
     tostring(w.valid), tostring(w.motorActive), tostring(w.cruise), tostring(w.toneState), tostring(w.toneErr), tostring(w.announceErr),
-    tostring(w.dataNote), f(w.netto, "%.1f"), f(w.teFast, "%.1f"), f(w.vstf and w.vstf * KMH, "%.0f"),
+    tostring(w.dataNote), tostring(w.satN), f(w.netto, "%.1f"), f(w.teFast, "%.1f"), f(w.vstf and w.vstf * KMH, "%.0f"),
     f(w.vSlow and w.vSlow * KMH, "%.0f"), f(w.dv, "%.0f"), tostring(w.stfLimited), f(w.mcValue, "%.1f"),
     f(w.headwind and w.headwind * KMH, "%.0f"), f(a and a.spd * KMH, "%.0f"), f(a and a.from, "%.0f"),
     tostring(a and a.meas), f(w.lossM, "%.0f"), tostring(w.lossArmed), tostring(w.mcAnnounced),
@@ -933,6 +974,8 @@ local function wakeup(w)
     te, tas, hRaw, note, teNet = inputsStep(w, now, dt)
   end
   w.dataNote = note
+  local sn = readNumber(w.satSrc)
+  w.satN = sn and math.floor(sn + 0.5) or nil
 
   -- Motor an (und MOTOR_HOLD s danach): keine Auswertung, alle Filter leer. Danach beginnen
   -- Netto, Fahrt und Vario neu, ohne das Steigen des Motorsteigflugs mitzuschleppen.
@@ -1224,7 +1267,9 @@ local function paint(w)
   local annText = string.format("Ansagen: %d", w.announceCount or 0)
   if w.announce and w.mcAnnounced ~= nil and w.mcAnnounced ~= w.mc then annText = "Ansage folgt ..."
   elseif w.announceInfo and os.clock() - (w.announceT or 0) < 6 then annText = w.announceInfo end
-  drawT(rx, y, rw, annText, FONT_XS, DIM, "c")
+  local annCol = DIM
+  if w.satN and w.satN < 6 and w.gpsOk then annText, annCol = string.format("GPS %d SAT", w.satN), ORANGE end
+  drawT(rx, y, rw, annText, FONT_XS, annCol, "c")
 
   -- Hinweis, warum keine Daten da sind (ganz zuletzt, ueber allem, auf dunklem Grund)
   if not w.valid and w.dataNote then
@@ -1327,6 +1372,12 @@ local function configure(w)
   w.baroFields[#w.baroFields + 1] = addNumber(w, "Barometrisch: Vario-Zeitkonst. (0.1 s)", "varioTau", 0, 100)
   updateBaroFields(w)
   addSource(w, "Hoehe fuer Netto (Flughoehe, empfohlen)", "netAlt")
+  addSource(w, "Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
+  line = form.addLine("Fahrt-Sensor: Einheit")
+  form.addChoiceField(line, nil, {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}},
+    function() return w.airUnit or 1 end, function(v) w.airUnit = v end)
+  addSource(w, "Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
+  addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
 
   -- MC
   addSource(w, "MC Poti/Schieber (optional)", "mcSrc")
@@ -1395,6 +1446,11 @@ local function read(w)
   local thr = same and storage.read("motorThr") or nil
   w.motorThr = (type(thr) == "number") and thr or 3
   w.netAlt = same and validSource(storage.read("netAlt")) or nil
+  w.airSrc = same and validSource(storage.read("airSrc")) or nil      -- 1.7: GPS-Logger 3
+  local au = same and storage.read("airUnit") or nil
+  w.airUnit = (type(au) == "number") and au or 1
+  w.crsSrc = same and validSource(storage.read("crsSrc")) or nil
+  w.satSrc = same and validSource(storage.read("satSrc")) or nil
   w.mcValue = w.mc / 10
   w.polarSig = nil
   w.fileChecked = nil
@@ -1409,6 +1465,10 @@ local function write(w)
   storage.write("motor", w.motor)
   storage.write("motorThr", w.motorThr)
   storage.write("netAlt", w.netAlt)
+  storage.write("airSrc", w.airSrc)
+  storage.write("airUnit", w.airUnit or 1)
+  storage.write("crsSrc", w.crsSrc)
+  storage.write("satSrc", w.satSrc)
 end
 
 local function init()
