@@ -1,5 +1,5 @@
 -- @widget  Polarflug
--- @version 1.4
+-- @version 1.5
 -- Polarflug fuer Ethos -- Vollbild-Widget, hilft beim Erfliegen der Polare.
 --
 -- Anzeige 1 (Balken): ein Balken pro Geschwindigkeitsbereich (Standard 20-30, 30-40 ... km/h).
@@ -30,6 +30,16 @@
 --   mit GPS-Geschw., Kasa-Kreisfit ueber ~28 s, Plausibilitaet wie im Analyzer, erster Fit nur
 --   mit vollem Fenster, Windtabelle in 100-m-Schichten nach GPS-Hoehe). Seit 1.2 wie Sollfahrt 1.2:
 --   Windfit nur bei echtem Kreisen, eine einzelne Kurve verfaelscht den Wind nicht mehr.
+--
+-- Ab 1.5 (SM GPS-Logger 3), alles optional:
+--   Fahrt Staudruck (z.B. Airspeed 0A0, Einheit automatisch, ohne Einheit Knoten): die gemessene Fahrt
+--   ist die TAS (IAS / sqrt(sigma), Normatmosphaere mit der GPS-Hoehe). Dann zaehlen Punkte auch ohne
+--   gemessenen Wind (kein Kreisen noetig), und Wind-Fehler gehen nicht mehr in Fahrt und Sinken ein.
+--   Gilt, solange der Wert sich innert 5 s aendert und nicht unter 5 m/s liegt, waehrend das GPS ueber
+--   12 m/s zeigt; sonst wieder GPS und Wind. Achtung: ein Fehler des Fahrtmessers (Rohr, Einbau) geht
+--   voll in die Polare; den Faktor bestimmt das Widget TEK-Kalibrierung.
+--   Flugrichtung / GPS-Kurs (DIY 0522): Kurs vom Empfaenger fuer den Kurven-Filter (mit GPS-Geschw.,
+--   ab 3 m/s, Rohwert in 0.1 Grad wird umgerechnet). GPS-Satelliten: unter 6 orange in der Fusszeile.
 --
 -- Alle Zahlenfelder sind ganzzahlig.
 
@@ -336,6 +346,9 @@ end
 -- gute Fits gehen wie bisher in die Windtabelle (Hoehenbereich des Fensters).
 local function sensorUpdate(w, lat, lon, spd, now)
   courseUpdate(w, lat, lon, now)
+  local cs = readNumber(w.crsSrc)
+  if cs and cs > 360 and cs <= 3600 then cs = cs / 10 end
+  if cs and spd and spd >= 3 and cs >= 0 and cs <= 360 then w.crs = cs % 360 end
   if spd ~= nil and w.crs ~= nil then
     local c = math.rad(w.crs)
     w.gve, w.gvn = spd * math.sin(c), spd * math.cos(c)
@@ -481,6 +494,29 @@ local function pushSample(w, now, tas, vario, crs)
   while #r > 0 and now - r[1].t > 2 * HALF + 1 do table.remove(r, 1) end
 end
 
+-- Fahrt vom Staudruck-Sensor in m/s (wahre Fahrt), nil wenn keiner oder unplausibel (siehe Kopf)
+local function airspeedTas(w, now, dt, gs)
+  local src = validSource(w.airSrc)
+  local v = src and readNumber(src)
+  if not v then w.asTas = nil; return nil end
+  local u = w.airUnit or 1
+  if u == 1 then
+    local ok, un = pcall(src.unit, src)
+    if not ok then un = nil end
+    local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
+    if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
+    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
+    elseif is("UNIT_MPH", "mph") then u = 5
+    else u = 3 end                                     -- Knoten oder ohne Einheit (DIY-Sensor)
+  end
+  local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
+  if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
+  local sigma = (1 - 2.2558e-5 * clamp(w.alt or 0, -500, 6000)) ^ 4.2559
+  w.asTas = lpf(w.asTas, ias / math.sqrt(sigma), dt, 0.2)
+  if now - (w.asChg or now) >= 5 or (w.asTas < 5 and (gs or 0) > 12) then return nil end
+  return w.asTas
+end
+
 -- Prueft die Sekunde um now - 2.5 s. Setzt w.reason (warum nicht gezaehlt) oder zaehlt einen Punkt.
 local function evalPoint(w, now)
   local tc = now - HALF
@@ -490,7 +526,7 @@ local function evalPoint(w, now)
   if #r < 3 then w.reason = "keine Daten"; return end
   if w.loadIt then w.reason = "laedt Punkte"; return end
   if tc - (w.t0 or now) < SKIP then w.reason = "Start"; return end
-  if not w.wt.filled then w.reason = "Wind fehlt: kreisen"; return end
+  if not w.wt.filled and not w.asOk then w.reason = "Wind fehlt: kreisen"; return end
   if w.lastMotor and tc - w.lastMotor < AFTER_MOTOR then w.reason = "Motor"; return end
   local j = 1
   while j < #r and r[j].t < tc - HALF do j = j + 1 end
@@ -1084,6 +1120,14 @@ local function wakeup(w)
   local air = airData(w, now)
   w.air = air
   local tas = air and air.tas or nil
+  local ast = airspeedTas(w, now, dt, air and air.gs)
+  w.asOk = ast ~= nil
+  if ast then
+    tas = ast
+    if air then air.tas = ast end
+  end
+  local sn = readNumber(w.satSrc)
+  w.satN = sn and math.floor(sn + 0.5) or nil
   w.tasS = tas and lpf(w.tasS, tas, dt, 1.0) or nil
 
   local mv = readNumber(w.motor)
@@ -1157,7 +1201,7 @@ local function paintHead(w, W, now)
   local headH = textHeight(FONT_L) + 6
   local tasStr = w.tasS and string.format("%.0f", w.tasS * KMH) or "--"
   local _, tw = drawT(m, 3, 120, tasStr, FONT_L, WHITE, "l")
-  drawT(m + tw + 4, 3 + textHeight(FONT_L) - textHeight(FONT_XS) - 3, 60, "km/h TAS", FONT_XS, C.DIM, "l")
+  drawT(m + tw + 4, 3 + textHeight(FONT_L) - textHeight(FONT_XS) - 3, 60, w.asOk and "km/h Staud." or "km/h TAS", FONT_XS, C.DIM, "l")
   -- aktueller Vario-Wert klein ueber "km/h TAS": zeigt sofort, ob der richtige Sensor gewaehlt ist
   drawT(m + tw + 4, 2, 90, w.varioNow and string.format("Vario %+.1f", w.varioNow) or "Vario --", FONT_XS, C.DIM, "l")
   local btnW = math.min(110, math.floor(W * 0.28))
@@ -1204,6 +1248,7 @@ local function paintFoot(w, W, H, now)
   if w.saveMsg and now - (w.saveMsgT or 0) < 8 then rt, rc = w.saveMsg, w.saveMsgErr and C.RED or C.GREEN
   elseif w.annErr then rt, rc = "ANSAGE: " .. string.sub(w.annErr, 1, 40), C.RED
   elseif w.saveErr then rt, rc = "SPEICHERN: " .. string.sub(w.saveErr, 1, 40), C.RED
+  elseif w.satN and w.satN < 6 and w.gpsOk then rt, rc = string.format("GPS %d SAT  |  %s", w.satN, rt), C.ORANGE
   elseif w.annText and now - (w.annT or 0) < 4 then rt = w.annText .. "  |  " .. rt end
   drawT(W / 2, y, W / 2 - m, rt, FONT_XS, rc, "r")
   return xsH + 6
@@ -1462,6 +1507,12 @@ local function configure(w)
   if tef and tef.enable then pcall(tef.enable, tef, w.varioType == 2) end
   addSource(w, "Motor (Strom oder Drehzahl)", "motor")
   addNumber(w, "Motor an ueber", "motorThr", 0, 20000)
+  addSource(w, "Fahrt Staudruck (optional, z.B. Airspeed)", "airSrc")
+  line = form.addLine("Fahrt-Sensor: Einheit")
+  form.addChoiceField(line, nil, {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}},
+    function() return w.airUnit or 1 end, function(v) w.airUnit = v end)
+  addSource(w, "Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
+  addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
 
   addNumber(w, "Bereiche ab (km/h)", "vMin", 0, 200)
   addNumber(w, "Bereiche bis (km/h)", "vMax", 10, 300)
@@ -1497,6 +1548,12 @@ local function read(w)
       local v = storage.read(d.key)
       w[d.key] = (type(v) == "number") and v or d.def
     end
+    -- 1.5 (GPS-Logger 3): am Ende angehaengt, Ethos-Storage arbeitet nach Aufrufreihenfolge
+    w.airSrc = validSource(storage.read("airSrc"))
+    local au = storage.read("airUnit")
+    w.airUnit = (type(au) == "number") and au or 1
+    w.crsSrc = validSource(storage.read("crsSrc"))
+    w.satSrc = validSource(storage.read("satSrc"))
   end
   w.cntSig = nil
 end
@@ -1505,6 +1562,10 @@ local function write(w)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
+  storage.write("airSrc", w.airSrc)
+  storage.write("airUnit", w.airUnit or 1)
+  storage.write("crsSrc", w.crsSrc)
+  storage.write("satSrc", w.satSrc)
 end
 
 local function init()
