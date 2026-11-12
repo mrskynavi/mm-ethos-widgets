@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.0
+-- @version 1.1
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -401,6 +401,8 @@ local function measure(now)
   local crs = nil
   if validSource(w.gpsCrs) then
     local c = readNumber(w.gpsCrs)
+    -- SM GPS-Logger 3: "Flugrichtung" (DIY 0522) in Grad; kommt sie roh in 0.1 Grad, ist sie bis 3600
+    if c and c > 360.5 and c <= 3600.5 then c = c / 10 end
     if c and gs and gs >= 3 then crs = c % 360 end
   else
     local lat, lon = readPosition(w.gps)
@@ -844,7 +846,7 @@ local function configure(w)
   addNumber(w, "Airspeed-Faktor im Logger jetzt (%)", "curFactor", 50, 200)
   addSource(w, "TEK-Vario des Loggers", "vario")
   addSource(w, "GPS-Geschwindigkeit", "gpsSpd")
-  addSource(w, "GPS-Kurs (empfohlen)", "gpsCrs")
+  addSource(w, "Flugrichtung / GPS-Kurs (empfohlen)", "gpsCrs")
   addSource(w, "GPS-Position (ohne GPS-Kurs)", "gps")
   addSource(w, "Hoehe (Luftdichte)", "alt")
   addChoice(w, "Hoehe ist", "altKind", {{"ueber Meer (GPS)", 1}, {"ueber Start + Platzhoehe", 2}})
