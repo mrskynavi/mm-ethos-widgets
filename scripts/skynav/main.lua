@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.37
+-- @version 1.38
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.37"
+local VERSION = "1.38"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -5442,6 +5442,20 @@ local function read(w)
     v = storage.read("devMain"); w.devMain = (v == 1 or v == 2) and v or 0                             -- 1.30: Geraete, aeltere
     w.devStabi = storage.read("devStabi") == true                                                       -- Konfigurationen: von Hand
     v = storage.read("drawIv"); w.drawIv = (type(v) == "number" and v >= 1 and v <= 4) and v or 1      -- 1.37
+    -- 1.38: Am Sender gingen nach jedem Neustart genau die zuletzt angehaengten Werte verloren (Sensor-Geraet,
+    -- Varioton-Ausgabe; Christoph 13.11.2026), der Rest blieb: der Speicher eines Widgets fasst offenbar nicht
+    -- beliebig viele Eintraege. Darum stehen diese Werte zusaetzlich gepackt im frueher ungenutzten Platz radFix
+    -- (weit vorne): 100000 + Klang + 10 * Ausgabe + 100 * Geraet + 1000 * Stabi + 10000 * Bildaufbau.
+    local p = w.radFix
+    if type(p) == "number" and p >= 100000 and p < 200000 then
+      p = math.floor(p) - 100000
+      local a, b, c, d, e = p % 10, math.floor(p / 10) % 10, math.floor(p / 100) % 10, math.floor(p / 1000) % 10, math.floor(p / 10000) % 10
+      w.vtStyle = (a >= 1 and a <= 4) and a or 1
+      w.vtDev = b == 2 and 2 or 1
+      w.devMain = (c == 1 or c == 2) and c or 0
+      w.devStabi = d == 1
+      w.drawIv = (e >= 1 and e <= 4) and e or 1
+    end
   end
   BAL.SN.load(w)
   w.mcValue = w.mc / 10
@@ -5449,6 +5463,7 @@ local function read(w)
 end
 
 local function write(w)
+  w.radFix = 100000 + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, BAL.SN.stored(w, k)) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, BAL.SN.stored(w, d.key)) end
