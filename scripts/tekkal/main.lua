@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.4
+-- @version 1.4.1
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -116,6 +116,23 @@ local function unitIs(src, name, txt)
   return (c ~= nil and u == c) or u == txt
 end
 
+-- km/h-Einheit von Ethos: der Name der Konstante ist nicht fest (UNIT_KPH, UNIT_KMH ...), darum _G durchsuchen
+-- (wie SkyNavigator 1.41; vorher wurde km/h ohne passende Konstante als Knoten gelesen, x1.85)
+local kmhU = nil
+local function isKmh(src)
+  local ok, u = pcall(src.unit, src)
+  if not ok or u == nil then return false end
+  if u == "km/h" then return true end
+  if kmhU == nil then
+    kmhU = false
+    for k, v in pairs(_G) do
+      if type(k) == "string" and k:sub(1, 5) == "UNIT_" and (k:find("KPH") or k:find("KMH") or k:find("KM_PER")
+        or k:find("KILOMETER_PER") or k:find("KMPH")) then kmhU = v; break end
+    end
+  end
+  return kmhU ~= false and u == kmhU
+end
+
 -- Geschwindigkeit eines Sensors in m/s. unitSel: 1 automatisch (fallback), 2 km/h, 3 kn, 4 m/s
 local function speedMs(src, unitSel, fallback)
   local v = readNumber(src)
@@ -123,7 +140,8 @@ local function speedMs(src, unitSel, fallback)
   local u = unitSel or 1
   if u == 1 then
     if unitIs(src, "UNIT_METER_PER_SECOND", "m/s") then u = 4
-    elseif unitIs(src, "UNIT_KMH", "km/h") or unitIs(src, "UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
+    elseif unitIs(src, "UNIT_KPH", "km/h") or unitIs(src, "UNIT_KMH", "km/h") or unitIs(src, "UNIT_KILOMETER_PER_HOUR", "km/h")
+      or isKmh(src) then u = 2
     elseif unitIs(src, "UNIT_KNOT", "kn") or unitIs(src, "UNIT_KNOTS", "kn") then u = 3
     elseif unitIs(src, "UNIT_MPH", "mph") then u = 5
     else u = fallback end
