@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.40
+-- @version 1.41
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.40"
+local VERSION = "1.41"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1334,7 +1334,7 @@ function BAL.polar(w)
   local e = w.polarE
   local m0 = e and type(e.mass) == "number" and e.mass > 0 and e.mass or nil
   w.polarMass = m0
-  local fac = m0 and (m0 + (w.balKg or 0)) / m0 or w.ballast / 100
+  local fac = clamp(m0 and (m0 + (w.balKg or 0)) / m0 or w.ballast / 100, 0.5, 4)   -- 1.41: Gewichtsfaktor plausibel
   w.polar = e and polarFromAbc(e.a, e.b, e.c, e.vMin, e.vMax, fac, w.bugs / 100) or nil
 end
 
@@ -1388,6 +1388,20 @@ end
 -- in jedem wakeup. Plausibilitaet: im Flug ist das Mittel der Fahrt etwa das Mittel der GPS-Geschwindigkeit
 -- (Wind mittelt sich in Kreisen und Schenkeln weg); nach 2 min ausserhalb 0.6..1.7 kommt "Fahrt-Sensor pruefen".
 BAL.AS = {}
+-- km/h-Einheit erkennen, auch wenn die Konstante je nach Ethos-Version anders heisst (wie Polarflug findKmhUnit):
+-- vorher fiel eine Fahrt in km/h (SM-Logger, Ethos zeigt km/h) ohne passende Konstante auf Knoten (x1.85 zu hoch)
+function BAL.isKmh(un)
+  if un == nil or un == "km/h" then return un == "km/h" end
+  if BAL.kmhU == nil then
+    BAL.kmhU = false
+    for k, v in pairs(_G) do
+      if type(k) == "string" and k:sub(1, 5) == "UNIT_" and (k:find("KPH") or k:find("KMH") or k:find("KM_PER") or k:find("KILOMETER_PER") or k:find("KMPH")) then
+        BAL.kmhU = v; break
+      end
+    end
+  end
+  return BAL.kmhU ~= false and un == BAL.kmhU
+end
 function BAL.AS.read(w, now, dt)
   local src = validSource(w.airSrc)
   local v = src and readNumber(src)
@@ -1398,7 +1412,7 @@ function BAL.AS.read(w, now, dt)
     if not ok then un = nil end
     local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
     if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
-    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
+    elseif is("UNIT_KPH", "km/h") or is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") or BAL.isKmh(un) then u = 2
     elseif is("UNIT_MPH", "mph") then u = 5
     else u = 3 end                                            -- Knoten oder ohne Einheit (DIY-Sensor): Knoten
   end
@@ -2124,11 +2138,13 @@ end
 local function nettoCalc(w, f, dt)
   -- Sollfahrt wie Widget Sollfahrt (gleiche Glaettung wie dessen Standard: Vario und Fahrt 2 s,
   -- Netto 8 s), damit beide Widgets bei gleichem MC und Wind dieselbe Sollfahrt zeigen
-  if w.polar and f and f.tas and f.tas * KMH > 15 and w.varioRaw ~= nil then
+  -- 1.41: nur plausible Eingaben (Vario +-30 m/s, Fahrt bis 100 m/s), Netto auf +-20 m/s begrenzt: am 13.11.
+  -- zeigte das Feld NETTO zu Beginn des Flugs fuenfstellige Werte
+  if w.polar and f and f.tas and f.tas * KMH > 15 and f.tas < 100 and w.varioRaw ~= nil and math.abs(w.varioRaw) < 30 then
     local p = w.polar
     w.teN = lpf(w.teN, w.varioRaw, dt, 2)
     w.tasN = lpf(w.tasN, f.tas, dt, 2)
-    w.netto = lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8)
+    w.netto = clamp(lpf(w.netto, w.teN + polarSink(p, w.tasN), dt, 8), -20, 20)
     local head = nil
     if w.windOk and f.hdg then local hx, hy = dirVec(f.hdg); head = -(w.wx * hx + w.wy * hy) end
     -- Zeit-MC, solange er gilt (siehe w.rzMan in wakeup: Poti oder Tippen auf das MC-Feld). Dann zaehlt
