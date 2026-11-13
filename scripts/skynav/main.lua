@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.38
+-- @version 1.39
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.38"
+local VERSION = "1.39"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2961,35 +2961,91 @@ end
 -- Bildaufbau den Takt aufhalten. Gemessen werden pro 10 s: Dauer von wakeup und paint (Mittel/Maximum) und der
 -- Abstand zwischen zwei wakeup (Takt; enthaelt auch das Zeichnen von Ethos selbst). Anzeige in der Konfiguration.
 -- Dazu "Bildaufbau" (drawIv): wie oft das Widget neu zeichnen laesst.
-BAL.TM = {IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil}
+BAL.TM = {CV = {1, 2, 4}, IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil}
 function BAL.TM.add(k, d)
   local c = BAL.TM.c
   local e = c[k]
   if not e then e = {n = 0, s = 0, m = 0}; c[k] = e end
   e.n, e.s = e.n + 1, e.s + d
   if d > e.m then e.m = d end
+  if not e.lo or d < e.lo then e.lo = d end
+  if d > 0.08 then e.hi = (e.hi or 0) + 1 end
 end
 function BAL.TM.wake(f, w)
   local T = BAL.TM
   local t = os.clock()
   if T.last then T.add("g", t - T.last) end
   T.last = t
+  -- 1.39 Rechentakt (calcIv): Der Sinkton des Ethos-Varios klickert auch auf dem Hauptbildschirm, also ohne
+  -- Zeichnen (Christoph 13.11.2026); der Takt lag bei rund 100 ms, davon 20 bis 27 ms Rechnen. Zum Eingrenzen
+  -- rechnet das Widget wahlweise nur in jedem 2. oder 4. Aufruf voll; dazwischen schreibt es nur den Vario-Wert.
+  T.wn = (T.wn or 0) + 1
+  local iv = BAL.TM.CV[w.calcIv or 1] or 1
+  if iv > 1 and T.wn % iv ~= 0 then
+    local s = w.voSens
+    if s and w.vtDev == 2 and w.voMode then BAL.VO.write(s, w.voMode, BAL.VO.v or 0) end
+    T.add("l", os.clock() - t)
+    return
+  end
   f(w)
   local t2 = os.clock()
   T.add("w", t2 - t)
   if not T.t0 then T.t0 = t2 elseif t2 - T.t0 >= 10 then T.r, T.c, T.t0 = T.c, {}, t2 end
 end
+-- 1.39: Am Sender (X20, Ethos 1.6.8) braucht ein Bild rund 125 ms, das Rechnen nur 20 bis 27 ms (Christoph
+-- 13.11.2026). Darum misst jedes 4. Bild zusaetzlich jeden Zeichenbefehl einzeln (lcd ueber einen Zaehler
+-- geleitet): Zeit und Anzahl pro Befehl, Anzeige in der Konfiguration, die teuersten zuerst.
+function BAL.TM.proxy()
+  local T = BAL.TM
+  if T.px then return T.px end
+  local real = lcd
+  T.real, T.L = real, {}
+  T.px = setmetatable({}, {__index = function(t, k)
+    local f = real[k]
+    if type(f) ~= "function" then return f end
+    local g = function(...)
+      local t0 = os.clock()
+      local a, b, c = f(...)
+      local e = T.L[k]
+      if not e then e = {n = 0, s = 0}; T.L[k] = e end
+      e.n, e.s = e.n + 1, e.s + (os.clock() - t0)
+      return a, b, c
+    end
+    rawset(t, k, g)
+    return g
+  end})
+  return T.px
+end
 function BAL.TM.paint(f, w)
+  local T = BAL.TM
+  T.pn = (T.pn or 0) + 1
+  local probe = T.pn % 4 == 0
+  if probe then local px = T.proxy(); lcd = px; T.Ln = (T.Ln or 0) + 1 end
   local t = os.clock()
-  f(w)
-  BAL.TM.add("p", os.clock() - t)
+  local ok, err = pcall(f, w)
+  local d = os.clock() - t
+  if probe then lcd = T.real; T.add("q", d) else T.add("p", d) end
+  if not ok then error(err, 0) end
 end
 function BAL.TM.info()
   local r, t = BAL.TM.r, {}
   if not r then return {"Messung laeuft (10 s)"} end
-  for _, d in ipairs({{"w", "Rechnen"}, {"p", "Zeichnen"}, {"g", "Takt"}}) do
+  for _, d in ipairs({{"w", "Rechnen"}, {"l", "Leer"}, {"p", "Zeichnen"}, {"g", "Takt"}}) do
     local e = r[d[1]]
     if e and e.n > 0 then t[#t + 1] = string.format("%s %.0f/%.0f ms n%d", d[2], e.s / e.n * 1000, e.m * 1000, e.n) end
+  end
+  local g = r.g
+  if g and g.n > 0 then t[#t + 1] = string.format("Takt min %.0f, >80ms %d%%", (g.lo or 0) * 1000, math.floor((g.hi or 0) / g.n * 100 + 0.5)) end
+  -- Zeichenbefehle: Mittel pro Bild (ms) und Anzahl pro Bild, seit dem Einschalten
+  local L, n = BAL.TM.L, BAL.TM.Ln or 0
+  if L and n > 0 then
+    local ks = {}
+    for k in pairs(L) do ks[#ks + 1] = k end
+    table.sort(ks, function(a, b) return L[a].s > L[b].s end)
+    for i = 1, math.min(#ks, 7) do
+      local e = L[ks[i]]
+      t[#t + 1] = string.format("%s %.0fms x%.0f", ks[i]:gsub("^draw", ""), e.s / n * 1000, e.n / n)
+    end
   end
   return t
 end
@@ -5332,6 +5388,7 @@ local function configure(w)
   if w.vtDev == 2 then
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
+  addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}})
   addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
   for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
@@ -5413,7 +5470,7 @@ local function setDefaults(w)
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
   w.vtStyle, w.vtDev = 1, 1
-  w.drawIv = 1
+  w.drawIv, w.calcIv = 1, 1
   w.devMain, w.devStabi, w.varioType = 1, false, 0   -- 1.30: neue Widgets suchen die Sensoren des SM GPS-Logger 3
 end
 
@@ -5447,6 +5504,13 @@ local function read(w)
     -- beliebig viele Eintraege. Darum stehen diese Werte zusaetzlich gepackt im frueher ungenutzten Platz radFix
     -- (weit vorne): 100000 + Klang + 10 * Ausgabe + 100 * Geraet + 1000 * Stabi + 10000 * Bildaufbau.
     local p = w.radFix
+    w.calcIv = 1
+    if type(p) == "number" and p >= 1000000 and p < 2000000 then    -- 1.39: dazu Rechentakt * 100000
+      p = math.floor(p) - 1000000
+      local c6 = math.floor(p / 100000) % 10
+      w.calcIv = (c6 >= 1 and c6 <= 3) and c6 or 1
+      p = p % 100000 + 100000
+    end
     if type(p) == "number" and p >= 100000 and p < 200000 then
       p = math.floor(p) - 100000
       local a, b, c, d, e = p % 10, math.floor(p / 10) % 10, math.floor(p / 100) % 10, math.floor(p / 1000) % 10, math.floor(p / 10000) % 10
@@ -5463,7 +5527,7 @@ local function read(w)
 end
 
 local function write(w)
-  w.radFix = 100000 + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
+  w.radFix = 1000000 + 100000 * (w.calcIv or 1) + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, BAL.SN.stored(w, k)) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, BAL.SN.stored(w, d.key)) end
