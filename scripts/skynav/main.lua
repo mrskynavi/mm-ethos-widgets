@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.39
+-- @version 1.40
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.39"
+local VERSION = "1.40"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1449,7 +1449,7 @@ BAL.SN = {
     gpsAlt   = {dev = "gps",   lbl = "GPS-Höhe", ids = {0x0820}, names = {"GAlt", "GPS-Höhe", "GPS Alt"}},
     gpsTime  = {dev = "gps",   lbl = "Zeit",     ids = {0x0850}, names = {"GPS-Zeit", "GPS Clock", "GPS Time"}},
     satSrc   = {dev = "gps",   lbl = "Sats",     ids = {0x0860}, names = {"Satelliten", "Sats", "GPS Sats"}},
-    crsSrc   = {dev = "gps",   lbl = "Kurs",     ids = {0x5220, 0x0840}, names = {"Flugrichtung", "Flugr.", "Richtung", "GPS-Kurs", "Hdg", "GPS Course"}},
+    crsSrc   = {dev = "frgps", lbl = "Kurs",     ids = {0x0840}, names = {"GPS-Kurs", "GPS Course", "Hdg"}},  -- 1.40: nicht beim SM-Logger
     relAlt   = {dev = "baro",  lbl = "Höhe",     ids = {0x0100}, names = {"Altitude", "Flughöhe", "Höhe"}},
     vario    = {dev = "baro",  lbl = "Vario",    ids = {0x0110}, names = {"Steigr. Vario", "VSpeed", "Vario"}, korr = "TEK korr."},
     airSrc   = {dev = "sm",    lbl = "Fahrt",    ids = {0x0A00}, names = {"Airspeed", "ASpd"}, korr = "Fahrt korr."},
@@ -1518,6 +1518,7 @@ function BAL.SN.wanted(w, R)
   local dm, st = w.devMain or 0, w.devStabi == true
   if R.dev == "gps" or R.dev == "baro" then return dm >= 1 end
   if R.dev == "sm" then return dm == 1 end
+  if R.dev == "frgps" then return dm == 2 end   -- GPS-Kurs nur mit FrSky-GPS; beim SM-Logger Kurs aus den Positionen
   if R.dev == "stabi" then return st end
   if R.dev == "acc" then return st or dm == 1 end
   return false
