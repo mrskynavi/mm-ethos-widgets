@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.41
+-- @version 1.42
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.41"
+local VERSION = "1.42"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -238,12 +238,23 @@ local function fitOk(cx, cy, r, resFrac, pts)
   return resFrac <= MAX_RESIDUAL_FRAC
 end
 
--- Stuetzwert (Bodenvektor) ins Fenster, Fit jede Sekunde. Wind = Vektor, wohin die Luft zieht (m/s).
-local function windStep(w, ve, vn, now)
+-- Mit Staudruck-Fahrt (1.42): Fit mit bekannter Fahrt statt Kasa. Gesucht Wind W und Faktor k mit
+-- |Boden_i - W| = k * TAS_i (Gauss-Newton, 3 Unbekannte, k faengt einen Kalibrierfehler der Fahrt auf).
+-- Der Kasa-Fit nimmt konstante Fahrt an; Fahrtwechsel im Fenster (Ziehen/Druecken, halbe Kreise, Motorsteigflug
+-- mit 3D-Geschwindigkeit des SM-Loggers) verschoben den Kreismittelpunkt, und der Wind kam zeitweise aus der
+-- Gegenrichtung (Log 13.11.: Ostwind 15-20 km/h, Fits bis 13 km/h aus Sued/West). Mit Fahrt: alle Fits NO.
+-- Grenzen mit Fahrt: Kurs-Streuung unter 0.5 (etwa ein halber Kreis genuegt), Rest unter 12 % der Fahrt,
+-- k 0.7..1.4. Ohne Fahrt wie bisher Kasa mit Streuung unter 0.3 (rund 265 Grad). Replay 13.11.: Wind aus
+-- 100..320 Grad vorher 326 s, mit Fahrt 0 s, ohne Fahrt (nur Motor ausgeblendet) 69 s.
+-- Funktionen lokal in windFit (Ethos: max. 200 lokale Namen im Hauptteil).
+
+-- Stuetzwert (Bodenvektor, dazu TAS falls Staudruck gilt) ins Fenster, Fit jede Sekunde.
+-- Wind = Vektor, wohin die Luft zieht (m/s).
+local function windStep(w, ve, vn, now, tas)
   local win = w.win
   if ve and math.sqrt(ve * ve + vn * vn) >= 2 / KMH and (w.sT == nil or now - w.sT >= SAMPLE_DT) then
     w.sT = now
-    win[#win + 1] = {x = ve, y = vn}
+    win[#win + 1] = {x = ve, y = vn, a = tas}
     if #win > WINDOW then table.remove(win, 1) end
   end
 end
@@ -254,16 +265,78 @@ local function windFit(w, now)
   local need = w.windOk and 10 or WINDOW
   if #win >= need and (w.fitT == nil or now - w.fitT >= 1) then
     w.fitT = now
-    if courseSpread(win) < MAX_SPREAD_R then
-      local cx, cy, r, res = kasaFit(win)
-      if cx and fitOk(cx, cy, r, res, win) then
-        if w.windOk then
-          w.wx, w.wy = w.wx + 0.3 * (cx - w.wx), w.wy + 0.3 * (cy - w.wy)
-        else
-          w.wx, w.wy, w.windOk = cx, cy, true
-        end
-        w.windT = now
+    -- (Funktionen erst hier erzeugt: nur einmal pro Sekunde, nicht in jedem wakeup)
+    local AS_SPREAD, AS_RES_FRAC, AS_K_MIN, AS_K_MAX, KASA_SPREAD = 0.5, 0.12, 0.7, 1.4, 0.3
+    -- 3x3 loesen (Cramer), nil wenn singulaer
+    local function solve3(A, b)
+      local function det(m)
+        return m[1][1] * (m[2][2] * m[3][3] - m[2][3] * m[3][2]) - m[1][2] * (m[2][1] * m[3][3] - m[2][3] * m[3][1])
+          + m[1][3] * (m[2][1] * m[3][2] - m[2][2] * m[3][1])
       end
+      local D = det(A)
+      if math.abs(D) < 1e-9 then return nil end
+      local r = {}
+      for c = 1, 3 do
+        local M = {{A[1][1], A[1][2], A[1][3]}, {A[2][1], A[2][2], A[2][3]}, {A[3][1], A[3][2], A[3][3]}}
+        for i = 1, 3 do M[i][c] = b[i] end
+        r[c] = det(M) / D
+      end
+      return r
+    end
+
+    -- Wind mit bekannter Fahrt: Start beim bisherigen Wind (oder 0), 8 Schritte. Gibt wx, wy, k, Rest (m/s) zurueck.
+    local function airFit(pts, wx, wy)
+      local k = 1
+      for _ = 1, 8 do
+        local A = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}
+        local b = {0, 0, 0}
+        for _, p in ipairs(pts) do
+          local dx, dy = p.x - wx, p.y - wy
+          local m = math.sqrt(dx * dx + dy * dy)
+          if m > 1e-3 then
+            local r, j1, j2, j3 = m - k * p.a, -dx / m, -dy / m, -p.a   -- Ableitungen nach wx, wy, k
+            b[1], b[2], b[3] = b[1] - j1 * r, b[2] - j2 * r, b[3] - j3 * r
+            A[1][1], A[1][2], A[1][3] = A[1][1] + j1 * j1, A[1][2] + j1 * j2, A[1][3] + j1 * j3
+            A[2][2], A[2][3], A[3][3] = A[2][2] + j2 * j2, A[2][3] + j2 * j3, A[3][3] + j3 * j3
+          end
+        end
+        A[2][1], A[3][1], A[3][2] = A[1][2], A[1][3], A[2][3]
+        local s = solve3(A, b)
+        if not s then return nil end
+        wx, wy, k = wx + s[1], wy + s[2], k + s[3]
+      end
+      local res = 0
+      for _, p in ipairs(pts) do res = res + (math.sqrt((p.x - wx) ^ 2 + (p.y - wy) ^ 2) - k * p.a) ^ 2 end
+      return wx, wy, k, math.sqrt(res / #pts)
+    end
+    local sp = courseSpread(win)
+    -- Staudruck: alle Stuetzwerte im Fenster mit Fahrt
+    local nA, sumA, maxG = 0, 0, 0
+    for _, p in ipairs(win) do
+      if p.a and p.a > 3 then nA, sumA = nA + 1, sumA + p.a end
+      maxG = math.max(maxG, math.sqrt(p.x * p.x + p.y * p.y))
+    end
+    local cx, cy, good
+    if nA == #win then
+      if sp < AS_SPREAD then
+        local k, res
+        cx, cy, k, res = airFit(win, w.windOk and w.wx or 0, w.windOk and w.wy or 0)
+        good = cx ~= nil and k >= AS_K_MIN and k <= AS_K_MAX and res <= AS_RES_FRAC * k * sumA / nA
+          and math.sqrt(cx * cx + cy * cy) <= MAX_WIND_FACTOR * maxG
+        if good then w.windK = k end
+      end
+    elseif sp < KASA_SPREAD then
+      local r, res
+      cx, cy, r, res = kasaFit(win)
+      good = cx ~= nil and fitOk(cx, cy, r, res, win)
+    end
+    if good then
+      if w.windOk then
+        w.wx, w.wy = w.wx + 0.3 * (cx - w.wx), w.wy + 0.3 * (cy - w.wy)
+      else
+        w.wx, w.wy, w.windOk = cx, cy, true
+      end
+      w.windT = now
     end
   end
 end
@@ -1716,12 +1789,20 @@ local function readInputs(w, now, dt)
   -- Kurs vom GPS-Empfaenger (Quelle "GPS-Kurs", aus der Doppler-Geschwindigkeit, ohne die rund 1 s Verzug der
   -- 2-s-Basis); erst ab 3 m/s, darunter ist er unruhig
   -- (SM GPS-Logger 3: DIY-Wert 0522 "Flugrichtung"; kommt er roh in 0.1 Grad, wird er umgerechnet)
+  -- 1.42: nur, solange er zum Kurs aus den Positionen passt (Mittel der Abweichung unter 45 Grad). Eine von Hand
+  -- gewaehlte "Flugrichtung" des SM-Loggers ist kein Kurs und verdrehte sonst den Wind.
   local cs = readNumber(w.crsSrc)
   if cs and cs > 360 and cs <= 3600 then cs = cs / 10 end
-  if cs and gs >= 3 and cs >= 0 and cs <= 360 then w.crs = cs % 360 end
+  if cs and gs >= 3 and cs >= 0 and cs <= 360 then
+    if dd >= 3 then w.csDev = lpf(w.csDev, math.abs(angDiff(cs, w.crs)), dtFix, 10) end
+    if w.csDev and w.csDev < 45 then w.crs = cs % 360 end
+  end
   local ve, vn = nil, nil
   if w.crs then local sx, sy = dirVec(w.crs); ve, vn = gs * sx, gs * sy end
-  if ve then windStep(w, ve, vn, now) end
+  -- 1.42: keine Stuetzwerte im Motorsteigflug (Hoehe aendert sich ueber 6 m/s): der SM-Logger meldet die
+  -- 3D-Geschwindigkeit, die Bodenvektoren waren dort zu lang und zogen den Kreisfit weg
+  if w.lastAgl then w.climbW = lpf(w.climbW, (agl - w.lastAgl) / math.max(dtFix, 0.05), dtFix, 1) end
+  if ve and math.abs(w.climbW or 0) <= 6 then windStep(w, ve, vn, now, w.asOk and w.asTas or nil) end
   -- Vertikalgeschwindigkeit: Vario, sonst Hoehenaenderung
   local vz = w.vSlow2
   if vz == nil and w.lastAgl then
