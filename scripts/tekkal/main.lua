@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.2
+-- @version 1.3
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -25,17 +25,27 @@
 --   rechnen die Quellen auch, wenn das Widget nicht auf einem Bildschirm des Modells liegt (es muss nur
 --   einmal konfiguriert worden sein).
 --
--- Fahrt-Faktor (Kreise): pro voller Kreis (360 Grad, Drehrate ueber 6 Grad/s) Fit
---   |Bodenvektor - Wind| = k * Fahrt_horizontal ueber Wind Ost/Nord und k (Kasa-Startwert, dann
+-- Kurs (1.3): aus den GPS-Positionen (Peilung zwischen Fixes ab 3 m). Die "Flugrichtung" des SM-Loggers
+--   (DIY 0522) ist KEIN Kurs ueber Grund (bleibt im Flug vor dem Piloten in einem Bereich von ~170 Grad),
+--   damit wurden kaum Kreise erkannt. Eine Kurs-Quelle gilt nur ohne GPS-Position (FrSky-GPS).
+-- Fahrt-Faktor (Kreise): gleitendes Fenster (Stuetzwert alle 0.5 s, hoechstens 120 s); ein Kreis ist fertig,
+--   sobald sich der Kurs im Fenster um 360 Grad gedreht hat, egal wie langsam oder mit Geraden dazwischen.
+--   Fit |Bodenvektor - Wind| = k * Fahrt_horizontal ueber Wind Ost/Nord und k (Kasa-Startwert, dann
 --   Gauss-Newton, pro wakeup ein Schritt). Fahrt_horizontal = sqrt(TAS^2 - Vario^2), TAS aus der
---   Logger-Fahrt (IAS, Normatmosphaere wie SkyNavigator 1.27). Ein Kreis zaehlt, wenn die Fahrt um
---   weniger als 10 % schwankt, die Punkte auf dem Kreis liegen (Rest unter 1.2 m/s und 8 %) und der
---   Wind kleiner als die Fahrt ist. Ergebnis = Median der Kreise.
+--   Logger-Fahrt (IAS, Normatmosphaere wie SkyNavigator 1.27). Der Fit rechnet Punkt fuer Punkt, die Fahrt
+--   darf also schwanken (bis 20 %). Ein Kreis zaehlt, wenn die Punkte auf dem Kreis liegen (Rest unter
+--   2 m/s und 12 % der Fahrt) und der Wind kleiner als die Fahrt ist. Ergebnis = Median der Kreise.
+--   Gepruefter Flug ASW-17 13.11.: 15 Kreise, 13 davon k 1.03..1.08, Rest 0.4..1.6 m/s.
+-- Motor (1.3): Motor-Quelle (Gas/Schalter, laeuft ueber Schwelle) und/oder Vario am Anschlag (ab 8 m/s);
+--   bis 15 s danach (Ausgleiten nach dem Steigflug) zaehlen keine Kreise, Geraden und TEK-Werte. Die
+--   TEK-Werte laufen 2..4 s verzoegert in die Summen, damit der Motorbeginn vor dem Erkennen nicht mitzaehlt.
+-- Bedienung (1.3): Ein Tippen ins Widget oeffnet bei Ethos das Widget-Menue, darum gehen Uebernehmen und
+--   Neu beginnen ueber Schalter (Quellen in der Konfiguration, aktiv ueber 5 %, zaehlt beim Umlegen).
 -- Fahrt-Faktor (Geraden): nach einem Kreis gilt dessen Wind 3 min (+-150 m). Geradeaus (Drehrate unter
 --   4 Grad/s seit 3 s) jede Sekunde k = |Boden - Wind| / Fahrt, getrennt nach Fahrtbereich (10 km/h)
 --   und Himmelsrichtung (4 Viertel). Ein Bereich gilt, wenn zwei gegenueberliegende Viertel Werte haben
 --   (Windfehler hebt sich auf). Zeigt, ob der Faktor von der Fahrt abhaengt.
--- TEK (geradeaus, Drehrate unter 15 Grad/s): Raster 0.1 s, Energie E = v^2/2g, beide Reihen mit 0.25 s
+-- TEK (geradeaus, Drehrate unter 15 Grad/s, Vario nicht am Anschlag): Raster 0.1 s, Energie E = v^2/2g, beide Reihen mit 0.25 s
 --   geglaettet und hochpass-gefiltert (4 s), dann TE_hp gegen dE_hp regressiert, fuer Verzoegerungen
 --   -0.5..+1.0 s; es gilt die Verzoegerung mit dem kleinsten Rest. x = -Sxy/Sxx.
 --
@@ -63,7 +73,11 @@ local NUM_DEFS = {
   {key = "circles",   def = 3},    -- so viele Kreise braucht der Fahrt-Faktor
   {key = "manSec",    def = 30},   -- so viele Sekunden Fahrtwechsel braucht die TEK-Messung
   {key = "airK",      def = 1000}, -- Fahrt-Korrektur fuer die Quelle "Fahrt korr." (0.1 %, auf die Logger-Fahrt)
+  {key = "motorThr",  def = -800}, -- Motor laeuft, wenn die Motor-Quelle darueber liegt (-1024..1024)
+  {key = "motorAuto", def = 1},    -- 1 Motor auch am Vario erkennen (ab 8 m/s), 2 nur Motor-Quelle
 }
+-- 1.3: Quellen nach den Zahlen gespeichert (alte Konfigurationen bleiben gueltig)
+local EXTRA_SRC = {"motor", "swTake", "swReset"}
 
 local function clamp(x, lo, hi)
   if x < lo then return lo end
@@ -174,8 +188,11 @@ local CFG = nil          -- Einstellungen des (letzten) Widgets, CFG.model = sei
 local S = nil            -- Messzustand
 local FC = nil           -- Einstellungen aus der Datei (ohne Widget), {model, t, cfg}
 
-local CIRCLE_DT = 0.3    -- Abstand der Kreis-Stuetzwerte (s)
-local CIRCLE_MAX = 200   -- hoechstens so viele Stuetzwerte pro Kreis (60 s)
+local CIRCLE_DT = 0.5    -- Abstand der Kreis-Stuetzwerte (s)
+local CIRCLE_MAX = 240   -- Fenster fuer einen Kreis: hoechstens so viele Stuetzwerte (120 s)
+local CIRCLE_MIN = 10    -- ein Kreis braucht mindestens so viele Stuetzwerte (5 s)
+local MOTOR_HOLD = 15    -- so lange nach dem Motor (s) wird nicht gemessen
+local MOTOR_VARIO = 8    -- Vario ab hier gilt als Motorsteigflug (m/s)
 local GRID = 0.1         -- Raster der TEK-Messung (s)
 local LAG_MIN, LAG_MAX = -5, 10   -- Verzoegerungen in Rasterschritten
 local RING = 16
@@ -186,7 +203,7 @@ local RING = 16
 -- Bildschirm. UEBERNEHMEN kann den Widget-Speicher nicht schreiben (das macht Ethos nur beim Schliessen der
 -- Konfiguration), deshalb gilt die Datei: read() liest sie, UEBERNEHMEN und write() schreiben sie.
 local KORR_NUM = {"tekX", "tekLag", "airK", "airUnit", "airKind", "altKind", "fieldAlt"}
-local KORR_SRC = {"air", "vario", "alt"}
+local KORR_SRC = {"air", "vario", "alt", "gps", "motor", "swTake", "swReset"}
 
 local function korrName(mname)
   return "korrektur_" .. tostring(mname or currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
@@ -262,18 +279,26 @@ local function fileCfg(now, mname)
   return cfg
 end
 
+-- TEK-Summen eines Abschnitts (2 s), erst nach 2..4 s ohne Motor gezaehlt
+local function newSums()
+  local p = {sxy = {}, sxx = {}, syy = {}, n = 0, man = 0, used = false}
+  for L = LAG_MIN, LAG_MAX do p.sxy[L], p.sxx[L], p.syy[L] = 0, 0, 0 end
+  return p
+end
+
 local function newState()
   local s = {
     t0 = nil, lastT = nil, flyT = 0,
-    seg = {}, segTurn = 0, segSign = 0, segT = nil, segCrs = nil, calmT = nil,
+    buf = {}, cum = 0, bufT = nil, bufCrs = nil, turnNow = 0, motor = false, motorT = nil,
     circles = {}, rejects = 0, fit = nil, lastCircle = nil, lastReject = nil,
     straightT = 0, stLastT = nil, cls = {},
     gridAcc = 0, gridN = 0, okRun = 0,
     rDe = {}, rTe = {}, rDeS = {}, ri = 0,
-    sxy = {}, sxx = {}, syy = {}, sn = 0, manSec = 0,
+    sxy = {}, sxx = {}, syy = {}, sn = 0, manSec = 0, pend = nil, wait = nil, pendN = 0,
     model = nil, savedSig = nil, saveT = nil,
   }
   for L = LAG_MIN, LAG_MAX do s.sxy[L], s.sxx[L], s.syy[L] = 0, 0, 0 end
+  s.pend = newSums()
   return s
 end
 
@@ -366,8 +391,8 @@ local function fitStep(s, now)
   local tas = f.k * f.am
   local why
   if f.step == 9 then why = "Fit unloesbar"
-  elseif f.asd > 0.10 * f.am then why = string.format("Fahrt schwankt %.0f %%", 100 * f.asd / f.am)
-  elseif rms > 1.2 or rms > 0.08 * tas then why = string.format("Kreis unruhig (%.1f m/s)", rms)
+  elseif f.asd > 0.20 * f.am then why = string.format("Fahrt schwankt %.0f %%", 100 * f.asd / f.am)
+  elseif rms > 2.0 or rms > 0.12 * tas then why = string.format("Kreis unruhig (%.1f m/s)", rms)
   elseif wind > 0.8 * tas then why = "Wind zu stark"
   elseif f.k < 0.6 or f.k > 1.6 then why = string.format("Faktor %.2f unplausibel", f.k) end
   s.fit = nil
@@ -449,6 +474,20 @@ end
 
 -- ---------------------------------------------------------------- Messung
 
+-- GPS-Position suchen, wenn keine gewaehlt ist (alle 10 s)
+local GPS_FIND = {t = nil, src = nil}
+local function findGps(now)
+  if GPS_FIND.t and now - GPS_FIND.t < 10 then return GPS_FIND.src end
+  GPS_FIND.t, GPS_FIND.src = now, nil
+  if not (system and system.getSource) then return nil end
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local ok, src
+  if cat then ok, src = pcall(system.getSource, {category = cat, appId = 0x0800}) end
+  if not (ok and validSource(src)) then ok, src = pcall(system.getSource, "GPS") end
+  if ok and validSource(src) and readPosition(src) then GPS_FIND.src = src end
+  return GPS_FIND.src
+end
+
 -- Ein Schritt der Messung. Laeuft aus dem Widget und aus der Quelle "TEK korr.", rechnet aber nur einmal
 -- pro Zeitpunkt.
 local function measure(now)
@@ -490,15 +529,13 @@ local function measure(now)
   local gs = speedMs(w.gpsSpd, 1, 2)                 -- GPS-Geschw.: ohne Einheit km/h
   s.gs = gs
 
-  -- Kurs: GPS-Kurs-Quelle ab 3 m/s, sonst aus Positionen (ab 3 m Abstand)
+  -- Kurs: aus den GPS-Positionen (ab 3 m Abstand). Eine Kurs-Quelle nur ohne Position (FrSky-GPS); die
+  -- "Flugrichtung" des SM-Loggers ist kein Kurs ueber Grund.
   local crs = nil
-  if validSource(w.gpsCrs) then
-    local c = readNumber(w.gpsCrs)
-    -- SM GPS-Logger 3: "Flugrichtung" (DIY 0522) in Grad; kommt sie roh in 0.1 Grad, ist sie bis 3600
-    if c and c > 360.5 and c <= 3600.5 then c = c / 10 end
-    if c and gs and gs >= 3 then crs = c % 360 end
-  else
-    local lat, lon = readPosition(w.gps)
+  local gpsSrc = w.gps
+  if not validSource(gpsSrc) and not validSource(w.gpsCrs) then gpsSrc = findGps(now) end
+  if validSource(gpsSrc) then
+    local lat, lon = readPosition(gpsSrc)
     if lat and (lat ~= s.pLat or lon ~= s.pLon) then
       s.pLat, s.pLon = lat, lon
       if s.aLat == nil then s.aLat, s.aLon = lat, lon
@@ -508,6 +545,19 @@ local function measure(now)
       end
     end
     crs = s.crsP
+  elseif validSource(w.gpsCrs) then
+    local c = readNumber(w.gpsCrs)
+    if c and c > 360.5 and c <= 3600.5 then c = c / 10 end      -- roh in 0.1 Grad
+    if c and gs and gs >= 3 then
+      -- einzelne Ausreisser (Sprung ueber 50 Grad) erst gelten lassen, wenn der naechste Wert dazu passt
+      if c ~= s.crsRaw then
+        s.crsRaw = c
+        if s.crsOk == nil or math.abs(angDiff(s.crsOk, c)) <= 50 then s.crsOk, s.crsCand = c % 360, nil
+        elseif s.crsCand and math.abs(angDiff(s.crsCand, c)) <= 30 then s.crsOk, s.crsCand = c % 360, nil
+        else s.crsCand = c end
+      end
+      crs = s.crsOk
+    end
   end
   -- Drehrate aus Kursaenderungen (Grad/s, geglaettet)
   if crs and s.crsPrev and dt > 0 then
@@ -522,36 +572,49 @@ local function measure(now)
   s.flying = flying
   local rate = s.rate or 0
 
-  -- ---- Kreise
+  -- ---- Motor: Motor-Quelle ueber der Schwelle oder Vario am Anschlag, gilt noch 15 s nach
+  local mv = readNumber(w.motor)
+  if mv and mv > (w.motorThr or -800) then s.motorT = now end
+  if (w.motorAuto or 1) ~= 2 and vario and vario >= MOTOR_VARIO then s.motorT = now end
+  local motor = s.motorT ~= nil and now - s.motorT < MOTOR_HOLD
+  if motor and not s.motor then s.pend, s.wait = newSums(), nil end   -- TEK der letzten 2..4 s verwerfen
+  s.motor = motor
+
+  -- ---- Kreise: gleitendes Fenster, fertig bei 360 Grad Kursaenderung
   if s.fit then fitStep(s, now) end
-  if flying and crs and math.abs(rate) > 6 then
-    local sign = rate > 0 and 1 or -1
-    if sign ~= s.segSign then s.seg, s.segTurn, s.segSign, s.segT, s.segCrs = {}, 0, sign, nil, crs end
-    s.calmT = nil
-    if s.segT == nil or now - s.segT >= CIRCLE_DT then
-      s.segT = now
-      s.segTurn = s.segTurn + math.abs(angDiff(s.segCrs or crs, crs))
-      s.segCrs = crs
-      local vz = vario or 0
+  if flying and crs and not motor then
+    if s.bufT == nil or now - s.bufT >= CIRCLE_DT then
+      s.bufT = now
+      local cum = s.cum + (s.bufCrs and angDiff(s.bufCrs, crs) or 0)
+      s.cum, s.bufCrs = cum, crs
+      local vz = clamp(vario or 0, -MOTOR_VARIO, MOTOR_VARIO)
       local ah = math.sqrt(math.max(tas * tas - vz * vz, 1))
       local c = math.rad(crs)
-      local seg = s.seg
-      seg[#seg + 1] = {gs * math.sin(c), gs * math.cos(c), ah, ias}
-      if #seg > CIRCLE_MAX then s.seg, s.segTurn, s.segSign = {}, 0, 0 end
-      if s.segTurn >= 360 and #s.seg >= 12 and not s.fit then
-        local si, n = 0, #seg
-        for i = 1, n do si = si + seg[i][4] end
-        s.fit = {seg = seg, step = 0, ias = si / n, alt = msl}
-        s.seg, s.segTurn, s.segCrs = {}, 0, crs           -- naechster Kreis beginnt hier
+      local buf = s.buf
+      buf[#buf + 1] = {gs * math.sin(c), gs * math.cos(c), ah, ias, cum}
+      if #buf > CIRCLE_MAX then table.remove(buf, 1) end
+      -- kuerzestes Fenster bis jetzt mit 360 Grad
+      local j, turn = nil, 0
+      for i = #buf - 1, 1, -1 do
+        local d = math.abs(cum - buf[i][5])
+        if d > turn then turn = d end
+        if d >= 360 then j = i; break end
+      end
+      s.turnNow = math.min(turn, 360)
+      if j and #buf - j + 1 >= CIRCLE_MIN and not s.fit then
+        local seg, si = {}, 0
+        for i = j, #buf do seg[#seg + 1] = buf[i]; si = si + buf[i][4] end
+        s.fit = {seg = seg, step = 0, ias = si / #seg, alt = msl}
+        s.buf = {buf[#buf]}                                  -- naechster Kreis beginnt hier
+        s.turnNow = 0
       end
     end
-  else
-    s.calmT = s.calmT or now
-    if now - s.calmT > 2 then s.seg, s.segTurn, s.segSign = {}, 0, 0 end
+  elseif not flying or motor then
+    s.buf, s.bufCrs, s.bufT, s.turnNow = {}, nil, nil, 0
   end
 
   -- ---- Geraden mit dem Wind des letzten Kreises
-  if flying and crs and math.abs(rate) < 4 then s.straightT = s.straightT + dt else s.straightT = 0 end
+  if flying and crs and not motor and math.abs(rate) < 4 then s.straightT = s.straightT + dt else s.straightT = 0 end
   local lc = s.lastCircle
   if lc and s.straightT >= 3 and now - lc.t <= 180 and math.abs(msl - lc.alt) <= 150
     and (s.stLastT == nil or now - s.stLastT >= 1) then
@@ -591,19 +654,33 @@ local function measure(now)
       -- rDeS: dE/dt einmal geglaettet (Quelle "TEK korr."). Die Regression vergleicht lpf(TEK) mit lpf(dE), die
       -- gefundene Verzoegerung gilt also zwischen dem rohen TEK und diesem dE.
       s.rDe[s.ri], s.rTe[s.ri], s.rDeS[s.ri] = dEh, TEh, dE
-      local ok = flying and math.abs(rate) < 15 and s.flyT > 20
+      local ok = flying and not motor and math.abs(rate) < 15 and s.flyT > 20 and math.abs(vario) < 9.5
       s.okRun = ok and s.okRun + 1 or 0
+      local p = s.pend
       if s.okRun > 40 then                                  -- 4 s ruhig: Hochpass eingeschwungen
-        s.sn = s.sn + 1
-        if math.abs(dEh) > 0.4 then s.manSec = s.manSec + GRID end
+        p.n, p.used = p.n + 1, true
+        if math.abs(dEh) > 0.4 then p.man = p.man + GRID end
         local rDe, rTe, ri = s.rDe, s.rTe, s.ri
         for L = LAG_MIN, LAG_MAX do
           local x = rDe[(ri - (L > 0 and L or 0) - 1) % RING + 1]
           local y = rTe[(ri - (L < 0 and -L or 0) - 1) % RING + 1]
-          s.sxy[L] = s.sxy[L] + x * y
-          s.sxx[L] = s.sxx[L] + x * x
-          s.syy[L] = s.syy[L] + y * y
+          p.sxy[L] = p.sxy[L] + x * y
+          p.sxx[L] = p.sxx[L] + x * x
+          p.syy[L] = p.syy[L] + y * y
         end
+      end
+      -- alle 2 s: wartender Abschnitt zaehlt, offener wartet (Motor erst spaet erkannt -> beide verworfen)
+      s.pendN = s.pendN + 1
+      if s.pendN >= 20 then
+        s.pendN = 0
+        local wt = s.wait
+        if wt and wt.used then
+          for L = LAG_MIN, LAG_MAX do
+            s.sxy[L], s.sxx[L], s.syy[L] = s.sxy[L] + wt.sxy[L], s.sxx[L] + wt.sxx[L], s.syy[L] + wt.syy[L]
+          end
+          s.sn, s.manSec = s.sn + wt.n, s.manSec + wt.man
+        end
+        if p.used then s.wait, s.pend = p, newSums() else s.wait = nil end
       end
     end
   end
@@ -675,6 +752,52 @@ local function saveResult(w, now)
   end
 end
 
+-- ---------------------------------------------------------------- Ansagen
+
+-- Zahl ansagen: Systemdateien des Senders /audio/<sprache>/.../system/<n>.wav (wie SkyNavigator),
+-- sonst system.playNumber. Nur ganze Zahlen 0..999.
+local numDir = nil
+local function findNumDir()
+  if numDir ~= nil then return numDir or nil end
+  numDir = false
+  if not (io and io.open) then return nil end
+  local langs, seen = {}, {}
+  local function addLang(l)
+    if type(l) == "string" and l ~= "" then
+      l = l:lower():sub(1, 2)
+      if not seen[l] then seen[l] = true; langs[#langs + 1] = l end
+    end
+  end
+  if system and system.getLocale then local ok, l = pcall(system.getLocale); if ok then addLang(l) end end
+  addLang("de"); addLang("en")
+  for _, l in ipairs(langs) do
+    for _, d in ipairs({"/audio/" .. l .. "/default/system/", "/audio/" .. l .. "/system/",
+                        "/audio/" .. l .. "/us/system/", "/audio/" .. l .. "/gb/system/"}) do
+      local ok, f = pcall(io.open, d .. "5.wav", "r")
+      if ok and f then pcall(f.close, f); numDir = d; return d end
+    end
+  end
+  return nil
+end
+
+local function sayNumber(v)
+  if not system then return end
+  local n = math.floor((tonumber(v) or 0) + 0.5)
+  if n < 0 or n > 999 then return end
+  local d = system.playFile and findNumDir()
+  if d then
+    if n > 100 then
+      local h, r = math.floor(n / 100) * 100, n % 100
+      pcall(system.playFile, d .. string.format("%d.wav", h))
+      if r > 0 then pcall(system.playFile, d .. string.format("%d.wav", r)) end
+    else
+      pcall(system.playFile, d .. string.format("%d.wav", n))
+    end
+  elseif system.playNumber then
+    pcall(system.playNumber, n, rawget(_G, "UNIT_PERCENT") or 0, 0)
+  end
+end
+
 -- ---------------------------------------------------------------- Widget
 
 local function create()
@@ -684,12 +807,62 @@ local function create()
   return w
 end
 
+-- Schalter aktiv (ueber 5 %); zaehlt nur das Umlegen, nicht die Stellung beim Start
+local function switchEdge(w, key)
+  local v = readNumber(w[key])
+  local on = v ~= nil and v > 50
+  local prev = w[key .. "_on"]
+  w[key .. "_on"] = on
+  return on and prev == false
+end
+
+-- Messung uebernehmen: Fahrt-Faktor (ab 1 Kreis) und TEK-Korrektur (ab 5 s Fahrtwechsel)
+local function takeOver(w, now)
+  local s = S
+  local parts = {}
+  local k, _, n = airResult(s)
+  local airPct, tekPct = nil, nil
+  if k then
+    w.airK = clamp(math.floor(1000 * k + 0.5), 500, 2000)
+    airPct = w.airK / 10
+    parts[#parts + 1] = string.format("Fahrt %.1f %% (%d Kreise)", airPct, n)
+  end
+  local xv, _, lag = tekResult(s)
+  if xv and s.manSec >= 5 then
+    w.tekX = clamp(math.floor(1000 * xv + 0.5), -500, 500)
+    w.tekLag = clamp(math.floor(lag / GRID + 0.5), 0, RING - 1)
+    tekPct = w.tekX / 10
+    parts[#parts + 1] = string.format("TEK %+.1f %%", tekPct)
+  end
+  if #parts == 0 then
+    s.taken = {t = now, txt = "Noch nichts gemessen", fail = true}
+    playToneSafe(400, 400)
+    return
+  end
+  saveKorr(w)
+  s.taken = {t = now, txt = table.concat(parts, ", ")}
+  playToneSafe(800, 100)
+  playToneSafe(1200, 100)
+  playToneSafe(1600, 200)
+  if airPct then sayNumber(airPct) end
+end
+
 local function wakeup(w)
   w.model = currentModelName()
   CFG = w
   local now = os.clock()
   measure(now)
-  saveResult(w, now)
+  if S then
+    if switchEdge(w, "swTake") then takeOver(w, now) end
+    if switchEdge(w, "swReset") then
+      local mn = S.model
+      resetAll()
+      S.model = mn
+      S.taken = {t = now, txt = "Neu begonnen"}
+      playToneSafe(1000, 300)
+    end
+    saveResult(w, now)
+  end
   if now - w.lastInvalidate >= 0.3 then
     w.lastInvalidate = now
     lcd.invalidate()
@@ -701,7 +874,7 @@ end
 local function rgb(r, g, b) return lcd.RGB(r, g, b) end
 local C = {}
 local function colors()
-  C.BG, C.DIM, C.BOX, C.TXT = rgb(0, 0, 0), rgb(150, 150, 150), rgb(40, 40, 40), rgb(255, 255, 255)
+  C.BG, C.DIM, C.BOX, C.TXT = rgb(0, 0, 0), rgb(150, 150, 150), rgb(35, 35, 45), rgb(255, 255, 255)
   C.GREEN, C.ORANGE, C.RED, C.BLUE = rgb(0, 200, 80), rgb(255, 170, 0), rgb(255, 60, 50), rgb(0, 170, 255)
 end
 
@@ -722,29 +895,37 @@ local function textHeight(font)
   return th
 end
 
-local function button(x, y, bw, bh, label, col, txtCol)
-  lcd.color(col)
-  lcd.drawFilledRectangle(x, y, bw, bh)
-  drawT(x, y + math.floor((bh - textHeight(FONT_XS)) / 2), bw, label, FONT_XS, txtCol or C.TXT, "c")
-  return {x = x, y = y, w = bw, h = bh}
+local function swName(w, key, none)
+  local n = srcName(w[key])
+  if n == "" then return none end
+  return n
 end
 
--- Was jetzt fliegen?
-local function advice(w, s)
-  if not s.tas then return "Fahrt-Quelle waehlen (Airspeed des Loggers)", C.ORANGE end
-  if not s.vario then return "Vario-Quelle waehlen (TEK-Vario)", C.ORANGE end
-  if not s.gs then return "GPS-Geschw. waehlen", C.ORANGE end
-  if not s.crs and s.flying then return "GPS-Kurs (oder GPS-Position) waehlen", C.ORANGE end
-  if not s.flying then return "Bereit - am Boden", C.DIM end
+-- Was jetzt fliegen? Befehl (gross), Erklaerung, Farbe
+local function advice(w, s, now)
+  if s.taken and now - s.taken.t < 8 then
+    return s.taken.fail and "NICHTS ZU UEBERNEHMEN" or "UEBERNOMMEN", s.taken.txt, s.taken.fail and C.ORANGE or C.GREEN
+  end
+  if not s.tas then return "FAHRT-QUELLE FEHLT", "Konfiguration: Airspeed des Loggers waehlen", C.ORANGE end
+  if not s.vario then return "VARIO-QUELLE FEHLT", "Konfiguration: TEK-Vario des Loggers waehlen", C.ORANGE end
+  if not s.gs then return "GPS-GESCHW. FEHLT", "Konfiguration: GPS-Geschwindigkeit waehlen", C.ORANGE end
+  if not s.crs and s.flying then return "GPS-POSITION FEHLT", "Konfiguration: GPS-Position waehlen (fuer den Kurs)", C.ORANGE end
+  if s.motor then
+    local rest = MOTOR_HOLD - (now - s.motorT)
+    if rest > MOTOR_HOLD - 1 then return "MOTOR - PAUSE", "Messung startet 15 s nach Motor aus", C.BLUE end
+    return "MOTOR - PAUSE", string.format("Messung startet in %.0f s", math.max(rest, 0)), C.BLUE
+  end
+  if not s.flying then return "BEREIT", "Nach dem Start: ganze Kreise fliegen", C.DIM end
   local n = #s.circles
-  if s.fit then return "Kreis wird gerechnet ...", C.BLUE end
+  if s.fit then return "KREIS GEZAEHLT ...", "wird gerechnet", C.BLUE end
   if n < w.circles then
-    return string.format("Kreisen, Fahrt konstant halten (%d von %d Kreisen)", n, w.circles), C.TXT
+    return string.format("KREISEN  %d/%d", n + 1, w.circles),
+      string.format("Ganze Kreise, eine Richtung, Fahrt ruhig - Kreis %d Grad von 360", math.floor(s.turnNow or 0)), C.TXT
   end
   if s.manSec < w.manSec then
-    return string.format("Geradeaus: Fahrt wechseln, hochziehen/andruecken (%.0f von %d s)", s.manSec, w.manSec), C.TXT
+    return "FAHRT WECHSELN", string.format("Geradeaus hochziehen und andruecken - %.0f von %d s", s.manSec, w.manSec), C.TXT
   end
-  return "Fertig. Gerade schnell/langsam in Gegenrichtungen prueft die Fahrt", C.GREEN
+  return "FERTIG - UEBERNEHMEN", "Schalter " .. swName(w, "swTake", "(in Konfiguration waehlen)") .. " umlegen", C.GREEN
 end
 
 local function paint(w)
@@ -756,7 +937,8 @@ local function paint(w)
   if not S then resetAll() end
   local s = S
   local m = 6
-  local sH, xsH, lH = textHeight(FONT_S), textHeight(FONT_XS), textHeight(FONT_L)
+  local sH, xsH = textHeight(FONT_S), textHeight(FONT_XS)
+  local xlH = textHeight(FONT_XL)
 
   -- Kopf: Live-Werte
   local live = string.format("Fahrt %s  GPS %s  TAS %s km/h   TEK %s  korr %s m/s",
@@ -765,61 +947,60 @@ local function paint(w)
     s.tas and string.format("%.0f", s.tas * KMH) or "--",
     s.vario and string.format("%+.1f", s.vario) or "--",
     s.teKorr and string.format("%+.1f", s.teKorr) or "--")
-  drawT(m, 3, W - 2 * m - 130, live, FONT_S, C.TXT, "l")
-  -- Knopf NEU (zweimal tippen)
-  local ask = w.resetAsk and now - w.resetAsk < 4
-  w.btnReset = button(W - m - 60, 2, 60, sH + 4, ask and "SICHER?" or "NEU", ask and C.ORANGE or C.BOX, ask and C.BG)
-  local top = sH + 10
+  drawT(m, 3, W - 2 * m, live, FONT_S, C.TXT, "l")
+  local y = sH + 8
+
+  -- Befehl gross
+  local cmd, det, acol = advice(w, s, now)
+  local bandH = xlH + sH + 14
+  lcd.color(C.BOX)
+  lcd.drawFilledRectangle(0, y, W, bandH)
+  drawT(m, y + 4, W - 2 * m, cmd, FONT_XL, acol, "l")
+  drawT(m, y + 8 + xlH, W - 2 * m, det, FONT_S, C.TXT, "l")
+  local top = y + bandH + 6
 
   -- zwei Spalten
   local colW = math.floor((W - 3 * m) / 2)
   local xL, xR = m, 2 * m + colW
-  local foot = H - xsH - 6
-  local y
+  local foot = H - xsH - 4
 
   -- ---- links: Fahrt
   y = top
   drawT(xL, y, colW, "FAHRT-KORREKTUR", FONT_XS, C.DIM, "l")
   y = y + xsH + 2
+  local lH = textHeight(FONT_L)
   local k, sp, n = airResult(s)
-  w.btnTakeAir = nil
   if k then
     local col = (n >= w.circles and sp < 0.02) and C.GREEN or C.ORANGE
     if k < 0.8 or k > 1.25 then col = C.RED end
-    local _, tw = drawT(xL, y, colW, string.format("%.1f %%", 100 * k), FONT_XL, col, "l")
-    drawT(xL + tw + 8, y + 2, colW - tw - 8, string.format("+-%.1f %%, %d Kreise", 100 * sp, n), FONT_XS, C.TXT, "l")
-    drawT(xL + tw + 8, y + 2 + xsH, colW - tw - 8, string.format("oder im Logger %d %%", math.floor(w.curFactor * k + 0.5)),
+    local _, tw = drawT(xL, y, colW, string.format("%.1f %%", 100 * k), FONT_L, col, "l")
+    drawT(xL + tw + 8, y, colW - tw - 8, string.format("+-%.1f %%, %d Kreise", 100 * sp, n), FONT_XS, C.TXT, "l")
+    drawT(xL + tw + 8, y + xsH, colW - tw - 8, string.format("oder im Logger %d %%", math.floor(w.curFactor * k + 0.5)),
       FONT_XS, C.DIM, "l")
-    y = y + textHeight(FONT_XL) + 2
-    local aAsk = w.takeAirAsk and now - w.takeAirAsk < 4
-    w.btnTakeAir = button(xL, y, math.min(colW, 200), sH + 6, aAsk and "SICHER?" or "UEBERNEHMEN",
-      aAsk and C.ORANGE or C.BOX, aAsk and C.BG)
-    y = y + sH + 10
   else
-    drawT(xL, y, colW, "--", FONT_XL, C.DIM, "l")
-    y = y + textHeight(FONT_XL) + 2
+    drawT(xL, y, colW, "--", FONT_L, C.DIM, "l")
   end
-  drawT(xL, y, colW, string.format("Quelle Fahrt korr.: %.1f %%", (w.airK or 1000) / 10), FONT_XS, C.DIM, "l")
+  y = y + lH + 2
+  drawT(xL, y, colW, string.format("eingestellt (Fahrt korr.): %.1f %%", (w.airK or 1000) / 10), FONT_XS, C.DIM, "l")
   y = y + xsH
-  -- letzte Kreise
+  if s.lastReject and now - s.lastReject.t < 15 then
+    drawT(xL, y, colW, "verworfen: " .. s.lastReject.why, FONT_XS, C.ORANGE, "l")
+    y = y + xsH
+  end
   local cs = s.circles
-  for i = #cs, math.max(1, #cs - 2), -1 do
+  for i = #cs, 1, -1 do
+    if y + xsH > foot then break end
     local c = cs[i]
     drawT(xL, y, colW, string.format("%.0f km/h  k %.3f  Wind %.0f/%03d", c.ias * KMH, c.k, c.wind * KMH,
       math.floor(c.from + 0.5) % 360), FONT_XS, C.TXT, "l")
     y = y + xsH
   end
-  if s.lastReject and now - s.lastReject.t < 15 then
-    drawT(xL, y, colW, "verworfen: " .. s.lastReject.why, FONT_XS, C.ORANGE, "l")
-    y = y + xsH
-  end
-  -- Geraden nach Fahrtbereich
   local keys = {}
   for ci in pairs(s.cls) do keys[#keys + 1] = ci end
   table.sort(keys)
   for _, ci in ipairs(keys) do
     if y + xsH > foot then break end
-    local kc, opp, nq = classResult(s.cls[ci])
+    local kc, opp = classResult(s.cls[ci])
     if kc then
       drawT(xL, y, colW, string.format("Gerade %d-%d: k %.3f %s", ci * 10, ci * 10 + 10, kc,
         opp and "" or "(Gegenrichtung fehlt)"), FONT_XS, opp and C.TXT or C.DIM, "l")
@@ -834,79 +1015,33 @@ local function paint(w)
   local x, r2, lag, se = tekResult(s)
   if x and s.manSec >= 5 then
     local col = (s.manSec >= w.manSec and se < 0.04) and C.GREEN or C.ORANGE
-    local _, tw = drawT(xR, y, colW, string.format("%+.0f %%", 100 * x), FONT_XL, col, "l")
-    drawT(xR + tw + 8, y + 2, colW - tw - 8, string.format("+-%.0f %%, r2 %.2f", 100 * se, r2), FONT_XS, C.TXT, "l")
-    drawT(xR + tw + 8, y + 2 + xsH, colW - tw - 8, string.format("Verz. %.1f s, %.0f s Wechsel", lag, s.manSec), FONT_XS, C.TXT, "l")
-    y = y + textHeight(FONT_XL) + 2
+    local _, tw = drawT(xR, y, colW, string.format("%+.0f %%", 100 * x), FONT_L, col, "l")
+    drawT(xR + tw + 8, y, colW - tw - 8, string.format("+-%.0f %%, r2 %.2f", 100 * se, r2), FONT_XS, C.TXT, "l")
+    drawT(xR + tw + 8, y + xsH, colW - tw - 8, string.format("Verz. %.1f s, %.0f s Wechsel", lag, s.manSec), FONT_XS, C.TXT, "l")
+    y = y + lH + 2
     local txt = x > 0.02 and "Duese kompensiert zu wenig" or x < -0.02 and "Duese kompensiert zu stark" or "Duese passt"
     drawT(xR, y, colW, txt, FONT_XS, C.TXT, "l")
     y = y + xsH
   else
-    drawT(xR, y, colW, "--", FONT_XL, C.DIM, "l")
-    y = y + textHeight(FONT_XL) + 2
+    drawT(xR, y, colW, "--", FONT_L, C.DIM, "l")
+    y = y + lH + 2
     drawT(xR, y, colW, string.format("Fahrtwechsel %.0f s", s.manSec), FONT_XS, C.DIM, "l")
     y = y + xsH
   end
   if k then
-    drawT(xR, y, colW, string.format("aus Airspeed-Faktor erwartet %+.0f %%", 100 * (k * k - 1)), FONT_XS, C.DIM, "l")
+    drawT(xR, y, colW, string.format("aus Fahrt-Korrektur erwartet %+.0f %%", 100 * (k * k - 1)), FONT_XS, C.DIM, "l")
     y = y + xsH
   end
-  drawT(xR, y, colW, string.format("Quelle TEK korr.: %+.1f %%, %.1f s", (w.tekX or 0) / 10, (w.tekLag or 0) * GRID),
+  drawT(xR, y, colW, string.format("eingestellt (TEK korr.): %+.1f %%, %.1f s", (w.tekX or 0) / 10, (w.tekLag or 0) * GRID),
     FONT_XS, C.DIM, "l")
-  y = y + xsH + 4
-  local tAsk = w.takeAsk and now - w.takeAsk < 4
-  w.btnTake = nil
-  if x and s.manSec >= 5 then
-    w.btnTake = button(xR, y, math.min(colW, 200), sH + 6, tAsk and "SICHER?" or "UEBERNEHMEN",
-      tAsk and C.ORANGE or C.BOX, tAsk and C.BG)
-  end
 
-  -- Fuss: was fliegen
-  local adv, acol = advice(w, s)
-  drawT(m, foot, W - 2 * m, adv, FONT_XS, acol, "l")
-end
-
--- ---------------------------------------------------------------- Touch
-
-local function inBtn(b, x, y) return b and x >= b.x and x <= b.x + b.w and y >= b.y and y <= b.y + b.h end
-
-local function event(w, category, value, x, y)
-  if EVT_TOUCH and category == EVT_TOUCH and (TOUCH_START == nil or value == TOUCH_START) then
-    local now = os.clock()
-    if inBtn(w.btnReset, x, y) then
-      if w.resetAsk and now - w.resetAsk < 4 then w.resetAsk = nil; local mn = S and S.model; resetAll(); S.model = mn
-      else w.resetAsk = now end
-      lcd.invalidate()
-      return true
-    end
-    if inBtn(w.btnTakeAir, x, y) then
-      if w.takeAirAsk and now - w.takeAirAsk < 4 then
-        w.takeAirAsk = nil
-        local k = airResult(S)
-        if k then
-          w.airK = clamp(math.floor(1000 * k + 0.5), 500, 2000)
-          saveKorr(w)
-        end
-      else w.takeAirAsk = now end
-      lcd.invalidate()
-      return true
-    end
-    if inBtn(w.btnTake, x, y) then
-      if w.takeAsk and now - w.takeAsk < 4 then
-        w.takeAsk = nil
-        local xv, _, lag = tekResult(S)
-        if xv then
-          -- neue Korrektur = bisherige + gemessener Rest (gemessen wurde am Logger-TEK, nicht an TEK korr.)
-          w.tekX = clamp(math.floor(1000 * xv + 0.5), -500, 500)
-          w.tekLag = clamp(math.floor(lag / GRID + 0.5), 0, RING - 1)
-          saveKorr(w)
-        end
-      else w.takeAsk = now end
-      lcd.invalidate()
-      return true
-    end
-  end
-  return false
+  -- Fuss: Schalter
+  local hint = string.format("Uebernehmen: %s    Neu beginnen: %s    Motor: %s",
+    swName(w, "swTake", "kein Schalter"), swName(w, "swReset", "kein Schalter"),
+    validSource(w.motor) and (srcName(w.motor) .. ((w.motorAuto or 1) ~= 2 and " + Vario" or "")) or
+      ((w.motorAuto or 1) ~= 2 and "am Vario" or "aus"))
+  local hcol = (validSource(w.swTake) and validSource(w.swReset)) and C.DIM or C.ORANGE
+  drawT(m, foot, W - 2 * m, hint, FONT_XS, hcol, "l")
 end
 
 -- ---------------------------------------------------------------- Konfiguration
@@ -927,17 +1062,22 @@ local function addChoice(w, label, prop, list)
 end
 
 local function configure(w)
+  addSource(w, "Schalter Uebernehmen", "swTake")
+  addSource(w, "Schalter Neu beginnen", "swReset")
   addSource(w, "Fahrt (Airspeed des Loggers, nicht Fahrt korr.)", "air")
   addChoice(w, "Fahrt: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
   addChoice(w, "Fahrt: Logger liefert", "airKind", {{"IAS (Normdichte)", 1}, {"TAS", 2}})
   addNumber(w, "Airspeed-Faktor im Logger (%)", "curFactor", 50, 200)
   addSource(w, "TEK-Vario des Loggers (nicht TEK korr.)", "vario")
   addSource(w, "GPS-Geschwindigkeit", "gpsSpd")
-  addSource(w, "Flugrichtung / GPS-Kurs (empfohlen)", "gpsCrs")
-  addSource(w, "GPS-Position (ohne GPS-Kurs)", "gps")
+  addSource(w, "GPS-Position (fuer den Kurs)", "gps")
+  addSource(w, "GPS-Kurs (nur ohne Position, nicht SM-Flugrichtung)", "gpsCrs")
   addSource(w, "Hoehe (Luftdichte)", "alt")
   addChoice(w, "Hoehe ist", "altKind", {{"ueber Meer (GPS)", 1}, {"ueber Start + Platzhoehe", 2}})
   addNumber(w, "Platzhoehe ue. M. (m)", "fieldAlt", -400, 5000)
+  addSource(w, "Motor (Gas oder Schalter)", "motor")
+  addNumber(w, "Motor laeuft ueber", "motorThr", -1024, 1024)
+  addChoice(w, "Motor am Vario erkennen (ab 8 m/s)", "motorAuto", {{"Ja", 1}, {"Nein", 2}})
   addNumber(w, "Quelle Fahrt korr.: Faktor (0.1 %)", "airK", 500, 2000)
   addNumber(w, "Quelle TEK korr.: Korrektur (0.1 %)", "tekX", -500, 500)
   addNumber(w, "Quelle TEK korr.: Verzoegerung (0.1 s)", "tekLag", 0, RING - 1)
@@ -948,6 +1088,7 @@ end
 
 local function setDefaults(w)
   for _, k in ipairs(SOURCE_KEYS) do w[k] = nil end
+  for _, k in ipairs(EXTRA_SRC) do w[k] = nil end
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
 end
 
@@ -960,6 +1101,17 @@ local function read(w)
       local v = storage.read(d.key)
       w[d.key] = (type(v) == "number") and v or d.def
     end
+    for _, k in ipairs(EXTRA_SRC) do w[k] = validSource(storage.read(k)) end
+  end
+  -- Schalter und Motor fehlen (aeltere Konfiguration oder Speicher verloren): aus der Datei nach Namen
+  local r = readKorr()
+  if r and system and system.getSource then
+    for _, k in ipairs(EXTRA_SRC) do
+      if not w[k] and r[k] and r[k] ~= "" then
+        local ok, src = pcall(system.getSource, r[k])
+        if ok then w[k] = validSource(src) end
+      end
+    end
   end
   loadKorr(w)
   w.model = currentModelName()
@@ -971,6 +1123,7 @@ local function write(w)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
+  for _, k in ipairs(EXTRA_SRC) do storage.write(k, w[k]) end
   saveKorr(w)
 end
 
@@ -1008,7 +1161,6 @@ local function init()
     create = create,
     paint = paint,
     wakeup = wakeup,
-    event = event,
     configure = configure,
     read = read,
     write = write,
@@ -1023,6 +1175,6 @@ local M = {init = init}
 M._test = {
   measure = measure, state = function() return S end, setCfg = function(w) CFG = w end, reset = resetAll,
   airResult = airResult, tekResult = tekResult, classResult = classResult, resultText = resultText,
-  create = create, wakeup = wakeup, paint = paint, event = event, read = read, write = write,
+  create = create, wakeup = wakeup, paint = paint, read = read, write = write, takeOver = takeOver,
 }
 return M
