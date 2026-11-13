@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.33
+-- @version 1.34
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.33"
+local VERSION = "1.34"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2849,10 +2849,22 @@ function BAL.VO.sensor(w, now)
       pcall(s.name, s, "SkyNav Vario")
       pcall(s.appId, s, BAL.VO.APPID)
       pcall(s.physId, s, 0)
-      -- gleiches HF-Modul wie der Vario-Sensor (so machen es dashx / rfsuite)
-      local m = w.vario and BAL.SN.call(w.vario, "module")
-      if m ~= nil then pcall(s.module, s, m) end
     else s = nil end
+  end
+  -- 1.34: HF-Modul des Sensors = Modul eines echten Telemetrie-Sensors (Vario, GPS, Hoehe), auch bei einem schon
+  -- angelegten Sensor. Ohne gueltiges Modul gilt der Sensor fuer Ethos als verloren (rot) und nimmt keinen Wert an
+  -- (Christoph 13.11.2026; dashx und rfsuite setzen das Modul ebenfalls).
+  if s then
+    local m
+    for _, k in ipairs({"vario", "relAlt", "gps", "gpsAlt", "gpsSpd"}) do
+      local src = w[k]
+      if m == nil and src and src ~= s then
+        local x = BAL.SN.call(src, "module")
+        if type(x) == "number" then m = x end
+      end
+    end
+    w.voMod = m
+    if m ~= nil and BAL.SN.call(s, "module") ~= m then pcall(s.module, s, m) end
   end
   -- 1.32: Ein DIY-Sensor rechnet intern ganzzahlig (protocolDecimals 0): 0.3 m/s kam als 0 an, der Sensor zeigte
   -- immer 0 (Christoph 13.11.2026). Darum intern 2 Dezimalen, auch bei einem schon angelegten Sensor; Einheit m/s.
@@ -2915,6 +2927,9 @@ end
 -- Stand fuer die Konfiguration: Sensor, Wert, ob das Vario gerade dran ist
 function BAL.VO.info(w)
   local t = {}
+  local s = w.voSens
+  local md, ag = s and BAL.SN.call(s, "module"), s and BAL.SN.call(s, "age")
+  t[4] = "Modul " .. tostring(md) .. " (soll " .. tostring(w.voMod) .. "), Alter " .. tostring(ag) .. " ms, Wechsel " .. tostring(w.voSw or 0)
   if not w.voSens then t[1] = "Sensor fehlt (Seite mit Widget anzeigen)"
   elseif w.voLock == "ok" then t[1] = "Sensor ok (Schreibweg " .. tostring(w.voMode) .. ")"
   elseif w.voLock == "blind" then t[1] = "Sensor nimmt keinen Wert an (Weg " .. tostring(w.voMode) .. ")"
