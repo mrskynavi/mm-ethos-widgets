@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.32
+-- @version 1.33
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.32"
+local VERSION = "1.33"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2832,8 +2832,14 @@ function BAL.VO.sensor(w, now)
   local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
   local ok
   if cat and system and system.getSource then
+    -- nach AppID (nur wenn der gefundene Sensor sie wirklich hat), sonst nach Namen
     ok, s = pcall(system.getSource, {category = cat, appId = BAL.VO.APPID})
-    if not ok or (s and BAL.SN.isSet and not BAL.SN.isSet(s)) then s = nil end
+    if not ok or not BAL.SN.isSet(s) then s = nil end
+    if s then local id = BAL.SN.call(s, "appId"); if id ~= nil and id ~= BAL.VO.APPID then s = nil end end
+    if not s then
+      ok, s = pcall(system.getSource, {category = cat, name = "SkyNav Vario"})
+      if not ok or not BAL.SN.isSet(s) then s = nil end
+    end
   end
   local new = false
   if not s and model and model.createSensor and rawget(_G, "SENSOR_TYPE_DIY") then
@@ -2842,6 +2848,10 @@ function BAL.VO.sensor(w, now)
       new = true
       pcall(s.name, s, "SkyNav Vario")
       pcall(s.appId, s, BAL.VO.APPID)
+      pcall(s.physId, s, 0)
+      -- gleiches HF-Modul wie der Vario-Sensor (so machen es dashx / rfsuite)
+      local m = w.vario and BAL.SN.call(w.vario, "module")
+      if m ~= nil then pcall(s.module, s, m) end
     else s = nil end
   end
   -- 1.32: Ein DIY-Sensor rechnet intern ganzzahlig (protocolDecimals 0): 0.3 m/s kam als 0 an, der Sensor zeigte
@@ -2852,25 +2862,71 @@ function BAL.VO.sensor(w, now)
     pcall(s.decimals, s, 2)
     if new then pcall(s.minimum, s, -20); pcall(s.maximum, s, 20) end
   end
-  w.voSens = s
+  w.voSens, w.voMode, w.voBad, w.voGood, w.voLock, w.voSw, w.voLast = s, nil, 0, 0, nil, 0, nil
   return s
+end
+-- 1.33: Der Sensor zeigte am Sender weiter 0 (Christoph 13.11.2026). Wie Ethos den Wert eines Lua-Sensors annimmt,
+-- ist je nach Version verschieden und schlecht dokumentiert. Darum probiert das Widget die Schreibwege selbst
+-- durch und liest den Sensor zurueck: 1 = value(m/s), 2 = rawValue(0.01 m/s, ganzzahlig), 3 = rawValue(m/s).
+-- Stimmt der zurueckgelesene Wert 5-mal, bleibt es dabei; stimmt er 1 s lang nicht, kommt der naechste Weg.
+-- Passt nach zwei Runden keiner (oder laesst sich nichts zuruecklesen), gilt wieder der erste Weg.
+-- Die Konfiguration zeigt den Stand (BAL.VO.info).
+function BAL.VO.write(s, mode, v)
+  if mode == 2 then return pcall(s.rawValue, s, math.floor(v * 100 + 0.5)) end
+  if mode == 3 then return pcall(s.rawValue, s, v) end
+  return pcall(s.value, s, v)
 end
 function BAL.VO.set(w, now, on)
   local v = on and w.varioRaw or 0
-  BAL.VO.v, BAL.VO.t = clamp(v, -20, 20), now
+  v = clamp(v, -20, 20)
+  BAL.VO.v, BAL.VO.t = v, now
   local s = BAL.VO.sensor(w, now)
   if not s then return end
-  -- Ab Ethos 26.1 nimmt ein Lua-Sensor den Wert ueber rawValue (ganzzahlig, in protocolDecimals = 0.01 m/s),
-  -- vorher ueber value (wie rfsuite). Klappt das nicht, Sensor neu suchen.
-  if w.voRaw == nil then
+  if not w.voMode then
     local ok, ver = pcall(system.getVersion)
     local mj = ok and type(ver) == "table" and tonumber(ver.major) or 0
-    w.voRaw = mj >= 26 and type(s.rawValue) == "function"
+    w.voFirst = (mj >= 26 and type(s.rawValue) == "function") and 3 or 1
+    w.voMode = w.voFirst
   end
-  local ok
-  if w.voRaw then ok = pcall(s.rawValue, s, math.floor(BAL.VO.v * 100 + 0.5))
-  else ok = pcall(s.value, s, BAL.VO.v) end
-  if not ok then w.voSens, w.voRaw = nil, nil end
+  local last = w.voLast
+  if not w.voLock and last and math.abs(last) >= 0.05 then
+    local ok, rb = pcall(s.value, s)
+    w.voRb = ok and type(rb) == "number" and rb or nil
+    if w.voRb and math.abs(w.voRb - last) <= 0.03 then
+      w.voGood, w.voBad = (w.voGood or 0) + 1, 0
+      if w.voGood >= 5 then w.voLock = "ok" end
+    else
+      w.voBad, w.voGood = (w.voBad or 0) + 1, 0
+      if w.voBad >= 20 then
+        w.voBad, w.voSw = 0, (w.voSw or 0) + 1
+        if w.voSw >= 6 then w.voMode, w.voLock = w.voFirst, "blind"
+        else w.voMode = w.voMode % 3 + 1 end
+      end
+    end
+  end
+  if w.voMode ~= 1 and type(s.rawValue) ~= "function" then w.voMode = 1 end
+  if BAL.VO.write(s, w.voMode, v) then w.voLast, w.voErr = v, 0
+  else
+    w.voLast, w.voErr = nil, (w.voErr or 0) + 1
+    if not w.voLock then w.voMode = w.voMode % 3 + 1 end
+    if w.voErr >= 6 then w.voSens = nil end                    -- Sensor geloescht? In 10 s neu suchen/anlegen
+  end
+end
+-- Stand fuer die Konfiguration: Sensor, Wert, ob das Vario gerade dran ist
+function BAL.VO.info(w)
+  local t = {}
+  if not w.voSens then t[1] = "Sensor fehlt (Seite mit Widget anzeigen)"
+  elseif w.voLock == "ok" then t[1] = "Sensor ok (Schreibweg " .. tostring(w.voMode) .. ")"
+  elseif w.voLock == "blind" then t[1] = "Sensor nimmt keinen Wert an (Weg " .. tostring(w.voMode) .. ")"
+  else t[1] = "Sensor gefunden, Schreibweg " .. tostring(w.voMode or "-") .. " in Probe" end
+  local vr = w.varioRaw
+  t[2] = vr and string.format("Vario %+.2f m/s, gesendet %+.2f", vr, BAL.VO.v or 0) or "kein Wert vom Vario-Sensor"
+  if w.voRb then t[2] = t[2] .. string.format(", gelesen %+.2f", w.voRb) end
+  if not w.varioTone then t[3] = "still: Varioton in der App aus"
+  elseif vr == nil then t[3] = "still: Vario-Sensor fehlt"
+  elseif w.vtOn then t[3] = "Vario aktiv"
+  else t[3] = "still: nur Thermik-Seite, Kreisen, Gleiten mit Steigen" end
+  return t
 end
 function BAL.VO.init(source)
   source:value(0)
@@ -5206,7 +5262,10 @@ local function configure(w)
   end
   if w.devStabi or BAL.SN.isSet(w.man.bankSrc) then addBool(w, "Querlage: Richtung umkehren", "bankInv") end
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
-  addChoice(w, "Varioton-Ausgabe", "vtDev", {{"Widget-Toene", 1}, {"Ethos-Vario (Quelle SkyNav Vario)", 2}})
+  addChoice(w, "Varioton-Ausgabe", "vtDev", {{"Widget-Toene", 1}, {"Ethos-Vario (Sensor SkyNav Vario)", 2}})
+  if w.vtDev == 2 then
+    for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+  end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
