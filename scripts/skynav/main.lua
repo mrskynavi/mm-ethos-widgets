@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.31
+-- @version 1.32
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.31"
+local VERSION = "1.32"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2835,14 +2835,22 @@ function BAL.VO.sensor(w, now)
     ok, s = pcall(system.getSource, {category = cat, appId = BAL.VO.APPID})
     if not ok or (s and BAL.SN.isSet and not BAL.SN.isSet(s)) then s = nil end
   end
+  local new = false
   if not s and model and model.createSensor and rawget(_G, "SENSOR_TYPE_DIY") then
     ok, s = pcall(model.createSensor, {type = SENSOR_TYPE_DIY})
     if ok and s then
+      new = true
       pcall(s.name, s, "SkyNav Vario")
       pcall(s.appId, s, BAL.VO.APPID)
-      if UNIT_METER_PER_SECOND then pcall(s.unit, s, UNIT_METER_PER_SECOND) end
-      pcall(s.decimals, s, 2)
     else s = nil end
+  end
+  -- 1.32: Ein DIY-Sensor rechnet intern ganzzahlig (protocolDecimals 0): 0.3 m/s kam als 0 an, der Sensor zeigte
+  -- immer 0 (Christoph 13.11.2026). Darum intern 2 Dezimalen, auch bei einem schon angelegten Sensor; Einheit m/s.
+  if s then
+    if UNIT_METER_PER_SECOND then pcall(s.unit, s, UNIT_METER_PER_SECOND); pcall(s.protocolUnit, s, UNIT_METER_PER_SECOND) end
+    pcall(s.protocolDecimals, s, 2)
+    pcall(s.decimals, s, 2)
+    if new then pcall(s.minimum, s, -20); pcall(s.maximum, s, 20) end
   end
   w.voSens = s
   return s
@@ -2851,7 +2859,18 @@ function BAL.VO.set(w, now, on)
   local v = on and w.varioRaw or 0
   BAL.VO.v, BAL.VO.t = clamp(v, -20, 20), now
   local s = BAL.VO.sensor(w, now)
-  if s and not pcall(s.value, s, BAL.VO.v) then w.voSens = nil end
+  if not s then return end
+  -- Ab Ethos 26.1 nimmt ein Lua-Sensor den Wert ueber rawValue (ganzzahlig, in protocolDecimals = 0.01 m/s),
+  -- vorher ueber value (wie rfsuite). Klappt das nicht, Sensor neu suchen.
+  if w.voRaw == nil then
+    local ok, ver = pcall(system.getVersion)
+    local mj = ok and type(ver) == "table" and tonumber(ver.major) or 0
+    w.voRaw = mj >= 26 and type(s.rawValue) == "function"
+  end
+  local ok
+  if w.voRaw then ok = pcall(s.rawValue, s, math.floor(BAL.VO.v * 100 + 0.5))
+  else ok = pcall(s.value, s, BAL.VO.v) end
+  if not ok then w.voSens, w.voRaw = nil, nil end
 end
 function BAL.VO.init(source)
   source:value(0)
