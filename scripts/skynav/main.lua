@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.36
+-- @version 1.37
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.36"
+local VERSION = "1.37"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2956,6 +2956,44 @@ function BAL.VO.info(w)
   end
   return t
 end
+-- 1.37 Rechenlast messen: Der Sinkton des Ethos-Varios klickert, sobald ein Widget rechnet oder zeichnet
+-- (Christoph 13.11.2026): Ethos schiebt den Dauerton in kurzen Stuecken nach, und das stockt, wenn Lua oder der
+-- Bildaufbau den Takt aufhalten. Gemessen werden pro 10 s: Dauer von wakeup und paint (Mittel/Maximum) und der
+-- Abstand zwischen zwei wakeup (Takt; enthaelt auch das Zeichnen von Ethos selbst). Anzeige in der Konfiguration.
+-- Dazu "Bildaufbau" (drawIv): wie oft das Widget neu zeichnen laesst.
+BAL.TM = {IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil}
+function BAL.TM.add(k, d)
+  local c = BAL.TM.c
+  local e = c[k]
+  if not e then e = {n = 0, s = 0, m = 0}; c[k] = e end
+  e.n, e.s = e.n + 1, e.s + d
+  if d > e.m then e.m = d end
+end
+function BAL.TM.wake(f, w)
+  local T = BAL.TM
+  local t = os.clock()
+  if T.last then T.add("g", t - T.last) end
+  T.last = t
+  f(w)
+  local t2 = os.clock()
+  T.add("w", t2 - t)
+  if not T.t0 then T.t0 = t2 elseif t2 - T.t0 >= 10 then T.r, T.c, T.t0 = T.c, {}, t2 end
+end
+function BAL.TM.paint(f, w)
+  local t = os.clock()
+  f(w)
+  BAL.TM.add("p", os.clock() - t)
+end
+function BAL.TM.info()
+  local r, t = BAL.TM.r, {}
+  if not r then return {"Messung laeuft (10 s)"} end
+  for _, d in ipairs({{"w", "Rechnen"}, {"p", "Zeichnen"}, {"g", "Takt"}}) do
+    local e = r[d[1]]
+    if e and e.n > 0 then t[#t + 1] = string.format("%s %.0f/%.0f ms n%d", d[2], e.s / e.n * 1000, e.m * 1000, e.n) end
+  end
+  return t
+end
+
 function BAL.VO.init(source)
   source:value(0)
   source:decimals(2)
@@ -3443,7 +3481,7 @@ local function wakeup(w)
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn) end
   end
 
-  if now - w.lastInvalidate >= 0.15 then
+  if now - w.lastInvalidate >= (BAL.TM.IV[w.drawIv or 1] or 0.15) then
     w.lastInvalidate = now
     lcd.invalidate()
   end
@@ -5294,6 +5332,8 @@ local function configure(w)
   if w.vtDev == 2 then
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
+  addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
+  for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
@@ -5373,6 +5413,7 @@ local function setDefaults(w)
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
   w.vtStyle, w.vtDev = 1, 1
+  w.drawIv = 1
   w.devMain, w.devStabi, w.varioType = 1, false, 0   -- 1.30: neue Widgets suchen die Sensoren des SM GPS-Logger 3
 end
 
@@ -5400,6 +5441,7 @@ local function read(w)
     v = storage.read("vtDev"); w.vtDev = v == 2 and 2 or 1                                              -- 1.29
     v = storage.read("devMain"); w.devMain = (v == 1 or v == 2) and v or 0                             -- 1.30: Geraete, aeltere
     w.devStabi = storage.read("devStabi") == true                                                       -- Konfigurationen: von Hand
+    v = storage.read("drawIv"); w.drawIv = (type(v) == "number" and v >= 1 and v <= 4) and v or 1      -- 1.37
   end
   BAL.SN.load(w)
   w.mcValue = w.mc / 10
@@ -5429,13 +5471,14 @@ local function write(w)
   storage.write("vtDev", w.vtDev or 1)
   storage.write("devMain", w.devMain or 0)
   storage.write("devStabi", w.devStabi == true)
+  storage.write("drawIv", w.drawIv or 1)
 end
 
 local function init()
   -- Ethos akzeptiert Widget-Schluessel nur mit weniger als 8 Zeichen.
   system.registerWidget({
     key = "skynav1", name = "SkyNavigator",
-    create = create, paint = paint, wakeup = wakeup, event = eventHandler,
+    create = create, paint = function(w) BAL.TM.paint(paint, w) end, wakeup = function(w) BAL.TM.wake(wakeup, w) end, event = eventHandler,
     configure = configure, read = read, write = write,
   })
   if system.registerSource then
@@ -5449,6 +5492,6 @@ M._test = {
   crossTrack = crossTrack, slotEpoch = slotEpoch, igcLat = igcLat, igcLon = igcLon, create = create, assess = assess,
   scoreOf = scoreOf, startCalc = startCalc, rz = RZ, angDiff = angDiff, bearingOf = bearingOf, toLocal = toLocal,
   slotWindow = slotWindow, refreshTasks = refreshTasks, rctLines = rctLines,
-  voInfo = BAL.VO.info,
+  voInfo = BAL.VO.info, tmInfo = BAL.TM.info,
 }
 return M
