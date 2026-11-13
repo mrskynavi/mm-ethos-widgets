@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.3
+-- @version 1.4
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -41,6 +41,8 @@
 --   TEK-Werte laufen 2..4 s verzoegert in die Summen, damit der Motorbeginn vor dem Erkennen nicht mitzaehlt.
 -- Bedienung (1.3): Ein Tippen ins Widget oeffnet bei Ethos das Widget-Menue, darum gehen Uebernehmen und
 --   Neu beginnen ueber Schalter (Quellen in der Konfiguration, aktiv ueber 5 %, zaehlt beim Umlegen).
+--   1.4: wahlweise nach der Landung automatisch uebernehmen (nach mind. 60 s Flug, 3 s am Boden; im Simulator
+--   am Ende des Logs), fuer Simulator und Fluege ohne freien Schalter.
 -- Fahrt-Faktor (Geraden): nach einem Kreis gilt dessen Wind 3 min (+-150 m). Geradeaus (Drehrate unter
 --   4 Grad/s seit 3 s) jede Sekunde k = |Boden - Wind| / Fahrt, getrennt nach Fahrtbereich (10 km/h)
 --   und Himmelsrichtung (4 Viertel). Ein Bereich gilt, wenn zwei gegenueberliegende Viertel Werte haben
@@ -78,6 +80,10 @@ local NUM_DEFS = {
 }
 -- 1.3: Quellen nach den Zahlen gespeichert (alte Konfigurationen bleiben gueltig)
 local EXTRA_SRC = {"motor", "swTake", "swReset"}
+-- 1.4: Zahlen nach den Quellen von 1.3
+local EXTRA_NUM = {
+  {key = "autoTake",  def = 2},    -- 1 nach der Landung automatisch uebernehmen, 2 nein
+}
 
 local function clamp(x, lo, hi)
   if x < lo then return lo end
@@ -803,6 +809,7 @@ end
 local function create()
   local w = {lastInvalidate = 0, model = currentModelName()}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
+  for _, d in ipairs(EXTRA_NUM) do w[d.key] = d.def end
   CFG = w
   return w
 end
@@ -816,7 +823,7 @@ local function switchEdge(w, key)
   return on and prev == false
 end
 
--- Messung uebernehmen: Fahrt-Faktor (ab 1 Kreis) und TEK-Korrektur (ab 5 s Fahrtwechsel)
+-- Messung uebernehmen: Fahrt-Faktor (ab 1 Kreis) und TEK-Korrektur (ab 5 s Fahrtwechsel, r2 ab 0.3, +-5 %)
 local function takeOver(w, now)
   local s = S
   local parts = {}
@@ -827,15 +834,17 @@ local function takeOver(w, now)
     airPct = w.airK / 10
     parts[#parts + 1] = string.format("Fahrt %.1f %% (%d Kreise)", airPct, n)
   end
-  local xv, _, lag = tekResult(s)
-  if xv and s.manSec >= 5 then
+  local xv, r2, lag, se = tekResult(s)
+  if xv and s.manSec >= 5 and (r2 < 0.3 or se > 0.05) then
+    parts[#parts + 1] = string.format("TEK unsicher (r2 %.2f), nicht uebernommen", r2)
+  elseif xv and s.manSec >= 5 then
     w.tekX = clamp(math.floor(1000 * xv + 0.5), -500, 500)
     w.tekLag = clamp(math.floor(lag / GRID + 0.5), 0, RING - 1)
     tekPct = w.tekX / 10
     parts[#parts + 1] = string.format("TEK %+.1f %%", tekPct)
   end
-  if #parts == 0 then
-    s.taken = {t = now, txt = "Noch nichts gemessen", fail = true}
+  if not airPct and not tekPct then
+    s.taken = {t = now, txt = #parts > 0 and parts[1] or "Noch nichts gemessen", fail = true}
     playToneSafe(400, 400)
     return
   end
@@ -860,6 +869,15 @@ local function wakeup(w)
       S.model = mn
       S.taken = {t = now, txt = "Neu begonnen"}
       playToneSafe(1000, 300)
+    end
+    -- nach der Landung automatisch uebernehmen (einmal pro Flug)
+    local s = S
+    if s.flying then s.autoDone, s.landT = false, nil
+    elseif (w.autoTake or 2) == 1 and s.flyT > 60 and not s.autoDone then
+      if (not s.tas or s.tas < 4) and (not s.gs or s.gs < 2) then
+        s.landT = s.landT or now
+        if now - s.landT >= 3 then s.autoDone = true; takeOver(w, now) end
+      else s.landT = nil end
     end
     saveResult(w, now)
   end
@@ -925,7 +943,11 @@ local function advice(w, s, now)
   if s.manSec < w.manSec then
     return "FAHRT WECHSELN", string.format("Geradeaus hochziehen und andruecken - %.0f von %d s", s.manSec, w.manSec), C.TXT
   end
-  return "FERTIG - UEBERNEHMEN", "Schalter " .. swName(w, "swTake", "(in Konfiguration waehlen)") .. " umlegen", C.GREEN
+  if w.autoTake == 1 and not validSource(w.swTake) then
+    return "FERTIG - LANDEN", "Die Werte werden nach der Landung uebernommen", C.GREEN
+  end
+  return "FERTIG - UEBERNEHMEN", "Schalter " .. swName(w, "swTake", "(in Konfiguration waehlen)") .. " umlegen" ..
+    (w.autoTake == 1 and " oder landen" or ""), C.GREEN
 end
 
 local function paint(w)
@@ -1037,10 +1059,12 @@ local function paint(w)
 
   -- Fuss: Schalter
   local hint = string.format("Uebernehmen: %s    Neu beginnen: %s    Motor: %s",
-    swName(w, "swTake", "kein Schalter"), swName(w, "swReset", "kein Schalter"),
+    (validSource(w.swTake) and srcName(w.swTake) or (w.autoTake == 1 and "" or "kein Schalter")) ..
+      (w.autoTake == 1 and (validSource(w.swTake) and " + nach Landung" or "nach Landung") or ""),
+    swName(w, "swReset", "kein Schalter"),
     validSource(w.motor) and (srcName(w.motor) .. ((w.motorAuto or 1) ~= 2 and " + Vario" or "")) or
       ((w.motorAuto or 1) ~= 2 and "am Vario" or "aus"))
-  local hcol = (validSource(w.swTake) and validSource(w.swReset)) and C.DIM or C.ORANGE
+  local hcol = ((validSource(w.swTake) or w.autoTake == 1) and validSource(w.swReset)) and C.DIM or C.ORANGE
   drawT(m, foot, W - 2 * m, hint, FONT_XS, hcol, "l")
 end
 
@@ -1064,6 +1088,7 @@ end
 local function configure(w)
   addSource(w, "Schalter Uebernehmen", "swTake")
   addSource(w, "Schalter Neu beginnen", "swReset")
+  addChoice(w, "Nach der Landung automatisch uebernehmen", "autoTake", {{"Nein", 2}, {"Ja", 1}})
   addSource(w, "Fahrt (Airspeed des Loggers, nicht Fahrt korr.)", "air")
   addChoice(w, "Fahrt: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
   addChoice(w, "Fahrt: Logger liefert", "airKind", {{"IAS (Normdichte)", 1}, {"TAS", 2}})
@@ -1090,6 +1115,7 @@ local function setDefaults(w)
   for _, k in ipairs(SOURCE_KEYS) do w[k] = nil end
   for _, k in ipairs(EXTRA_SRC) do w[k] = nil end
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
+  for _, d in ipairs(EXTRA_NUM) do w[d.key] = d.def end
 end
 
 local function read(w)
@@ -1102,6 +1128,10 @@ local function read(w)
       w[d.key] = (type(v) == "number") and v or d.def
     end
     for _, k in ipairs(EXTRA_SRC) do w[k] = validSource(storage.read(k)) end
+    for _, d in ipairs(EXTRA_NUM) do
+      local v = storage.read(d.key)
+      w[d.key] = (type(v) == "number") and v or d.def
+    end
   end
   -- Schalter und Motor fehlen (aeltere Konfiguration oder Speicher verloren): aus der Datei nach Namen
   local r = readKorr()
@@ -1124,6 +1154,7 @@ local function write(w)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
   for _, k in ipairs(EXTRA_SRC) do storage.write(k, w[k]) end
+  for _, d in ipairs(EXTRA_NUM) do storage.write(d.key, w[d.key]) end
   saveKorr(w)
 end
 
