@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.30
+-- @version 1.31
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.30"
+local VERSION = "1.31"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2819,9 +2819,39 @@ end
 -- unruhiger Takt im Steigen (Christoph 12.11.2026). Wenn das Widget nicht spielen soll (Sollfahrt, Wendeton
 -- hat Vorrang, Ereignistoene), liefert die Quelle 0, das liegt in der stillen Mitte. Wert ungefiltert wie Klang 4.
 BAL.VO = {v = 0, t = -1}
+-- Ab 1.31 zusaetzlich als Telemetrie-Sensor "SkyNav Vario" (DIY, AppID 0x5FF0, m/s): "Vario abspielen" bietet
+-- nur Telemetrie-Sensoren mit m/s an, die Lua-Quelle erschien dort nicht (Christoph 13.11.2026). Das Widget legt
+-- den Sensor beim ersten Mal selbst an (sucht zuerst nach der AppID, damit keine Doppel entstehen; Fehlversuch
+-- hoechstens alle 10 s neu) und schreibt den Wert in jedem wakeup.
+BAL.VO.APPID = 0x5FF0
+function BAL.VO.sensor(w, now)
+  local s = w.voSens
+  if s then return s end
+  if w.voTry and now - w.voTry < 10 then return nil end
+  w.voTry = now
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local ok
+  if cat and system and system.getSource then
+    ok, s = pcall(system.getSource, {category = cat, appId = BAL.VO.APPID})
+    if not ok or (s and BAL.SN.isSet and not BAL.SN.isSet(s)) then s = nil end
+  end
+  if not s and model and model.createSensor and rawget(_G, "SENSOR_TYPE_DIY") then
+    ok, s = pcall(model.createSensor, {type = SENSOR_TYPE_DIY})
+    if ok and s then
+      pcall(s.name, s, "SkyNav Vario")
+      pcall(s.appId, s, BAL.VO.APPID)
+      if UNIT_METER_PER_SECOND then pcall(s.unit, s, UNIT_METER_PER_SECOND) end
+      pcall(s.decimals, s, 2)
+    else s = nil end
+  end
+  w.voSens = s
+  return s
+end
 function BAL.VO.set(w, now, on)
   local v = on and w.varioRaw or 0
   BAL.VO.v, BAL.VO.t = clamp(v, -20, 20), now
+  local s = BAL.VO.sensor(w, now)
+  if s and not pcall(s.value, s, BAL.VO.v) then w.voSens = nil end
 end
 function BAL.VO.init(source)
   source:value(0)
