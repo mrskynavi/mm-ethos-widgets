@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.35
+-- @version 1.36
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.35"
+local VERSION = "1.36"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2900,7 +2900,10 @@ function BAL.VO.set(w, now, on)
   if not w.voMode then
     local ok, ver = pcall(system.getVersion)
     local mj = ok and type(ver) == "table" and tonumber(ver.major) or 0
-    w.voFirst = (mj >= 26 and type(s.rawValue) == "function") and 3 or 1
+    -- 1.36: Am Sender (Ethos 1.6.8, Christoph 13.11.2026) geht nur Weg 4: value() nimmt den Rohwert ganzzahlig in
+    -- 0.01 m/s (Weg 1 kam als 0.00 an, rawValue wurde gar nicht uebernommen). Darum dort zuerst Weg 4, ab Ethos 26
+    -- zuerst rawValue ganzzahlig (Weg 2); die Probe mit Zuruecklesen bleibt als Absicherung.
+    w.voFirst = (mj >= 26 and type(s.rawValue) == "function") and 2 or 4
     w.voMode = w.voFirst
   end
   local last = w.voLast
