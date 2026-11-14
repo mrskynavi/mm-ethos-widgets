@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.43
+-- @version 1.43.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.43"
+local VERSION = "1.43.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3468,7 +3468,8 @@ end
 -- Suche: N_max (Bisektion), Zeit-MC, Zeitreserve, was fuer ein Dreieck mehr fehlt, Abflughoehe aus dem Bart
 function RZ.search(w, now)
   local r, T, f = w.rz, w.task, w.cur
-  if not (r and r.TL and f and T) then return end
+  -- startT fehlt nach "Neustart: wieder scharf" zwischen Tabelle und Suche (1.43.1, Simulator-Fehler 14.11.)
+  if not (r and r.TL and f and T and w.startT and w.state == S_STARTED) then w.rz = nil; return end
   local rest = T.work * 60 - (f.clk - w.startT)
   local avail = rest - math.max(15, rest * w.rzRes / 100)
   local F = r.f or 1
