@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.42
+-- @version 1.43
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.42"
+local VERSION = "1.43"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1340,6 +1340,7 @@ local function loadRadii(w)
         end
         if type(v.ql) == "number" and math.abs(v.ql) <= 45 then m.ql = v.ql end   -- Querlage-Nullpunkt (Grad)
         if type(v.qk) == "number" and math.abs(v.qk) >= 5 and math.abs(v.qk) <= 300 then m.qk = v.qk end   -- Rollrate Querruder (Grad/s voll)
+        if type(v.tv) == "number" and v.tv >= 0 and v.tv <= 3 then m.tv = v.tv end   -- Vorhalt fuer "Jetzt wenden" (s)
         w.radii[k] = m
       end
     end
@@ -1350,11 +1351,11 @@ local function saveRadii(w)
   local keys = {}
   for k in pairs(w.radii) do keys[#keys + 1] = k end
   table.sort(keys)
-  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\n-- qk = Rollrate bei vollem Querruder (Grad/s), gelernt mit Lagesensor, fuer Fluege ohne.\nreturn {\n"}
+  local out = {"-- Wenderadien pro Modell (m). Das Widget lernt sie selbst aus den Wenden an den Ecken.\n-- ql = Nullpunkt der Querlage (Grad), gesetzt mit \"Querlage nullen\".\n-- qk = Rollrate bei vollem Querruder (Grad/s), gelernt mit Lagesensor, fuer Fluege ohne.\n-- tv = Vorhalt (s) fuer \"Jetzt wenden\", gelernt aus der Sektortiefe nach jeder Wende.\nreturn {\n"}
   for _, k in ipairs(keys) do
     local m, parts = w.radii[k], {}
-    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql", "qk"}) do
-      if m[key] then parts[#parts + 1] = string.format("%s = %.1f", key, m[key]) end
+    for _, key in ipairs({"all", "tp1", "tp2", "tp3", "ql", "qk", "tv"}) do
+      if m[key] then parts[#parts + 1] = string.format(key == "tv" and "%s = %.2f" or "%s = %.1f", key, m[key]) end
     end
     out[#out + 1] = string.format("  [%q] = {%s},\n", k, table.concat(parts, ", "))
   end
@@ -2499,12 +2500,13 @@ local function glideCalc(w, f, full)
   return g
 end
 
--- Wendeton: Countdown und ein deutliches "Jetzt wenden". warnSec Sekunden vor dem Kurvenbeginn kurze Piepse im
--- Sekundentakt, beim Kurvenbeginn ein hoher langer Ton mit Vibration. Der Kurvenbeginn wird bei jedem Aufruf aus dem
+-- Wendeton: Einzaehlen "drei, zwei, eins" (mindestens 3 s, sonst warnSec) im Sekundentakt und ein deutliches
+-- "Jetzt wenden" (hoher langer Ton mit Vibration) um den gelernten Vorhalt tv VOR dem fruehesten sicheren
+-- Kurvenbeginn (BAL.WV, 1.43). Der Kurvenbeginn wird bei jedem Aufruf aus dem
 -- aktuellen Plan genommen (nicht im Voraus festgelegt): fliegt der Pilot neben dem Plan, verschiebt sich "Jetzt"
 -- (im Grenzfall "geradeaus bis in den Sektor, dann wenden"). Kommt auf jeder Seite und auch, wenn das Widget nicht auf
 -- dem Bildschirm ist (Ereignis). Genau einmal pro Ecke und Runde; kein Ton, wenn der Pilot schon kraeftig dreht.
--- Liefert true, solange der Countdown laeuft. Vorrang: ab warnSec + 1.5 s vor dem Kurvenbeginn bis 1 s nach
+-- Liefert true, solange der Countdown laeuft. Vorrang: ab Zaehlbeginn - 1.5 s bis 1 s nach
 -- "Jetzt" (und 2.5 s ab jeder Kurs-Ansage vor der Ecke) schweigen alle anderen Toene und Ansagen auf allen Seiten
 -- (w.prioUntil, siehe audible). So ist auch die Warteschlange des Senders leer, wenn der Countdown beginnt;
 -- Ereignistoene aus dieser Zeit kommen danach.
@@ -2569,6 +2571,135 @@ local function prioTone(w, f, len, hap)
   w.prioPlay = nil
 end
 
+-- ---------------------------------------------------------------- Wende: Vorhalt, zu frueh, verpasst (1.43)
+-- tv  = Vorhalt (s) fuer "Jetzt", pro Modell in radien.lua (tv), gelernt aus der Sektortiefe nach jeder Wende.
+-- early = Warnung, wenn das Modell vor dem Sektor schon so eindreht, dass die Kurve (volle Drehrate V/R) den
+--         Sektor nicht erreicht: tiefer Doppelton + Vibration ("kurz geradeaus").
+-- miss  = Alarm, wenn der naechste TP ohne Sektor hinter dem Modell liegt (nahe vorbei, Abstand waechst 3 s im
+--         Geradeausflug) oder das Modell im Sektor des uebernaechsten TP ist: Toene, Vibration, "Wendepunkt n
+--         verpasst" (audio/wendepunkt.wav, verpasst.wav), alle 6 s, Balken "TPn FEHLT" bis der Sektor erreicht ist.
+BAL.WV = {TV0 = 1.0, LO = 0.3, HI = 1.5}
+
+function BAL.WV.tv(w)
+  local m = w.radii and w.radii[w.modelName or "?"]
+  return (m and m.tv) or BAL.WV.TV0
+end
+
+-- Tiefe im Sektor (m entlang der Halbierenden) und Abstand zum TP
+function BAL.WV.depth(c, f)
+  local rx, ry = f.x - c.x, f.y - c.y
+  return rx * c.bx + ry * c.by, math.sqrt(rx * rx + ry * ry)
+end
+
+-- "Jetzt" gespielt: merken, mit welcher Geschwindigkeit das Modell in Richtung Sektor flog
+function BAL.WV.jetzt(w, g)
+  local f, T = w.cur, w.task
+  local c = T and g.next and T.tp[g.next]
+  if not (f and c and f.ve) then return end
+  w.wvJ = {j = g.next, vb = f.ve * c.bx + f.vn * c.by, lap = #w.laps}
+end
+
+function BAL.WV.alarm(w, now, j)
+  prioHold(w, now, 3.5)
+  w.prioPlay = true
+  tone(w, nil, 900, 150); tone(w, nil, 700, 150); tone(w, nil, 500, 300)
+  haptic(w, nil, 500)
+  if audioFile("verpasst.wav") then
+    sayWord(w, nil, "wendepunkt.wav"); sayNumber(w, nil, j, UNIT_RAW, 0); sayWord(w, nil, "verpasst.wav")
+  end
+  w.prioPlay = nil
+end
+
+function BAL.WV.learn(w, M)
+  local J = M.J
+  local m = w.radii and w.radii[w.modelName or "?"]
+  if not (J and J.vb > 3 and w.radii) or M.dmax > 100 then return end   -- >100 m: im Sektor gekreist
+  if not m then m = {}; w.radii[w.modelName or "?"] = m end
+  local tv = m.tv or BAL.WV.TV0
+  local need = (w.margin or 5) + 10
+  if M.dmax < (w.margin or 5) + 5 then tv = tv - 0.3                      -- knapp: sofort zurueck
+  else tv = tv + clamp(0.3 * (M.dmax - need) / J.vb, -0.3, 0.3) end   -- hoechstens 0.3 s pro Wende
+  m.tv = clamp(tv, BAL.WV.LO, BAL.WV.HI)
+  w.radiiDirty = true
+  w.wvLast = {j = M.j, dmax = M.dmax, ex = (M.dmax - need) / J.vb, tv = m.tv}
+end
+
+function BAL.WV.step(w, f, now, dt)
+  if dt > 0 then w.wkDt = (w.wkDt or dt) * 0.9 + dt * 0.1 end
+  local T = w.task
+  if w.state ~= S_STARTED or not T then w.missTP, w.wvX, w.wvM, w.wvTp = nil, nil, nil, w.tp; return end
+  -- Sektor erreicht: Messung der Tiefe beginnt, Alarm aus
+  if w.wvTp ~= w.tp then
+    if w.tp >= 1 and w.tp <= 3 then
+      local J = w.wvJ
+      if J and (J.j ~= w.tp or J.lap ~= #w.laps) then J = nil end
+      w.wvM = {j = w.tp, dmax = -1e9, t = now, J = J}
+    end
+    w.wvTp, w.missTP, w.wvX, w.wvJ, w.wvE = w.tp, nil, nil, nil, nil
+  end
+  -- Alarm wiederholen (auch ohne neuen Fix)
+  local X = w.wvX
+  if w.missTP and X and X.nextT and now >= X.nextT then
+    X.nextT = now + 6
+    if not X.toward then BAL.WV.alarm(w, now, w.missTP) end
+  end
+  if not (f and f.ve) or f.clk == w.wvClk then return end
+  w.wvClk = f.clk
+  -- Tiefe nach dem Sektor-Eintritt: bis sie wieder abnimmt (Kurve fertig), hoechstens 12 s, nicht im Bart
+  local M = w.wvM
+  if M then
+    local c = T.tp[M.j]
+    local d = BAL.WV.depth(c, f)
+    if d > M.dmax then M.dmax = d end
+    if w.therm or now - M.t > 12 then w.wvM = nil
+    elseif d < M.dmax - 5 then w.wvM = nil; BAL.WV.learn(w, M) end
+  end
+  local j = w.tp % 3 + 1
+  local c = T.tp[j]
+  local dep, dist = BAL.WV.depth(c, f)
+  local gs = math.sqrt(f.ve * f.ve + f.vn * f.vn)
+  -- zu frueh eingedreht: dreht in Wenderichtung (> 12 Grad/s), TP naeher als 150 m, noch nicht im Sektor;
+  -- Kurve mit voller Drehrate V/R ab jetzt (Bogen in 15-Grad-Schritten bis 270 Grad) erreicht den Sektor nicht
+  local s = c.s
+  if dist < 150 and f.hdg and (w.omS or 0) * -s > math.rad(12) and not inSector(T, j, f.x, f.y) then
+    local V = math.max(w.tasF or f.tas or 15, 5)
+    local R = radius(w, j)
+    local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
+    local h0, om, ok = math.rad(f.hdg), V / R, false
+    for k = 1, 18 do
+      local a = k * math.rad(15)
+      local t, h = a / om, h0 - s * a
+      local x = f.x + s * R * (math.cos(h) - math.cos(h0)) + wx * t
+      local y = f.y - s * R * (math.sin(h) - math.sin(h0)) + wy * t
+      local rx, ry = x - c.x, y - c.y
+      local dd = rx * c.bx + ry * c.by
+      if dd >= (w.margin or 5) and dd * dd >= 0.5 * (rx * rx + ry * ry) then ok = true; break end
+    end
+    if not ok and (not w.wvE or now - w.wvE >= 2.5) then
+      w.wvE = now
+      prioHold(w, now, 1)
+      prioTone(w, 600, 150, 250); prioTone(w, 450, 250)
+    end
+  end
+  -- verpasst (nur TP1..3, nicht die Ziellinie; nicht im Landeanflug unter 50 m)
+  if w.tp >= 3 or (f.agl or 999) < 50 then return end
+  if not X or X.j ~= j then X = {j = j, dmin = dist, dprev = dist}; w.wvX = X end
+  if dist < X.dmin then X.dmin = dist end
+  local cosA = gs > 3 and dist > 1 and ((c.x - f.x) * f.ve + (c.y - f.y) * f.vn) / (dist * gs) or 0
+  X.toward = cosA > 0.5
+  local away = cosA < -0.17 and dist > X.dprev and (w.omega or 0) < math.rad(15)
+  X.dprev = dist
+  if away then X.awayT = X.awayT or now else X.awayT = nil end
+  if not w.missTP then
+    local passed = X.dmin < 250 and dist > X.dmin + 40 and X.awayT and now - X.awayT >= 3
+    local nextSec = j < 3 and inSector(T, j + 1, f.x, f.y)
+    if passed or nextSec then
+      w.missTP, X.nextT = j, now + 6
+      BAL.WV.alarm(w, now, j)
+    end
+  end
+end
+
 function turnTone(w, g, now)
   local p = g.plan
   if not p or w.warnSec <= 0 or w.state ~= S_STARTED then return false end
@@ -2606,14 +2737,20 @@ function turnTone(w, g, now)
     end
     tT = 99
   end
-  -- Kein Vorhalt mehr: "Jetzt" ist der frueheste sichere Kurvenbeginn. Wer langsamer reagiert, kommt nur tiefer in den
-  -- Sektor; ein Vorhalt liess schnelle Piloten den Sektor verfehlen (Simulation: 0.2 bis 1.2 s Reaktion alle drin).
+  -- Vorhalt (1.43): "Jetzt" kommt tv s VOR dem fruehesten sicheren Kurvenbeginn. Bis die Kurve wirklich dreht,
+  -- vergehen Reaktion, Einrollen und Aufbau der Drehrate (ASW-17 am 13.11.: Knueppel bis Drehung 1.2 s, Drehung im
+  -- Mittel 1.7 s nach "Jetzt", Sektortiefe 24..70 m statt 15 m). tv lernt das Widget pro Modell aus der erreichten
+  -- Sektortiefe (BAL.WV.learn), Start 1.0 s, 0.3..1.5 s. Gegen zu fruehes Eindrehen warnt BAL.WV.early.
+  -- Ausgeloest wird schon, wenn der naechste wakeup zu spaet waere (halber gemessener Takt).
   tT = tT - (w.cur and (now - w.cur.clk) or 0)                 -- Fix ist bis zu einem GPS-Takt alt
+  tT = tT - BAL.WV.tv(w) - 0.5 * (w.wkDt or 0.1)
   local turning = (w.omega or 0) > math.rad(15)
-  -- Vorrang schon 1.5 s vor dem Countdown (Warteschlange leeren) und waehrend er laeuft
-  if (wt or tT <= w.warnSec + 1.5) and not turning then prioHold(w, now, 0.4) end
+  -- Einzaehlen: mindestens 3 s ("drei, zwei, eins", dann der lange hohe Ton)
+  local nCnt = math.max(w.warnSec, 3)
+  -- Vorrang schon 1.5 s vor dem Einzaehlen (Warteschlange leeren) und waehrend es laeuft
+  if (wt or tT <= nCnt + 1.5) and not turning then prioHold(w, now, 0.4) end
   if not wt then
-    if tT > w.warnSec + 0.05 then return false end
+    if tT > nCnt + 0.3 then return false end
     wt = {key = key}
     w.warn = wt
     if turning then wt.done = true; return false end           -- dreht schon: kein Ton mehr
@@ -2625,14 +2762,19 @@ function turnTone(w, g, now)
       prioHold(w, now, 1.6)                                    -- 0.6 s Ton, danach noch 1 s still
       prioTone(w, 2400, 600, 400)
       w.quietUntil = now + 1.5
+      BAL.WV.jetzt(w, g)
     end
     return false
   end
-  if tT > w.warnSec + 1 then return false end                  -- Kurs passt gerade nicht: warten, Kurs-Ansage fuehrt
-  -- Countdown: ein kurzer Piep pro Sekunde, nicht mehr in der letzten halben Sekunde vor "Jetzt"
-  if (not wt.beepT or now - wt.beepT >= 1) and tT > 0.5 then
-    wt.beepT = now
-    prioTone(w, 1700, 90)
+  if tT > nCnt + 1 then return false end                       -- Kurs passt gerade nicht: warten, Kurs-Ansage fuehrt
+  -- Einzaehlen: Zahl k, sobald die Restzeit unter k faellt (gleicher Abstand wie "Jetzt", also im Sekundentakt). Springt die Restzeit
+  -- (Kurswechsel), faellt eine Zahl weg statt falsch zu zaehlen.
+  local k = math.floor(tT - 0.15) + 1                          -- naechste faellige Zahl
+  if k >= 1 and k <= nCnt and (not wt.last or k < wt.last) and tT <= k + 0.15 and tT > k - 0.5 then
+    wt.last = k
+    w.prioPlay = true
+    sayNumber(w, nil, k, UNIT_RAW, 0)
+    w.prioPlay = nil
   end
   w.quietUntil = now + 1
   return true
@@ -3624,6 +3766,7 @@ local function wakeup(w)
 
   BAL.VT.mode(w, now, dt)
   local warn = cur and turnTone(w, w.gc or {}, now)           -- Wendeton auf jeder Seite
+  BAL.WV.step(w, cur, now, dt)                                 -- Vorhalt lernen, zu frueh, verpasst
   warn = warn or (w.prioUntil and now < w.prioUntil)          -- Vorrang: keine Seitentoene
   if w.vtDev == 2 then BAL.VO.set(w, now, w.vtOn and not warn and not (w.quietUntil and now < w.quietUntil)) end
   if w.vtOn then
@@ -3846,6 +3989,7 @@ local function header(w, W)
   else
     clock = string.format("%02d:%02d:%02d", math.floor(ls / 3600), math.floor(ls / 60) % 60, ls % 60)
   end
+  if w.missTP and w.state == S_STARTED then st, col = string.format("TP%d FEHLT", w.missTP), C_RED end
   if not w.gpsOk then st, col = st .. "  GPS?", C_RED end
   -- scharf oder in der Aufgabe, aber die Position aendert sich seit 8 s nicht: Sensor ohne Fix sendet oft
   -- die letzte Position weiter
@@ -3916,6 +4060,7 @@ local function footerMsg(w, W, H, now)
   if w.inZoneNow then msg = "SICHERHEITSZONE " .. tostring(w.zoneName or "") end
   if w.overMax then msg = "MAXIMALHÖHE " .. (w.task and w.task.maxAlt or "") .. " m" end
   if w.igc and w.igc.err then msg = w.igc.err end
+  if w.missTP and w.state == S_STARTED then msg = string.format("TP%d VERPASST - ZURÜCK IN DEN SEKTOR", w.missTP) end
   if msg then
     local h = textH(FONT_S) + 4
     lcd.color(rgb(120, 0, 0))
