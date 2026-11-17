@@ -68,6 +68,19 @@ local NUM_DEFS = {
 
 -- ---------------------------------------------------------------- Wind und TAS (aus Sollfahrt)
 
+-- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
+-- Fehlt die Datei, bleibt der Faktor 1.
+local VMOD
+local function varioModul()
+  if VMOD == nil then
+    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
+    local ok2, m = false, nil
+    if ok and f then ok2, m = pcall(f) end
+    VMOD = (ok2 and type(m) == "table") and m or false
+  end
+  return VMOD or nil
+end
+
 local function clamp(x, lo, hi)
   if x < lo then return lo end
   if x > hi then return hi end
@@ -1103,9 +1116,17 @@ local function wakeup(w)
   end
 
   -- Hoehe: GPS-Hoehe, sonst aus dem Vario aufintegriert (wie Sollfahrt)
-  local vario = readNumber(w.vario)
-  w.varioNow = vario
+  local vraw = readNumber(w.vario)
   local alt = readNumber(w.gpsAlt)
+  -- Eichfaktor lernen (nur mit GPS-Hoehe, sonst waere die Hoehe aus dem Vario selbst gerechnet) und anwenden
+  local vm = varioModul()
+  if vm then
+    w.vst = w.vst or {}
+    if not w.vstLoaded then vm.load(w.vst, storage.read); w.vstLoaded = true end
+    if alt ~= nil then vm.step(w.vst, now, alt, vraw); vm.save(w.vst, storage.write) end
+  end
+  local vario = (vm and w.vst) and vm.apply(w.vst, vraw) or vraw
+  w.varioNow = vario
   if alt == nil then
     w.altInt = (w.altInt or 0) + (vario or 0) * dt
     alt = w.altInt

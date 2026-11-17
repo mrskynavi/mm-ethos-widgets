@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.8
+-- @version 1.9
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -831,23 +831,17 @@ local function airspeedTas(w, now, dt, gs)
   return w.asTas
 end
 
--- Vario-Eichfaktor lernen: Vario und Hoehenaenderung messen dieselbe Bewegung, der Motor spielt keine Rolle.
--- Alle 10 s: Hoehenrate gegen mittleres Vario (f * Vario ~ Rate, kleinste Quadrate durch 0), nur bei |Vario| >= 0.4 m/s.
--- Ab 20 Fenstern und plausiblem Faktor (0.6 .. 1.6) gilt er, sonst 1. w.varioF wirkt auf das Vario vor der TE-Rechnung.
-local VL_WIN, VL_MINN, VL_MINABS = 10, 20, 0.4
-local function varioLernStep(w, now, hA, vario)
-  if hA == nil or vario == nil then return end
-  if w.lT0 == nil then w.lT0, w.lH0, w.lVs, w.lVn = now, hA, 0, 0 end
-  w.lVs, w.lVn = w.lVs + vario, w.lVn + 1
-  if now - w.lT0 < VL_WIN then return end
-  local vm = w.lVs / w.lVn
-  if math.abs(vm) >= VL_MINABS then
-    local rate = (hA - w.lH0) / (now - w.lT0)
-    w.lNum, w.lDen, w.lN = (w.lNum or 0) + rate * vm, (w.lDen or 0) + vm * vm, (w.lN or 0) + 1
-    local f = w.lNum / w.lDen
-    w.varioF = (w.lN >= VL_MINN and f >= 0.6 and f <= 1.6) and f or 1
+-- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
+-- Fehlt die Datei, bleibt der Faktor 1.
+local VMOD
+local function varioModul()
+  if VMOD == nil then
+    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
+    local ok2, m = false, nil
+    if ok and f then ok2, m = pcall(f) end
+    VMOD = (ok2 and type(m) == "table") and m or false
   end
-  w.lT0, w.lH0, w.lVs, w.lVn = now, hA, 0, 0
+  return VMOD or nil
 end
 
 -- Alle Messwerte -> TE (m/s), TAS (m/s), Gegenwind (m/s) und ein Hinweistext, falls Daten fehlen.
@@ -881,7 +875,9 @@ local function inputsStep(w, now, dt)
   -- Vario / TE (barometrisch: Energiekompensation selbst addieren)
   local te
   if vario ~= nil then
-    local vf = vario * (w.varioF or 1)
+    local vf = vario
+    local vm = varioModul()
+    if vm and w.vst then vf = vm.apply(w.vst, vario) end
     te = (w.varioType == 2) and (vf + w.teFactor / 100 * kin) or vf
   end
 
@@ -897,7 +893,13 @@ local function inputsStep(w, now, dt)
       w.hT0, w.hH0 = now, w.hAF
     end
     if w.hRate ~= nil then teNet = w.hRate + (w.kinA or 0) end
-    varioLernStep(w, now, w.hAF, vario)
+    local vm = varioModul()
+    if vm then
+      w.vst = w.vst or {}
+      if not w.vstLoaded then vm.load(w.vst, storage.read); w.vstLoaded = true end
+      vm.step(w.vst, now, w.hAF, vario)
+      vm.save(w.vst, storage.write)
+    end
   else
     w.hAF, w.hT0, w.hRate = nil, nil, nil
   end

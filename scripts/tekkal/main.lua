@@ -65,6 +65,19 @@ local NUM_DEFS = {
   {key = "airK",      def = 1000}, -- Fahrt-Korrektur fuer die Quelle "Fahrt korr." (0.1 %, auf die Logger-Fahrt)
 }
 
+-- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
+-- Fehlt die Datei, bleibt der Faktor 1.
+local VMOD
+local function varioModul()
+  if VMOD == nil then
+    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
+    local ok2, m = false, nil
+    if ok and f then ok2, m = pcall(f) end
+    VMOD = (ok2 and type(m) == "table") and m or false
+  end
+  return VMOD or nil
+end
+
 local function clamp(x, lo, hi)
   if x < lo then return lo end
   if x > hi then return hi end
@@ -485,7 +498,15 @@ local function measure(now)
   end
   s.ias, s.tas = ias, tas
   s.airKorr = ias and ias * (w.airK or 1000) / 1000     -- Quelle "Fahrt korr." (IAS wie der Logger, in m/s)
-  local vario = readNumber(w.vario)
+  local vraw = readNumber(w.vario)
+  -- Eichfaktor lernen (Hoehe nur fuer die Aenderung, daher egal welche Hoehenquelle) und anwenden
+  local vm = varioModul()
+  if vm then
+    s.vst = s.vst or {}
+    if not s.vstLoaded then vm.load(s.vst, storage.read); s.vstLoaded = true end
+    if alt ~= nil then vm.step(s.vst, now, alt, vraw); vm.save(s.vst, storage.write) end
+  end
+  local vario = (vm and s.vst) and vm.apply(s.vst, vraw) or vraw
   s.vario = vario
   local gs = speedMs(w.gpsSpd, 1, 2)                 -- GPS-Geschw.: ohne Einheit km/h
   s.gs = gs
