@@ -1,5 +1,5 @@
 -- @widget  Polarflug
--- @version 1.5
+-- @version 1.6
 -- Polarflug fuer Ethos -- Vollbild-Widget, hilft beim Erfliegen der Polare.
 --
 -- Anzeige 1 (Balken): ein Balken pro Geschwindigkeitsbereich (Standard 20-30, 30-40 ... km/h).
