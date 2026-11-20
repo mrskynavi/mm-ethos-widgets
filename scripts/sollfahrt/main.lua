@@ -1,5 +1,5 @@
 -- @widget  Sollfahrt
--- @version 1.9
+-- @version 1.10
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
@@ -1301,6 +1301,12 @@ local function paint(w)
     lcd.color(rgb(0, 0, 0))
     lcd.drawFilledRectangle(0, ny, W, nh)
     drawT(0, ny + 5, W, w.dataNote, FONT_STD, ORANGE, "c")
+  end
+  -- Status des gemeinsamen Eichmoduls (unten rechts): zeigt, ob scripts/gemeinsam/vario.lua geladen ist
+  do
+    local vm = VMG.modul()
+    local etxt = vm and string.format("Eichfaktor %.2f", (w.vst and vm.apply(w.vst, 1)) or 1) or "Eichmodul fehlt"
+    drawT(0, H - textHeight(FONT_XS) - 2, W - 4, etxt, FONT_XS, DIM, "r")
   end
 end
 

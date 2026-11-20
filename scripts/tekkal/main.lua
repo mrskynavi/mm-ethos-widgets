@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.3
+-- @version 1.4
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -885,6 +885,12 @@ local function paint(w)
   -- Fuss: was fliegen
   local adv, acol = advice(w, s)
   drawT(m, foot, W - 2 * m, adv, FONT_XS, acol, "l")
+  -- Status des gemeinsamen Eichmoduls (unten rechts): zeigt, ob scripts/gemeinsam/vario.lua geladen ist
+  do
+    local vm = VMG.modul()
+    local etxt = vm and string.format("Eichfaktor %.2f", (s.vst and vm.apply(s.vst, 1)) or 1) or "Eichmodul fehlt"
+    drawT(0, H - sH - 2, W - 4, etxt, FONT_XS, C.DIM, "r")
+  end
 end
 
 -- ---------------------------------------------------------------- Touch
