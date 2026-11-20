@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.50
+-- @version 1.51
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.50"
+local VERSION = "1.51"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3210,6 +3210,10 @@ function BAL.VO.set(w, now, on)
     -- zuerst rawValue ganzzahlig (Weg 2); die Probe mit Zuruecklesen bleibt als Absicherung.
     w.voFirst = (mj >= 26 and type(s.rawValue) == "function") and 2 or 4
     w.voMode = w.voFirst
+    -- 1.51: Unter Ethos 26 ist Weg 4 am Sender bestaetigt: gleich fest, keine Probe. Mit der Lastbremse (1.48)
+    -- schrieben leichte Aufrufe dazwischen neue Werte, das Zuruecklesen passte nicht mehr, die Probe wechselte
+    -- auf einen Weg, den Ethos 1.6.8 nicht annimmt, und der Sensor galt nach ~30 s als verloren (Christoph 20.11.).
+    if w.voFirst == 4 then w.voLock = "ok" end
   end
   local last = w.voLast
   if not w.voLock and last and math.abs(last) >= 0.05 then
@@ -3312,7 +3316,7 @@ function BAL.TM.wake(f, w)
     if s and w.vtDev == 2 and w.voMode then
       local v = BAL.VO.on and clamp(w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
       BAL.VO.v = v
-      BAL.VO.write(s, w.voMode, v)
+      if BAL.VO.write(s, w.voMode, v) then w.voLast = v end
     end
     local d = os.clock() - t
     T.ld = T.ld + d
@@ -3343,7 +3347,7 @@ function BAL.TM.wake(f, w)
   local iv = BAL.TM.CV[w.calcIv or 1] or 1
   if iv > 1 and T.wn % iv ~= 0 then
     local s = w.voSens
-    if s and w.vtDev == 2 and w.voMode then BAL.VO.write(s, w.voMode, BAL.VO.v or 0) end
+    if s and w.vtDev == 2 and w.voMode and BAL.VO.write(s, w.voMode, BAL.VO.v or 0) then w.voLast = BAL.VO.v or 0 end
     T.add("l", os.clock() - t)
     return
   end
