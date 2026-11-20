@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.6
+-- @version 1.6.1
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -214,6 +214,7 @@ end
 
 local CFG = nil          -- Einstellungen des (letzten) Widgets, CFG.model = sein Modell
 local S = nil            -- Messzustand
+local WAKE_T = nil        -- 1.6.1: Zeit des letzten Widget-wakeup
 local FC = nil           -- Einstellungen aus der Datei (ohne Widget), {model, t, cfg}
 
 local CIRCLE_DT = 0.5    -- Abstand der Kreis-Stuetzwerte (s)
@@ -631,6 +632,8 @@ end
 local function measure(now)
   local mname = currentModelName()
   local w = CFG
+  -- 1.6.1: Widget vom Bildschirm genommen (seit 3 s kein wakeup): wie ohne Widget nur die Quellen aus der Datei
+  if w and not (WAKE_T and now - WAKE_T < 3) then w = nil end
   if not w or w.model ~= mname then w = fileCfg(now, mname) end
   if not w then return end
   if not S then resetAll() end
@@ -1044,6 +1047,7 @@ local function wakeup(w)
   w.model = currentModelName()
   CFG = w
   local now = os.clock()
+  WAKE_T = now                -- 1.6.1: Widget lebt (vom Bildschirm genommen: kein wakeup mehr)
   devStep(w, now)
   measure(now)
   if S then
