@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.7
+-- @version 1.7.1
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -597,7 +597,8 @@ FIND = devFind
 -- auf dem Bildschirm (Christoph 20.11.2026). Angelegt beim ersten Mal (gesucht ueber die AppID), Modul wie der
 -- Logger, Wert ganzzahlig in 0.01 m/s (unter Ethos 26 ueber value, wie bei SkyNavigator am Sender bestaetigt).
 local KS = {}
-local KS_DEF = {tek = {name = "TEK korr.", appId = 0x5FF1, dec = 2}, air = {name = "Fahrt korr.", appId = 0x5FF2, dec = 1}}
+local KS_DEF = {tek = {name = "TEK korr.", appId = 0x5FF1, dec = 2, lo = -20, hi = 20},
+  air = {name = "Fahrt korr.", appId = 0x5FF2, dec = 1, lo = 0, hi = 200}}
 local function ksGet(now, key, ref)
   local e = KS[key]
   if e and e.s then return e.s end
@@ -629,6 +630,9 @@ local function ksGet(now, key, ref)
   if UNIT_METER_PER_SECOND then pcall(sn.unit, sn, UNIT_METER_PER_SECOND); pcall(sn.protocolUnit, sn, UNIT_METER_PER_SECOND) end
   pcall(sn.protocolDecimals, sn, 2)
   pcall(sn.decimals, sn, D.dec)
+  -- 1.7.1: Ein neuer DIY-Sensor hat den Bereich 0..10000, negative Werte kamen als 0 an (Christoph 20.11.2026)
+  pcall(sn.minimum, sn, D.lo)
+  pcall(sn.maximum, sn, D.hi)
   e.s = sn
   return sn
 end

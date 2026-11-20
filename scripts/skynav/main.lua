@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.51
+-- @version 1.51.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.51"
+local VERSION = "1.51.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3176,7 +3176,7 @@ function BAL.VO.sensor(w, now)
     if UNIT_METER_PER_SECOND then pcall(s.unit, s, UNIT_METER_PER_SECOND); pcall(s.protocolUnit, s, UNIT_METER_PER_SECOND) end
     pcall(s.protocolDecimals, s, 2)
     pcall(s.decimals, s, 2)
-    if new then pcall(s.minimum, s, -20); pcall(s.maximum, s, 20) end
+    pcall(s.minimum, s, -20); pcall(s.maximum, s, 20)          -- 1.51.1: immer (DIY-Vorgabe 0..10000 schneidet Sinken ab)
   end
   w.voSens, w.voMode, w.voBad, w.voGood, w.voLock, w.voSw, w.voLast = s, nil, 0, 0, nil, 0, nil
   return s
