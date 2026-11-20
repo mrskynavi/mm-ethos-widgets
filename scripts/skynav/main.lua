@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.49
+-- @version 1.49.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.49"
+local VERSION = "1.49.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3202,6 +3202,13 @@ function BAL.VO.info(w)
   local ok, ver = pcall(system.getVersion)
   t[3] = "Ethos " .. tostring(ok and type(ver) == "table" and ver.version or "?")
   t[4] = "Modul " .. tostring(s and BAL.SN.call(s, "module")) .. "/" .. tostring(w.voMod) .. " W" .. tostring(w.voSw or 0)
+  -- 1.49.1: welche Quelle das Widget als Vario liest und was sie gerade liefert
+  do
+    local q = w.vario
+    local nm = q and BAL.SN.call(q, "name") or nil
+    local v = readNumber(q)
+    t[#t + 1] = string.format("Quelle %s: %s", tostring(nm or "keine"), v and string.format("%+.2f", v) or "nil")
+  end
   -- pro Schreibweg: gesendet > gelesen, Alter in ms
   for m = 1, 4 do
     local r = w.voT and w.voT[m]
