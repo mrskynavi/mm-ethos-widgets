@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.46
+-- @version 1.47
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.46"
+local VERSION = "1.47"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3241,7 +3241,8 @@ function BAL.TM.wake(f, w)
   -- 1.46: 6..9 = wie 4, dazu kuenstliche Last: 10 / 20 / 40 ms in jedem Aufruf, 9 = 100 ms einmal pro Sekunde
   -- (wie ein Bild). Zeigt, wie lange ein einzelner Aufruf Ethos aufhalten darf, bevor der Sinkton hackt.
   if w.calcIv and w.calcIv >= 4 and w.calcIv <= 9 then
-    w.varioRaw = w.calcIv == 5 and -2 or (readNumber(w.vario) or 0)
+    -- 1.47: Laststufen 6..9 ebenfalls mit festen -2 m/s (am Boden steht das echte Vario bei 0 = still)
+    w.varioRaw = (w.calcIv == 4) and (readNumber(w.vario) or 0) or -2
     BAL.VO.set(w, t, true)
     local busy = ({0, 0, 0.010, 0.020, 0.040, 0})[w.calcIv - 3]
     if w.calcIv == 9 and t - (T.bz or 0) >= 1 then T.bz, busy = t, 0.100 end
@@ -5733,7 +5734,7 @@ local function configure(w)
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
   addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5},
-    {"Sensor + 10 ms (Test)", 6}, {"Sensor + 20 ms (Test)", 7}, {"Sensor + 40 ms (Test)", 8}, {"Sensor + 100 ms/s (Test)", 9}})
+    {"-2 m/s + 10 ms (Test)", 6}, {"-2 m/s + 20 ms (Test)", 7}, {"-2 m/s + 40 ms (Test)", 8}, {"-2 m/s + 100 ms/s (Test)", 9}})
   addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
   for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
