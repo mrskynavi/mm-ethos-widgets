@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.48
+-- @version 1.49
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.48"
+local VERSION = "1.49"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3217,7 +3217,7 @@ end
 -- Abstand zwischen zwei wakeup (Takt; enthaelt auch das Zeichnen von Ethos selbst). Anzeige in der Konfiguration.
 -- Dazu "Bildaufbau" (drawIv): wie oft das Widget neu zeichnen laesst.
 BAL.TM = {CV = {1, 2, 4}, IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil,
-  GOV_RATE = 0.12, GOV_MAX = 0.04, GOV_DRAW = 1.5}
+  GOV_RATE = 0.12, GOV_MAX = 0.04, VD = {0.3, 0.6, 1.0, 1.5}}
 function BAL.TM.add(k, d)
   local c = BAL.TM.c
   local e = c[k]
@@ -3238,18 +3238,22 @@ function BAL.TM.wake(f, w)
   -- nur den letzten Vario-Wert; gezeichnet wird dann hoechstens alle GOV_DRAW s.
   T.ld = math.max(0, (T.ld or 0) - (T.last and (t - T.last) or 0) * T.GOV_RATE)
   T.last = t
-  T.gov = w.vtOn and (w.calcIv or 1) == 1
-  -- spaetestens nach 1 s wieder voll rechnen (Wertung und IGC bekommen mindestens einen Fix pro Sekunde)
+  -- 1.49: nie in der Naehe einer Ecke (dort schweigt der Varioton ohnehin, der Wendeton hat Vorrang)
+  T.gov = w.vtOn and (w.calcIv or 1) == 1 and not w.nearC
+  -- spaetestens nach 1 s wieder voll rechnen (Weg, Seiten, Toene)
   if T.gov and T.ld > T.GOV_MAX and t - (T.full or 0) < 1 then
-    -- Vario-Wert trotzdem frisch vom Sensor (wie in readInputs), damit der Ton ohne Verzoegerung folgt
+    -- 1.49 leicht: jeden neuen GPS-Punkt einlesen und werten; ein Ereignis rechnet den Aufruf voll
+    T.mk = t
+    f(w, true)
+    -- Bild auch aus dem leichten Aufruf (Position aus dem letzten Punkt, Weg aus der letzten vollen Rechnung)
+    if w.lastInvalidate and t - w.lastInvalidate >= (T.VD[w.vtDraw or 2] or 0.6) then
+      w.lastInvalidate = t
+      lcd.invalidate()
+    end
+    -- Vario-Wert frisch (readInputs hat ihn eben gelesen), damit der Ton ohne Verzoegerung folgt
     local s = w.voSens
     if s and w.vtDev == 2 and w.voMode then
-      local v = 0
-      if BAL.VO.on then
-        v = readNumber(w.vario)
-        if v ~= nil and w.varioType == 2 then v = v + (w.teDE or 0) end
-        v = v and clamp(v, -20, 20) or (BAL.VO.v or 0)
-      end
+      local v = BAL.VO.on and clamp(w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
       BAL.VO.v = v
       BAL.VO.write(s, w.voMode, v)
     end
@@ -3350,7 +3354,8 @@ end
 function BAL.TM.paint(f, w)
   local T = BAL.TM
   T.pn = (T.pn or 0) + 1
-  local probe = T.pn % 4 == 0
+  -- 1.49: Einzelmessung der Zeichenbefehle nur noch in den Testmodi (kostet selbst rund 10 % eines Bilds)
+  local probe = T.pn % 4 == 0 and (w.calcIv or 1) >= 2
   if probe then local px = T.proxy(); lcd = px; T.Ln = (T.Ln or 0) + 1 end
   local t = os.clock()
   local ok, err = pcall(f, w)
@@ -3751,8 +3756,29 @@ local function armOrRestart(w, now, viaSw)
   end
 end
 
-local function wakeup(w)
+local function wakeup(w, lite)
   local now = os.clock()
+  -- Zeit seit dem letzten Einlesen (auch in leichten Aufrufen), fuer die Vario-Filter in readInputs
+  local rdt = w.riT and math.min(now - w.riT, 0.5) or 0
+  w.riT = now
+  -- 1.49 leichter Aufruf (Lastbremse beim Varioton, siehe BAL.TM.wake): jeder neue GPS-Punkt wird trotzdem
+  -- eingelesen und gewertet (Sektor, Start, Ziel; Christoph 20.11.2026: in engen Wenden zaehlt jeder Punkt bis
+  -- 10 Hz). Ausgelassen werden Weg-Rechnung, Seiten, Toene, Dateien. Bei einem Ereignis (Start, Sektor, Ziel)
+  -- oder Scharfstellen laeuft der volle Aufruf mit diesem Punkt weiter.
+  local fLite
+  if lite then
+    local f = readInputs(w, now, rdt)
+    if not f then return end
+    if w.armPending then fLite = f
+    else
+      assess(w, f, now)
+      w.fix = f
+      w.cur = f
+      w.calcDue = (w.calcDue or 0) + 1
+      if w.lastEventT ~= now then return end
+      fLite = f
+    end
+  end
   local dt = w.lastT and (now - w.lastT) or 0
   w.lastT = now
   if dt > 0.5 then dt = 0.5 end
@@ -3796,8 +3822,10 @@ local function wakeup(w)
     w.qlPress = nil
     if BAL.QL.zero(w) then tone(w, nil, 2000, 150); note(w, "Querlage genullt", now) end
   end
-  local f = readInputs(w, now, dt)
-  if f then
+  local f = fLite
+  local done = fLite and w.fix == fLite                       -- im leichten Teil schon gewertet
+  if not f then f = readInputs(w, now, rdt) end
+  if f and not done then
     if w.armPending then
       w.armPending = nil
       if not w.igc and w.task then igcOpen(w, f) end
@@ -3820,7 +3848,7 @@ local function wakeup(w)
   local pg = w.page
   -- Ein neuer Fix wird im naechsten Aufruf gerechnet (Ethos bricht nach 20 000 Instruktionen pro Aufruf ab,
   -- Einlesen/Wertung und Planung zusammen waeren zu viel); spaetestens im dritten.
-  if f then w.calcDue = (w.calcDue or 0) + 1 end
+  if f and not done then w.calcDue = (w.calcDue or 0) + 1 end
   local redo = (w.calcDue ~= nil and (f == nil or w.calcDue >= 3)) or not cur or pg ~= w.calcPage
   if redo then w.calcDue = nil end
   -- Aufrufe ohne Fix: Windfit, Restzeit-Sollfahrt (Tabelle, im naechsten Aufruf die Suche), nie zusammen
@@ -3843,6 +3871,7 @@ local function wakeup(w)
     -- der Wendeton kommt auf jeder Seite
     local gc = w.gc
     local near = w.state == S_STARTED and gc and gc.tCorner and gc.tCorner < w.zoomSec + w.warnSec + 8
+    w.nearC = near
     w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START or near)
   end
   thermCalc(w, cur, now, dt)
@@ -3890,7 +3919,7 @@ local function wakeup(w)
   end
 
   local ivD = BAL.TM.IV[w.drawIv or 1] or 0.15
-  if BAL.TM.gov and w.vtOn then ivD = math.max(ivD, BAL.TM.GOV_DRAW) end   -- 1.48 Lastbremse beim Varioton
+  if BAL.TM.gov and w.vtOn then ivD = math.max(ivD, BAL.TM.VD[w.vtDraw or 2] or 0.6) end   -- 1.48/1.49 beim Varioton
   if now - w.lastInvalidate >= ivD then
     w.lastInvalidate = now
     lcd.invalidate()
@@ -5465,7 +5494,9 @@ local function paintTherm(w, W, H, top)
     ex, ey = cx - ox * kxx - oy * kxy + 0.5, cy - ox * kyx - oy * kyy + 0.5
     -- Teilstueck 3 px breit (ganze Pixel): drei Linien quer zur Hauptrichtung versetzt
     local DL = lcd.drawLine
+    local thin = BAL.TM.gov                 -- 1.49: beim Varioton mit Lastbremse Spur 1 px statt 3 px (1/3 der Linien)
     local function seg(x1, y1, x2, y2)
+      if thin then DL(x1, y1, x2, y2); return end
       local dx, dy = x2 - x1, y2 - y1
       if (dx < 0 and -dx or dx) >= (dy < 0 and -dy or dy) then
         DL(x1, y1 - 1, x2, y2 - 1); DL(x1, y1, x2, y2); DL(x1, y1 + 1, x2, y2 + 1)
@@ -5769,6 +5800,7 @@ local function configure(w)
   addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5},
     {"-2 m/s + 10 ms (Test)", 6}, {"-2 m/s + 20 ms (Test)", 7}, {"-2 m/s + 40 ms (Test)", 8}, {"-2 m/s + 100 ms/s (Test)", 9}})
   addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
+  addChoice(w, "Bildaufbau beim Varioton", "vtDraw", {{"alle 0.3 s", 1}, {"alle 0.6 s", 2}, {"alle 1 s", 3}, {"alle 1.5 s", 4}})
   for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
@@ -5849,7 +5881,7 @@ local function setDefaults(w)
   w.ailSrc = nil
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
   w.vtStyle, w.vtDev = 1, 1
-  w.drawIv, w.calcIv = 1, 1
+  w.drawIv, w.calcIv, w.vtDraw = 1, 1, 2
   w.devMain, w.devStabi, w.varioType = 1, false, 0   -- 1.30: neue Widgets suchen die Sensoren des SM GPS-Logger 3
 end
 
@@ -5883,7 +5915,13 @@ local function read(w)
     -- beliebig viele Eintraege. Darum stehen diese Werte zusaetzlich gepackt im frueher ungenutzten Platz radFix
     -- (weit vorne): 100000 + Klang + 10 * Ausgabe + 100 * Geraet + 1000 * Stabi + 10000 * Bildaufbau.
     local p = w.radFix
-    w.calcIv = 1
+    w.calcIv, w.vtDraw = 1, 2
+    if type(p) == "number" and p >= 10000000 then                    -- 1.49: dazu Bild beim Varioton * 10000000
+      p = math.floor(p)
+      local c7 = p // 10000000
+      w.vtDraw = (c7 >= 1 and c7 <= 4) and c7 or 2
+      p = p % 10000000
+    end
     if type(p) == "number" and p >= 1000000 and p < 2000000 then    -- 1.39: dazu Rechentakt * 100000
       p = math.floor(p) - 1000000
       local c6 = math.floor(p / 100000) % 10
@@ -5906,7 +5944,7 @@ local function read(w)
 end
 
 local function write(w)
-  w.radFix = 1000000 + 100000 * (w.calcIv or 1) + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
+  w.radFix = 10000000 * (w.vtDraw or 2) + 1000000 + 100000 * (w.calcIv or 1) + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, BAL.SN.stored(w, k)) end
   for _, d in ipairs(NUM_DEFS) do storage.write(d.key, BAL.SN.stored(w, d.key)) end
