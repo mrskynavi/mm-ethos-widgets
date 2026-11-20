@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.4.1
+-- @version 1.5
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -43,6 +43,10 @@
 --   Neu beginnen ueber Schalter (Quellen in der Konfiguration, aktiv ueber 5 %, zaehlt beim Umlegen).
 --   1.4: wahlweise nach der Landung automatisch uebernehmen (nach mind. 60 s Flug, 3 s am Boden; im Simulator
 --   am Ende des Logs), fuer Simulator und Fluege ohne freien Schalter.
+-- Sensor (1.5): Vorgabe "SM GPS-Logger 3", das Widget sucht Airspeed, TEK-Vario, GPS, GPS-Geschw. und GPS-Hoehe
+--   selbst (S.Port-AppID mit Instanz 0..15, sonst Ethos-Name; Vario von der hoechsten Instanz her, weil der
+--   Logger eine andere Instanz bekommt, wenn der Empfaenger ein eigenes Vario hat). "Manuell" zeigt die
+--   Quellen zum Selberwaehlen wie bis 1.4; die von Hand gewaehlten Quellen bleiben gespeichert.
 -- Fahrt-Faktor (Geraden): nach einem Kreis gilt dessen Wind 3 min (+-150 m). Geradeaus (Drehrate unter
 --   4 Grad/s seit 3 s) jede Sekunde k = |Boden - Wind| / Fahrt, getrennt nach Fahrtbereich (10 km/h)
 --   und Himmelsrichtung (4 Viertel). Ein Bereich gilt, wenn zwei gegenueberliegende Viertel Werte haben
@@ -512,6 +516,116 @@ local function findGps(now)
   return GPS_FIND.src
 end
 
+-- ---------------------------------------------------------------- Sensor-Wahl (1.5)
+-- dev 1 = SM GPS-Logger 3 (Quellen automatisch), 0 = Manuell (Quellen von Hand). w.man haelt die Hand-Werte
+-- (gespeichert), w[k] die wirksamen Quellen, mit denen die Messung rechnet.
+local DEV_KEYS = {"air", "vario", "gpsSpd", "gps", "alt"}
+local DEV_ROLE = {
+  air    = {lbl = "Airspeed",    ids = {0x0A00}, names = {"Airspeed", "ASpd"}},
+  vario  = {lbl = "Vario",       ids = {0x0110}, desc = true, names = {"Steigr. Vario", "VSpeed", "Vario"}},
+  gpsSpd = {lbl = "GPS-Geschw.", ids = {0x0830}, names = {"GPS-Geschw.", "GSpd", "GPS Speed"}},
+  gps    = {lbl = "GPS",         ids = {0x0800}, names = {"GPS"}},
+  alt    = {lbl = "GPS-Hoehe",   ids = {0x0820}, names = {"GAlt", "GPS-H\195\182he", "GPS Alt"}},
+}
+local MAN_NUM = {"airUnit", "airKind", "altKind"}
+
+local function srcCall(s, m)
+  local okF, f = pcall(function() return s[m] end)
+  if not (okF and type(f) == "function") then return nil end
+  local ok, v = pcall(f, s)
+  if ok then return v end
+  return nil
+end
+
+-- echte Quelle? (Ethos liefert fuer ein leeres Feld je nach Version nil, false oder eine Quelle "---")
+local function isSet(s)
+  if not validSource(s) then return false end
+  local none = rawget(_G, "CATEGORY_NONE")
+  if none ~= nil and srcCall(s, "category") == none then return false end
+  local n = srcCall(s, "name")
+  if n == "" or n == "---" then return false end
+  return true
+end
+
+-- Telemetrie-Quelle ueber AppID (Zahl) oder Namen
+local function getTele(spec)
+  if not (system and system.getSource) then return nil end
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local ok, s
+  if type(spec) == "number" then
+    if not cat then return nil end
+    ok, s = pcall(system.getSource, {category = cat, appId = spec})
+  else
+    if cat then ok, s = pcall(system.getSource, {category = cat, name = spec}) end
+    if not (ok and isSet(s)) then ok, s = pcall(system.getSource, spec) end
+  end
+  if not (ok and isSet(s)) then return nil end
+  if cat then
+    local c = srcCall(s, "category")
+    if c ~= nil and c ~= cat and c ~= rawget(_G, "CATEGORY_TELEMETRY") then return nil end  -- z.B. "TEK korr."
+  end
+  return s
+end
+
+local function devFind(k)
+  local R = DEV_ROLE[k]
+  for _, id in ipairs(R.ids) do
+    for j = 0, 15 do
+      local s = getTele(id + (R.desc and 15 - j or j))
+      if s then return s end
+    end
+  end
+  for _, n in ipairs(R.names) do
+    local s = getTele(n)
+    if s then return s end
+  end
+  return nil
+end
+
+-- wirksame Quellen und Einstellungen setzen
+local function devApply(w)
+  local man = w.man or {}
+  if (w.dev or 1) == 1 then
+    w.found = w.found or {}
+    for _, k in ipairs(SOURCE_KEYS) do w[k] = w.found[k] end      -- gpsCrs bleibt leer: Kurs aus der Position
+    w.airUnit, w.airKind, w.altKind = 1, 1, 1                      -- Logger: Airspeed IAS, GPS-Hoehe ue. M.
+  else
+    for _, k in ipairs(SOURCE_KEYS) do w[k] = man[k] end
+    for _, k in ipairs(MAN_NUM) do w[k] = man[k] or 1 end
+  end
+end
+
+local function devResolve(w, k)
+  w.found = w.found or {}
+  w.found[k] = devFind(k)
+end
+
+local function devResolveAll(w)
+  if (w.dev or 1) == 1 then
+    for _, k in ipairs(DEV_KEYS) do devResolve(w, k) end
+  end
+  devApply(w)
+end
+
+-- Hand-Werte aus den (gelesenen) Feldern merken
+local function devLoad(w)
+  local man = {}
+  for _, k in ipairs(SOURCE_KEYS) do man[k] = w[k] end
+  for _, k in ipairs(MAN_NUM) do man[k] = w[k] end
+  w.man = man
+end
+
+-- Konfiguration: gefunden / fehlt
+local function devSummary(w)
+  local fr, mi = {}, {}
+  for _, k in ipairs(DEV_KEYS) do
+    local s = w.found and w.found[k]
+    if s then fr[#fr + 1] = DEV_ROLE[k].lbl .. ": " .. tostring(srcCall(s, "name") or "?")
+    else mi[#mi + 1] = DEV_ROLE[k].lbl end
+  end
+  return fr, mi
+end
+
 -- Ein Schritt der Messung. Laeuft aus dem Widget und aus der Quelle "TEK korr.", rechnet aber nur einmal
 -- pro Zeitpunkt.
 local function measure(now)
@@ -825,9 +939,10 @@ end
 -- ---------------------------------------------------------------- Widget
 
 local function create()
-  local w = {lastInvalidate = 0, model = currentModelName()}
+  local w = {lastInvalidate = 0, model = currentModelName(), dev = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(EXTRA_NUM) do w[d.key] = d.def end
+  devLoad(w)
   CFG = w
   return w
 end
@@ -874,10 +989,37 @@ local function takeOver(w, now)
   if airPct then sayNumber(airPct) end
 end
 
+-- Logger-Quellen im Betrieb nachsuchen: eine pro Aufruf, dann Pause (10 s, wenn etwas fehlt, sonst 30 s;
+-- im Flug nur fehlende, alle 60 s)
+local function devStep(w, now)
+  if (w.dev or 1) ~= 1 or not w.man then return end
+  if w.devNext and now < w.devNext then return end
+  local fly = S and S.flying
+  local i = (w.devI or 0) + 1
+  if fly then
+    while DEV_KEYS[i] and w.found and w.found[DEV_KEYS[i]] do i = i + 1 end
+  end
+  local k = DEV_KEYS[i]
+  if not k then
+    w.devI = 0
+    local miss = false
+    for _, kk in ipairs(DEV_KEYS) do if not (w.found and w.found[kk]) then miss = true end end
+    w.devNext = now + (fly and 60 or (miss and 10 or 30))
+    return
+  end
+  local had = w.found and w.found[k]
+  devResolve(w, k)
+  devApply(w)
+  if w.found[k] and srcName(w.found[k]) ~= srcName(had) then w.devSave = true end
+  if i == #DEV_KEYS and w.devSave then w.devSave = nil; saveKorr(w) end   -- Sensornamen fuer die Quellen ohne Widget
+  w.devI = i
+end
+
 local function wakeup(w)
   w.model = currentModelName()
   CFG = w
   local now = os.clock()
+  devStep(w, now)
   measure(now)
   if S then
     if switchEdge(w, "swTake") then takeOver(w, now) end
@@ -942,10 +1084,15 @@ local function advice(w, s, now)
   if s.taken and now - s.taken.t < 8 then
     return s.taken.fail and "NICHTS ZU UEBERNEHMEN" or "UEBERNOMMEN", s.taken.txt, s.taken.fail and C.ORANGE or C.GREEN
   end
-  if not s.tas then return "FAHRT-QUELLE FEHLT", "Konfiguration: Airspeed des Loggers waehlen", C.ORANGE end
-  if not s.vario then return "VARIO-QUELLE FEHLT", "Konfiguration: TEK-Vario des Loggers waehlen", C.ORANGE end
-  if not s.gs then return "GPS-GESCHW. FEHLT", "Konfiguration: GPS-Geschwindigkeit waehlen", C.ORANGE end
-  if not s.crs and s.flying then return "GPS-POSITION FEHLT", "Konfiguration: GPS-Position waehlen (fuer den Kurs)", C.ORANGE end
+  local auto = (w.dev or 1) == 1
+  if not s.tas then return "FAHRT-QUELLE FEHLT", auto and "SM-Logger: Sensor Airspeed nicht gefunden (Sensoren suchen)" or
+    "Konfiguration: Airspeed des Loggers waehlen", C.ORANGE end
+  if not s.vario then return "VARIO-QUELLE FEHLT", auto and "SM-Logger: Sensor Vario nicht gefunden (Sensoren suchen)" or
+    "Konfiguration: TEK-Vario des Loggers waehlen", C.ORANGE end
+  if not s.gs then return "GPS-GESCHW. FEHLT", auto and "SM-Logger: Sensor GPS-Geschw. nicht gefunden (Sensoren suchen)" or
+    "Konfiguration: GPS-Geschwindigkeit waehlen", C.ORANGE end
+  if not s.crs and s.flying then return "GPS-POSITION FEHLT", auto and "SM-Logger: Sensor GPS nicht gefunden (Sensoren suchen)" or
+    "Konfiguration: GPS-Position waehlen (fuer den Kurs)", C.ORANGE end
   if s.motor then
     local rest = MOTOR_HOLD - (now - s.motorT)
     if rest > MOTOR_HOLD - 1 then return "MOTOR - PAUSE", "Messung startet 15 s nach Motor aus", C.BLUE end
@@ -1104,20 +1251,47 @@ local function addChoice(w, label, prop, list)
 end
 
 local function configure(w)
+  if not w.man then devLoad(w) end
+  devResolveAll(w)
+  -- Sensor: SM-Logger (Quellen automatisch) oder Manuell (Quellen von Hand wie bis 1.4)
+  local line = form.addLine("Sensor")
+  form.addChoiceField(line, nil, {{"SM GPS-Logger 3", 1}, {"Manuell", 0}}, function() return w.dev or 1 end, function(v)
+    w.dev = v
+    devResolveAll(w)
+    if form.clear then pcall(form.clear); configure(w) end
+  end)
+  local hand = (w.dev or 1) ~= 1
+  if not hand then
+    local fr, mi = devSummary(w)
+    for i, t in ipairs(fr) do local l = form.addLine(i == 1 and "  gefunden" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+    for i, t in ipairs(mi) do local l = form.addLine(i == 1 and "  fehlt" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+  end
   addSource(w, "Schalter Uebernehmen", "swTake")
   addSource(w, "Schalter Neu beginnen", "swReset")
   addChoice(w, "Nach der Landung automatisch uebernehmen", "autoTake", {{"Nein", 2}, {"Ja", 1}})
-  addSource(w, "Fahrt (Airspeed des Loggers, nicht Fahrt korr.)", "air")
-  addChoice(w, "Fahrt: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
-  addChoice(w, "Fahrt: Logger liefert", "airKind", {{"IAS (Normdichte)", 1}, {"TAS", 2}})
   addNumber(w, "Airspeed-Faktor im Logger (%)", "curFactor", 50, 200)
-  addSource(w, "TEK-Vario des Loggers (nicht TEK korr.)", "vario")
-  addSource(w, "GPS-Geschwindigkeit", "gpsSpd")
-  addSource(w, "GPS-Position (fuer den Kurs)", "gps")
-  addSource(w, "GPS-Kurs (nur ohne Position, nicht SM-Flugrichtung)", "gpsCrs")
-  addSource(w, "Hoehe (Luftdichte)", "alt")
-  addChoice(w, "Hoehe ist", "altKind", {{"ueber Meer (GPS)", 1}, {"ueber Start + Platzhoehe", 2}})
-  addNumber(w, "Platzhoehe ue. M. (m)", "fieldAlt", -400, 5000)
+  -- ohne form.clear (Seite laesst sich nicht neu aufbauen) die Hand-Felder immer zeigen
+  if hand or not form.clear then
+    local function man(label, k)
+      local ln = form.addLine(label)
+      return form.addSourceField(ln, nil, function() return w.man[k] end, function(v) w.man[k] = v; devApply(w) end)
+    end
+    local function manCh(label, k, list)
+      local ln = form.addLine(label)
+      return form.addChoiceField(ln, nil, list, function() return w.man[k] or 1 end, function(v) w.man[k] = v; devApply(w) end)
+    end
+    if not hand then form.addLine("  Quellen fuer Manuell:") end
+    man("Fahrt (Airspeed des Loggers, nicht Fahrt korr.)", "air")
+    manCh("Fahrt: Einheit", "airUnit", {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}})
+    manCh("Fahrt: Logger liefert", "airKind", {{"IAS (Normdichte)", 1}, {"TAS", 2}})
+    man("TEK-Vario des Loggers (nicht TEK korr.)", "vario")
+    man("GPS-Geschwindigkeit", "gpsSpd")
+    man("GPS-Position (fuer den Kurs)", "gps")
+    man("GPS-Kurs (nur ohne Position, nicht SM-Flugrichtung)", "gpsCrs")
+    man("Hoehe (Luftdichte)", "alt")
+    manCh("Hoehe ist", "altKind", {{"ueber Meer (GPS)", 1}, {"ueber Start + Platzhoehe", 2}})
+  end
+  addNumber(w, "Platzhoehe ue. M. (m, ohne Hoehe)", "fieldAlt", -400, 5000)
   addSource(w, "Motor (Gas oder Schalter)", "motor")
   addNumber(w, "Motor laeuft ueber", "motorThr", -1024, 1024)
   addChoice(w, "Motor am Vario erkennen (ab 8 m/s)", "motorAuto", {{"Ja", 1}, {"Nein", 2}})
@@ -1134,6 +1308,19 @@ local function setDefaults(w)
   for _, k in ipairs(EXTRA_SRC) do w[k] = nil end
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   for _, d in ipairs(EXTRA_NUM) do w[d.key] = d.def end
+  w.dev = 1
+end
+
+-- 1.5: Sensor-Wahl im Feld "tones" mitgespeichert (tones + 10 * (dev + 1)), nicht am Speicherende: dort
+-- gingen bei SkyNavigator am Sender Werte verloren. Fehlt sie (bis 1.4), gilt SM GPS-Logger 3.
+local function tonesIn(w, v)
+  if type(v) == "number" and v >= 10 and v < 40 then
+    w.dev = (math.floor(v / 10) - 1 == 0) and 0 or 1
+    v = v % 10
+  else
+    w.dev = 1
+  end
+  w.tones = (v == 1 or v == 2) and v or 1
 end
 
 local function read(w)
@@ -1143,7 +1330,8 @@ local function read(w)
     for _, k in ipairs(SOURCE_KEYS) do w[k] = validSource(storage.read(k)) end
     for _, d in ipairs(NUM_DEFS) do
       local v = storage.read(d.key)
-      w[d.key] = (type(v) == "number") and v or d.def
+      if d.key == "tones" then tonesIn(w, v)
+      else w[d.key] = (type(v) == "number") and v or d.def end
     end
     for _, k in ipairs(EXTRA_SRC) do w[k] = validSource(storage.read(k)) end
     for _, d in ipairs(EXTRA_NUM) do
@@ -1161,6 +1349,9 @@ local function read(w)
       end
     end
   end
+  devLoad(w)
+  w.found, w.devI, w.devNext = {}, 0, nil
+  devResolveAll(w)
   loadKorr(w)
   w.model = currentModelName()
   CFG = w
@@ -1169,8 +1360,14 @@ end
 
 local function write(w)
   storage.write("ver", STORE_VER)
-  for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
-  for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
+  local man = w.man or {}
+  for _, k in ipairs(SOURCE_KEYS) do storage.write(k, man[k]) end          -- Hand-Quellen (auch beim Logger behalten)
+  for _, d in ipairs(NUM_DEFS) do
+    local v = w[d.key]
+    if d.key == "tones" then v = (v or 1) + 10 * (((w.dev or 1) == 1 and 1 or 0) + 1)
+    elseif d.key == "airUnit" or d.key == "airKind" or d.key == "altKind" then v = man[d.key] or d.def end
+    storage.write(d.key, v)
+  end
   for _, k in ipairs(EXTRA_SRC) do storage.write(k, w[k]) end
   for _, d in ipairs(EXTRA_NUM) do storage.write(d.key, w[d.key]) end
   saveKorr(w)
