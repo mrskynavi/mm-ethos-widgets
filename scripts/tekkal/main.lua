@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.5
+-- @version 1.6
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -287,7 +287,7 @@ local function loadKorr(w) applyKorrNums(w, readKorr()) end
 
 -- Einstellungen aus der Datei, wenn kein Widget des aktiven Modells laeuft (alle 10 s neu gelesen)
 local function fileCfg(now, mname)
-  if FC and FC.model == mname and now - FC.t < 10 then return FC.cfg end
+  if FC and FC.model == mname and now - FC.t < 60 then return FC.cfg end      -- 1.6: 60 s statt 10 s (Datei + Quellensuche)
   local r = readKorr(mname)
   local cfg = nil
   if r then
@@ -666,6 +666,31 @@ local function measure(now)
   s.vario = vario
   local gs = speedMs(w.gpsSpd, 1, 2)                 -- GPS-Geschw.: ohne Einheit km/h
   s.gs = gs
+
+  -- 1.6 (Christoph 20.11.2026): Ohne Kalibrier-Widget auf einem Bildschirm laufen nur die Quellen "TEK korr." und
+  -- "Fahrt korr." (Werte aus korrektur_<Modell>.txt). Dann nur das Noetige rechnen: die volle Kalibrierung in jedem
+  -- Takt der Quellen kostete am Sender so viel Lua-Zeit, dass der Sinkton des Ethos-Varios hackte.
+  if w.fromFile then
+    s.gridAcc = s.gridAcc + dt
+    if s.gridAcc >= GRID then
+      s.gridAcc = s.gridAcc - GRID
+      if s.gridAcc > GRID then s.gridAcc = 0 end
+      if tas and vario then
+        local Es0 = s.Es
+        s.Es = lpf(s.Es, tas * tas / (2 * G), GRID, 0.25)
+        s.ri = s.ri % RING + 1
+        s.rDeS[s.ri] = Es0 and (s.Es - Es0) / GRID or 0
+      end
+    end
+    if vario then
+      local lag = clamp(w.tekLag or 0, 0, RING - 1)
+      local d = (s.ri > 0) and s.rDeS[(s.ri - lag - 1) % RING + 1] or nil
+      s.teKorr = vario + (w.tekX or 0) / 1000 * (d or 0)
+    else
+      s.teKorr = nil
+    end
+    return
+  end
 
   -- Kurs: aus den GPS-Positionen (ab 3 m Abstand). Eine Kurs-Quelle nur ohne Position (FrSky-GPS); die
   -- "Flugrichtung" des SM-Loggers ist kein Kurs ueber Grund.
