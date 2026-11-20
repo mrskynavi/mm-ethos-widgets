@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.44
+-- @version 1.45
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.44"
+local VERSION = "1.45"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3234,6 +3234,16 @@ function BAL.TM.wake(f, w)
   -- Zeichnen (Christoph 13.11.2026); der Takt lag bei rund 100 ms, davon 20 bis 27 ms Rechnen. Zum Eingrenzen
   -- rechnet das Widget wahlweise nur in jedem 2. oder 4. Aufruf voll; dazwischen schreibt es nur den Vario-Wert.
   T.wn = (T.wn or 0) + 1
+  -- 1.45 Testmodi (Christoph 20.11.2026: Sinkton hackt auch auf dem Hauptbildschirm mit jedem 4. Aufruf):
+  -- 4 = nur Vario-Sensor lesen und in "SkyNav Vario" schreiben, sonst nichts rechnen und nicht zeichnen;
+  -- 5 = fest -2.0 m/s schreiben. Klingt 4 sauber, liegt es an der Last; hackt auch 5, liegt es am Schreiben
+  -- des Sensors bzw. an Ethos selbst.
+  if w.calcIv == 4 or w.calcIv == 5 then
+    w.varioRaw = w.calcIv == 5 and -2 or (readNumber(w.vario) or 0)
+    BAL.VO.set(w, t, true)
+    T.add("l", os.clock() - t)
+    return
+  end
   local iv = BAL.TM.CV[w.calcIv or 1] or 1
   if iv > 1 and T.wn % iv ~= 0 then
     local s = w.voSens
@@ -5717,7 +5727,7 @@ local function configure(w)
   if w.vtDev == 2 then
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
-  addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}})
+  addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5}})
   addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
   for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
@@ -5837,7 +5847,7 @@ local function read(w)
     if type(p) == "number" and p >= 1000000 and p < 2000000 then    -- 1.39: dazu Rechentakt * 100000
       p = math.floor(p) - 1000000
       local c6 = math.floor(p / 100000) % 10
-      w.calcIv = (c6 >= 1 and c6 <= 3) and c6 or 1
+      w.calcIv = (c6 >= 1 and c6 <= 5) and c6 or 1
       p = p % 100000 + 100000
     end
     if type(p) == "number" and p >= 100000 and p < 200000 then
