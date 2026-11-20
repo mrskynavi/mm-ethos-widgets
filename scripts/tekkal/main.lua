@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.7.1
+-- @version 1.7.2
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -598,7 +598,7 @@ FIND = devFind
 -- Logger, Wert ganzzahlig in 0.01 m/s (unter Ethos 26 ueber value, wie bei SkyNavigator am Sender bestaetigt).
 local KS = {}
 local KS_DEF = {tek = {name = "TEK korr.", appId = 0x5FF1, dec = 2, lo = -20, hi = 20},
-  air = {name = "Fahrt korr.", appId = 0x5FF2, dec = 1, lo = 0, hi = 200}}
+  air = {name = "Fahrt korr.", appId = 0x5FF2, dec = 1, lo = 0, hi = 500}}
 local function ksGet(now, key, ref)
   local e = KS[key]
   if e and e.s then return e.s end
@@ -627,7 +627,20 @@ local function ksGet(now, key, ref)
   if not sn then return nil end
   local m = ref and srcCall(ref, "module")
   if type(m) == "number" and srcCall(sn, "module") ~= m then pcall(sn.module, sn, m) end
-  if UNIT_METER_PER_SECOND then pcall(sn.unit, sn, UNIT_METER_PER_SECOND); pcall(sn.protocolUnit, sn, UNIT_METER_PER_SECOND) end
+  -- 1.7.2: "Fahrt korr." in km/h (Christoph 20.11.2026), sofern Ethos eine km/h-Konstante hat; sonst m/s
+  local un, fac = UNIT_METER_PER_SECOND, 1
+  if key == "air" then
+    if kmhU == nil then
+      kmhU = false
+      for k, v in pairs(_G) do
+        if type(k) == "string" and k:sub(1, 5) == "UNIT_" and (k:find("KPH") or k:find("KMH") or k:find("KM_PER")
+          or k:find("KILOMETER_PER") or k:find("KMPH")) then kmhU = v; break end
+      end
+    end
+    if kmhU then un, fac = kmhU, 3.6 end
+  end
+  e.fac = fac
+  if un then pcall(sn.unit, sn, un); pcall(sn.protocolUnit, sn, un) end
   pcall(sn.protocolDecimals, sn, 2)
   pcall(sn.decimals, sn, D.dec)
   -- 1.7.1: Ein neuer DIY-Sensor hat den Bereich 0..10000, negative Werte kamen als 0 an (Christoph 20.11.2026)
@@ -650,7 +663,7 @@ local function ksStep(now)
   if not st or KS.lt == now then return end
   KS.lt = now
   if st.teKorr then local sn = ksGet(now, "tek", st.refSrc); if sn then ksWrite(sn, st.teKorr) end end
-  if st.airKorr then local sn = ksGet(now, "air", st.refSrc); if sn then ksWrite(sn, st.airKorr) end end
+  if st.airKorr then local sn = ksGet(now, "air", st.refSrc); if sn then ksWrite(sn, st.airKorr * (KS.air.fac or 1)) end end
 end
 
 -- wirksame Quellen und Einstellungen setzen
