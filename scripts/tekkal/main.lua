@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.4
+-- @version 1.5
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -70,10 +70,21 @@ local NUM_DEFS = {
 local VMG = {}
 function VMG.modul()
   if VMG.mod == nil then
-    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
-    local ok2, m = false, nil
-    if ok and f then ok2, m = pcall(f) end
-    VMG.mod = (ok2 and type(m) == "table") and m or false
+    -- Pfad mehrfach probieren; den Grund (VMG.err) merken, damit er im Widget sichtbar ist
+    local f, e = nil, nil
+    for _, p in ipairs({"/scripts/gemeinsam/vario.lua", "scripts/gemeinsam/vario.lua"}) do
+      local ok, r = pcall(loadScript, p)
+      if ok and r then f = r; break end
+      e = ok and "nil" or tostring(r)
+    end
+    if not f then
+      VMG.err = "laden: " .. tostring(e)
+      VMG.mod = false
+    else
+      local ok2, m = pcall(f)
+      if ok2 and type(m) == "table" then VMG.mod = m
+      else VMG.err = "ausfuehren: " .. tostring(m); VMG.mod = false end
+    end
   end
   return VMG.mod or nil
 end
@@ -888,7 +899,7 @@ local function paint(w)
   -- Status des gemeinsamen Eichmoduls (unten rechts): zeigt, ob scripts/gemeinsam/vario.lua geladen ist
   do
     local vm = VMG.modul()
-    local etxt = vm and string.format("Eichfaktor %.2f", (s.vst and vm.apply(s.vst, 1)) or 1) or "Eichmodul fehlt"
+    local etxt = vm and string.format("Eichfaktor %.2f", (s.vst and vm.apply(s.vst, 1)) or 1) or "Eichmodul: " .. string.sub(tostring(VMG.err), 1, 45)
     drawT(0, H - sH - 2, W - 4, etxt, FONT_XS, C.DIM, "r")
   end
 end
