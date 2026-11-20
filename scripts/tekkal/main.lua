@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.5
+-- @version 1.6
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -70,20 +70,18 @@ local NUM_DEFS = {
 local VMG = {}
 function VMG.modul()
   if VMG.mod == nil then
-    -- Pfad mehrfach probieren; den Grund (VMG.err) merken, damit er im Widget sichtbar ist
-    local f, e = nil, nil
-    for _, p in ipairs({"/scripts/gemeinsam/vario.lua", "scripts/gemeinsam/vario.lua"}) do
-      local ok, r = pcall(loadScript, p)
-      if ok and r then f = r; break end
-      e = ok and "nil" or tostring(r)
-    end
-    if not f then
-      VMG.err = "laden: " .. tostring(e)
-      VMG.mod = false
-    else
-      local ok2, m = pcall(f)
-      if ok2 and type(m) == "table" then VMG.mod = m
-      else VMG.err = "ausfuehren: " .. tostring(m); VMG.mod = false end
+    -- Mehrere Lade-Wege probieren (je nach Sender-Firmware fehlt mal loadScript, mal require); VMG.err = letzter Fehler
+    VMG.mod = false
+    local tries = {
+      function() return require("gemeinsam.vario") end,
+      function() return require("scripts.gemeinsam.vario") end,
+      function() local f = loadScript("/scripts/gemeinsam/vario.lua"); return f and f() end,
+      function() local f = loadScript("scripts/gemeinsam/vario.lua"); return f and f() end,
+    }
+    for _, t in ipairs(tries) do
+      local ok, m = pcall(t)
+      if ok and type(m) == "table" then VMG.mod = m; VMG.err = nil; break end
+      VMG.err = tostring(m)
     end
   end
   return VMG.mod or nil
