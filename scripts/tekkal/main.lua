@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.6.1
+-- @version 1.7
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -287,6 +287,7 @@ end
 local function loadKorr(w) applyKorrNums(w, readKorr()) end
 
 -- Einstellungen aus der Datei, wenn kein Widget des aktiven Modells laeuft (alle 10 s neu gelesen)
+local FIND = nil          -- 1.7: devFind (weiter unten definiert)
 local function fileCfg(now, mname)
   if FC and FC.model == mname and now - FC.t < 60 then return FC.cfg end      -- 1.6: 60 s statt 10 s (Datei + Quellensuche)
   local r = readKorr(mname)
@@ -301,6 +302,12 @@ local function fileCfg(now, mname)
       if n and n ~= "" and system and system.getSource then
         local ok, src = pcall(system.getSource, n)
         if ok then cfg[k] = validSource(src) end
+      end
+    end
+    -- 1.7: Logger-Sensoren, die per Namen nicht gefunden wurden (oder in der Datei fehlen), ueber die AppID suchen
+    if FIND then
+      for _, k in ipairs({"air", "vario", "gpsSpd", "gps", "alt"}) do
+        if not validSource(cfg[k]) then cfg[k] = FIND(k) end
       end
     end
   end
@@ -583,6 +590,65 @@ local function devFind(k)
   return nil
 end
 
+FIND = devFind
+
+-- 1.7 Telemetrie-Sensoren "TEK korr." und "Fahrt korr." (DIY, m/s), damit die korrigierten Werte ueberall am Sender
+-- waehlbar sind (Telemetrie-Seite, Vario abspielen, andere Widgets), auch ohne SkyNavigator und ohne dieses Widget
+-- auf dem Bildschirm (Christoph 20.11.2026). Angelegt beim ersten Mal (gesucht ueber die AppID), Modul wie der
+-- Logger, Wert ganzzahlig in 0.01 m/s (unter Ethos 26 ueber value, wie bei SkyNavigator am Sender bestaetigt).
+local KS = {}
+local KS_DEF = {tek = {name = "TEK korr.", appId = 0x5FF1, dec = 2}, air = {name = "Fahrt korr.", appId = 0x5FF2, dec = 1}}
+local function ksGet(now, key, ref)
+  local e = KS[key]
+  if e and e.s then return e.s end
+  if e and now - e.t < 10 then return nil end
+  e = {t = now}
+  KS[key] = e
+  local D = KS_DEF[key]
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local sn
+  if cat and system and system.getSource then
+    local ok, x = pcall(system.getSource, {category = cat, appId = D.appId})
+    if ok and isSet(x) then
+      local id = srcCall(x, "appId")
+      if id == nil or id == D.appId then sn = x end
+    end
+  end
+  if not sn and model and model.createSensor and rawget(_G, "SENSOR_TYPE_DIY") then
+    local ok, x = pcall(model.createSensor, {type = SENSOR_TYPE_DIY})
+    if ok and x then
+      sn = x
+      pcall(sn.name, sn, D.name)
+      pcall(sn.appId, sn, D.appId)
+      pcall(sn.physId, sn, 0)
+    end
+  end
+  if not sn then return nil end
+  local m = ref and srcCall(ref, "module")
+  if type(m) == "number" and srcCall(sn, "module") ~= m then pcall(sn.module, sn, m) end
+  if UNIT_METER_PER_SECOND then pcall(sn.unit, sn, UNIT_METER_PER_SECOND); pcall(sn.protocolUnit, sn, UNIT_METER_PER_SECOND) end
+  pcall(sn.protocolDecimals, sn, 2)
+  pcall(sn.decimals, sn, D.dec)
+  e.s = sn
+  return sn
+end
+local function ksWrite(sn, v)
+  if KS.raw == nil then
+    local ok, ver = pcall(system.getVersion)
+    local mj = ok and type(ver) == "table" and tonumber(ver.major) or 0
+    KS.raw = mj >= 26 and type(sn.rawValue) == "function"
+  end
+  local iv = math.floor(v * 100 + 0.5)
+  if KS.raw then pcall(sn.rawValue, sn, iv) else pcall(sn.value, sn, iv) end
+end
+local function ksStep(now)
+  local st = S
+  if not st or KS.lt == now then return end
+  KS.lt = now
+  if st.teKorr then local sn = ksGet(now, "tek", st.refSrc); if sn then ksWrite(sn, st.teKorr) end end
+  if st.airKorr then local sn = ksGet(now, "air", st.refSrc); if sn then ksWrite(sn, st.airKorr) end end
+end
+
 -- wirksame Quellen und Einstellungen setzen
 local function devApply(w)
   local man = w.man or {}
@@ -667,6 +733,7 @@ local function measure(now)
   s.airKorr = ias and ias * (w.airK or 1000) / 1000     -- Quelle "Fahrt korr." (IAS wie der Logger, in m/s)
   local vario = readNumber(w.vario)
   s.vario = vario
+  s.refSrc = w.vario or w.air
   local gs = speedMs(w.gpsSpd, 1, 2)                 -- GPS-Geschw.: ohne Einheit km/h
   s.gs = gs
 
@@ -1411,7 +1478,9 @@ local function srcInit(source)
 end
 
 local function srcWakeup(source)
-  measure(os.clock())
+  local now = os.clock()
+  measure(now)
+  ksStep(now)
   local v = S and S.teKorr
   source:value(v or 0)
 end
@@ -1423,7 +1492,9 @@ local function airInit(source)
 end
 
 local function airWakeup(source)
-  measure(os.clock())
+  local now = os.clock()
+  measure(now)
+  ksStep(now)
   local v = S and S.airKorr
   source:value(v or 0)
 end
