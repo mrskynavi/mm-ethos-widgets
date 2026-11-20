@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.43.1
+-- @version 1.44
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.43.1"
+local VERSION = "1.44"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1253,7 +1253,9 @@ end
 
 -- feld.lua (Systemtool) alle 3 s als Text vergleichen: nach dem Schliessen des Tools soll die Aufgabe gleich da sein
 function FELD.changed(w, now)
-  if w.feldT and now - w.feldT < (w.feldText == "" and 10 or 3) and now >= w.feldT then return false end
+  -- 1.44: im Flug nur jede Minute (jedes Oeffnen einer Datei haelt Ethos auf, Varioton stockt)
+  local iv = w.flying and 60 or (w.feldText == "" and 10 or 3)
+  if w.feldT and now - w.feldT < iv and now >= w.feldT then return false end
   w.feldT = now
   local text = ""
   for _, path in ipairs(FELD.paths) do
@@ -1279,7 +1281,7 @@ end
 
 local function refreshTasks(w, now, force)
   local feldNew = FELD.changed(w, now)
-  if not force and not feldNew and w.tasksT and now - w.tasksT < 20 and now >= w.tasksT then return end
+  if not force and not feldNew and w.tasksT and now - w.tasksT < (w.flying and 300 or 20) and now >= w.tasksT then return end
   w.tasksT = now
   local t = loadLuaTable(TASK_PATHS)
   local list = {}
@@ -1419,7 +1421,7 @@ local function refreshPolar(w, now, force)
     w.radiiDirty, w.radiiSaveT = false, now
     saveRadii(w)
   end
-  if not force and name == w.polarModel and w.polarT and now - w.polarT < 30 then return end
+  if not force and name == w.polarModel and w.polarT and now - w.polarT < (w.flying and 120 or 30) then return end
   w.polarModel, w.polarT = name, now
   local all = loadLuaTable(POLAR_PATHS)
   local e = all and findByName(all, name or "")
@@ -1668,6 +1670,11 @@ function BAL.SN.step(w, now)
   if not w.man or not BAL.SN.on(w) then return end
   if w.snNext and now < w.snNext then return end
   local i = (w.snI or 0) + 1
+  -- 1.44: im Flug nur fehlende Rollen suchen, ohne Korrektur-Datei (jede Suche und jedes Oeffnen haelt Ethos auf)
+  local fly = w.flying
+  if fly then
+    while BAL.SN.KEYS[i] and validSource(w[BAL.SN.KEYS[i]]) do i = i + 1 end
+  end
   local k = BAL.SN.KEYS[i]
   if not k then
     w.snI = 0
@@ -1675,11 +1682,11 @@ function BAL.SN.step(w, now)
     for _, kk in ipairs(BAL.SN.KEYS) do
       if BAL.SN.wanted(w, BAL.SN.ROLE[kk]) and not BAL.SN.isSet(w[kk]) then miss = true end
     end
-    w.snNext = now + (miss and 10 or 30)
+    w.snNext = now + (fly and 60 or (miss and 10 or 30))
     return
   end
   w.snFound, w.snKorrK = w.snFound or {}, w.snKorrK or {}
-  if i == 1 then w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false end
+  if i == 1 and not fly then w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false end
   BAL.SN.resolve(w, k)
   w.snI = i
 end
@@ -2517,6 +2524,10 @@ do -- eigener Block: das Hauptkapitel ist am Limit von 200 lokalen Variablen
 -- verfehlt sie den Sektor. 0 = jetzt; nil = auch 12 s geradeaus und dann wenden reicht nicht (Kurs korrigieren).
 -- Bogen in 15-Grad-Schritten bis 180 Grad, Kurvenbeginn per Halbierung (die Kurve wird mit spaeterem Beginn tiefer).
 -- Einmal pro GPS-Fix gerechnet.
+-- 1.44: cos/sin der 15-Grad-Schritte einmal vorgerechnet (am Sender kostet jeder Aufruf einer C-Funktion
+-- wie math.cos spuerbar Zeit; vorher bis rund 500 solche Aufrufe pro Fix)
+local HT_CA, HT_SA = {}, {}
+for k = 1, 12 do HT_CA[k], HT_SA[k] = math.cos(k * math.pi / 12), math.sin(k * math.pi / 12) end
 local function headingTurnT(w, g, f)
   local c = g.C and g.C[1]
   if not (c and c.tx and f and f.hdg) then return nil end
@@ -2528,16 +2539,19 @@ local function headingTurnT(w, g, f)
   local h0 = math.rad(f.hdg)
   local dep = (c.margin or w.margin) + 10
   local om = V / R
+  local ch0, sh0 = math.cos(h0), math.sin(h0)
   local function ok(t0)
     -- Kurvenbeginn nach t0 s geradeaus (Boden: Luft + Wind)
-    local sx, sy = f.x + (V * math.sin(h0) + wx) * t0, f.y + (V * math.cos(h0) + wy) * t0
+    local sx, sy = f.x + (V * sh0 + wx) * t0, f.y + (V * ch0 + wy) * t0
     for k = 1, 12 do
-      local a = k * math.rad(15)                                   -- gedrehter Winkel
+      local a = k * (math.pi / 12)                                 -- gedrehter Winkel
       local t = a / om
-      local h = h0 - s * a                                         -- Peilung: links = kleiner
+      -- Peilung h = h0 - s * a (links = kleiner), cos/sin per Additionstheorem (s = +-1)
+      local ca, sn = HT_CA[k], s * HT_SA[k]
+      local chh, shh = ch0 * ca + sh0 * sn, sh0 * ca - ch0 * sn
       -- Luftkreis: Versatz vom Kurvenbeginn = R * (Sehne), dazu Wind
-      local x = sx + s * R * (math.cos(h) - math.cos(h0)) + wx * t
-      local y = sy - s * R * (math.sin(h) - math.sin(h0)) + wy * t
+      local x = sx + s * R * (chh - ch0) + wx * t
+      local y = sy - s * R * (shh - sh0) + wy * t
       local rx, ry = x - c.tx, y - c.ty
       local d = rx * c.bx + ry * c.by
       if d >= dep and d * d >= 0.5 * (rx * rx + ry * ry) then return true end
@@ -3227,10 +3241,41 @@ function BAL.TM.wake(f, w)
     T.add("l", os.clock() - t)
     return
   end
+  -- 1.44: einmal nach ~20 s ein Kurztest statt der Rechnung: was kostet am Sender ein Lua-Schritt, ein Aufruf
+  -- von math.floor, os.clock und ein Sensor-Wert (Mikrosekunden, Anzeige in der Konfiguration)
+  if not T.B and T.wn >= 200 then T.bench(w); T.add("l", os.clock() - t); return end
+  T.mk = t
   f(w)
   local t2 = os.clock()
   T.add("w", t2 - t)
   if not T.t0 then T.t0 = t2 elseif t2 - T.t0 >= 10 then T.r, T.c, T.t0 = T.c, {}, t2 end
+end
+-- Zeit seit der letzten Marke unter Schluessel k (Teile der Rechnung im wakeup)
+function BAL.TM.mark(k)
+  local T = BAL.TM
+  local t = os.clock()
+  if T.mk then T.add(k, t - T.mk) end
+  T.mk = t
+end
+function BAL.TM.bench(w)
+  local N, c, fl = 300, os.clock, math.floor
+  local x = 1.7
+  local t0 = c()
+  for _ = 1, N do x = x + 0.001 end
+  local t1 = c()
+  for _ = 1, N do x = fl(x) + 0.7 end
+  local t2 = c()
+  for _ = 1, N do x = (x // 1 | 0) + 0.7 end
+  local t3 = c()
+  for _ = 1, N do c() end
+  local t4 = c()
+  local s, ts = w.vario or w.gps, nil
+  if s and type(s) ~= "boolean" then
+    local a = c()
+    for _ = 1, 50 do pcall(s.value, s) end
+    ts = (c() - a) / 50
+  end
+  BAL.TM.B = {(t1 - t0) / N, (t2 - t1) / N, (t3 - t2) / N, (t4 - t3) / N, ts}
 end
 -- 1.39: Am Sender (X20, Ethos 1.6.8) braucht ein Bild rund 125 ms, das Rechnen nur 20 bis 27 ms (Christoph
 -- 13.11.2026). Darum misst jedes 4. Bild zusaetzlich jeden Zeichenbefehl einzeln (lcd ueber einen Zaehler
@@ -3276,6 +3321,19 @@ function BAL.TM.info()
   end
   local g = r.g
   if g and g.n > 0 then t[#t + 1] = string.format("Takt min %.0f, >80ms %d%%", (g.lo or 0) * 1000, math.floor((g.hi or 0) / g.n * 100 + 0.5)) end
+  -- Teile der Rechnung (1.44): Mittel/Max in ms
+  local parts = {}
+  for _, d in ipairs({{"d", "Dat"}, {"s", "Sens"}, {"e", "Wert"}, {"c", "Rech"}, {"t", "Ton"}}) do
+    local e = r[d[1]]
+    if e and e.n > 0 then parts[#parts + 1] = string.format("%s %.0f/%.0f", d[2], e.s / e.n * 1000, e.m * 1000) end
+  end
+  if #parts > 0 then t[#t + 1] = table.concat(parts, " ", 1, math.min(3, #parts)) end
+  if #parts > 3 then t[#t + 1] = table.concat(parts, " ", 4) end
+  local B = BAL.TM.B
+  if B then
+    t[#t + 1] = string.format("Test us: Lua %.1f floor %.1f //1 %.1f", B[1] * 1e6, B[2] * 1e6, B[3] * 1e6)
+    t[#t + 1] = string.format("Test us: clock %.1f Sensor %s", B[4] * 1e6, B[5] and string.format("%.0f", B[5] * 1e6) or "-")
+  end
   -- Zeichenbefehle: Mittel pro Bild (ms) und Anzahl pro Bild, seit dem Einschalten
   local L, n = BAL.TM.L, BAL.TM.Ln or 0
   if L and n > 0 then
@@ -3571,7 +3629,8 @@ local PAGE_SW = {"swOver", "swStart", "swGlide", "swTherm", "swEval"}
 local function pageFromSwitch(w, now)
   w.swState = w.swState or {}
   local any = false
-  for p, key in ipairs(PAGE_SW) do
+  for p = 1, #PAGE_SW do                                   -- Zahlen-Schleife: ipairs ruft pro Schritt eine C-Funktion
+    local key = PAGE_SW[p]
     if validSource(w[key]) then
       any = true
       local on = (readNumber(w[key]) or -1024) > 0
@@ -3652,6 +3711,7 @@ local function wakeup(w)
   if dt > 0.5 then dt = 0.5 end
   refreshTasks(w, now, false)
   refreshPolar(w, now, false)
+  BAL.TM.mark("d")
   -- Ballast: in 0.1 kg, mit Hysterese gegen Poti-Rauschen; eine Aenderung faerbt die Kopfzeile 3 s orange
   local bk, bfr = BAL.now(w)
   w.balFr = bfr
@@ -3684,6 +3744,7 @@ local function wakeup(w)
   BAL.AS.read(w, now, dt)
   BAL.QL.read(w, now, dt)
   BAL.QA.step(w, now, dt)
+  BAL.TM.mark("s")
   if w.qlPress and now - w.qlPress >= 2 then
     w.qlPress = nil
     if BAL.QL.zero(w) then tone(w, nil, 2000, 150); note(w, "Querlage genullt", now) end
@@ -3704,6 +3765,7 @@ local function wakeup(w)
   if w.igc and (now - (w.igc.lastFlush or 0) >= 5) then w.igc.lastFlush = now; igcFlush(w) end
   if w.closeAt and now >= w.closeAt then w.closeAt = nil; igcClose(w) end
   igcStep(w)
+  BAL.TM.mark("e")
 
   w.page = pageFromSwitch(w, now)
   -- Schwere Rechnung nur bei neuem GPS-Fix (oder Seitenwechsel) und nur fuer die sichtbare Seite.
@@ -3737,6 +3799,7 @@ local function wakeup(w)
     w.gc = glideCalc(w, cur, pg == P_GLIDE or pg == P_OVER or pg == P_START or near)
   end
   thermCalc(w, cur, now, dt)
+  BAL.TM.mark("c")
 
   -- Ereignistoene. Start, Sektor und Ziel (Linie bzw. Sektor erreicht) immer, auf jeder Seite und auch bei
   -- verstecktem Widget; Scharf (PEV) und Stopp nur auf der passenden Seite, ausser "Ereignisse immer melden".
@@ -3783,11 +3846,24 @@ local function wakeup(w)
     w.lastInvalidate = now
     lcd.invalidate()
   end
+  BAL.TM.mark("t")
 end
 
 -- ---------------------------------------------------------------- Zeichnen
 
-local function rgb(r, g, b) return lcd.RGB(r, g, b) end
+-- 1.44 (Varioton, Christoph 20.11.2026): Am Sender kostet jeder Aufruf einer Ethos- oder C-Funktion rund 0.2 ms
+-- (Messung pro Zeichenbefehl: color, font, getTextSize, drawLine je ~0.19 ms), ein Bild mit ~560 solchen Aufrufen
+-- blockiert Ethos ~145 ms und der Sinkton des Ethos-Varios stockt. Darum: Farben einmal rechnen, Farbe und Schrift
+-- nur setzen, wenn sie wechseln, Schrifthoehen merken, Runden ohne math.floor ((v + 0.5) // 1 | 0 ist reiner Lua-Code).
+local DRW = {rgb = {}, th = {}}
+local function rgb(r, g, b)
+  local k = r * 65536 + g * 256 + b
+  local c = DRW.rgb[k]
+  if c == nil then c = lcd.RGB(r, g, b); DRW.rgb[k] = c end
+  return c
+end
+function DRW.color(c) if c ~= DRW.c then DRW.c = c; lcd.color(c) end end
+function DRW.font(f) if f ~= DRW.f then DRW.f = f; lcd.font(f) end end
 local F_L, F_XL = FONT_L, FONT_XL      -- grosse Werte, auf kleinen Bildschirmen eine Stufe kleiner
 local SMALL = false                    -- kleiner Bildschirm (X18 und kleiner): kurze Beschriftungen
 local C_BG, C_DIM, C_WHITE, C_GREEN, C_ORANGE, C_RED, C_BLUE, C_YELLOW, C_GRID
@@ -3797,10 +3873,9 @@ local function colors()
   C_BLUE, C_YELLOW, C_GRID = rgb(0, 170, 255), rgb(255, 230, 0), rgb(55, 55, 55)
 end
 
-local function fl(v) return math.floor(v + 0.5) end
+local function fl(v) return (v + 0.5) // 1 | 0 end
 -- Linien in Kartenansichten werden auf den Kasten CLIP beschnitten (Liang-Barsky)
 local CLIP = nil
-local floor = math.floor
 local function line(x1, y1, x2, y2)
   local C = CLIP
   if C then
@@ -3826,10 +3901,13 @@ local function line(x1, y1, x2, y2)
       x1, y1, x2, y2 = x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy
     end
   end
-  lcd.drawLine(floor(x1 + 0.5), floor(y1 + 0.5), floor(x2 + 0.5), floor(y2 + 0.5))
+  lcd.drawLine((x1 + 0.5) // 1 | 0, (y1 + 0.5) // 1 | 0, (x2 + 0.5) // 1 | 0, (y2 + 0.5) // 1 | 0)
 end
 local function inClip(x, y) return not CLIP or (x >= CLIP[1] and x <= CLIP[3] and y >= CLIP[2] and y <= CLIP[4]) end
-local function rect(x, y, w, h) lcd.drawFilledRectangle(fl(x), fl(y), math.max(fl(w), 1), math.max(fl(h), 1)) end
+local function rect(x, y, w, h)
+  w, h = (w + 0.5) // 1 | 0, (h + 0.5) // 1 | 0
+  lcd.drawFilledRectangle((x + 0.5) // 1 | 0, (y + 0.5) // 1 | 0, w < 1 and 1 or w, h < 1 and 1 or h)
+end
 local function disc(x, y, r) lcd.drawFilledCircle(fl(x), fl(y), fl(r)) end
 local function ring(x, y, r) lcd.drawCircle(fl(x), fl(y), fl(r)) end
 local function tri(x1, y1, x2, y2, x3, y3) lcd.drawFilledTriangle(fl(x1), fl(y1), fl(x2), fl(y2), fl(x3), fl(y3)) end
@@ -3848,21 +3926,27 @@ local function polyAff(pts, ox, ax, ay, oy, bx, by)
   end
 end
 
-local function drawT(x, y, boxW, str, font, color, align)
-  lcd.font(font)
-  lcd.color(color)
-  local tw, th = lcd.getTextSize(str)
+local function textH(font)
+  local th = DRW.th[font]
+  if not th then
+    DRW.font(font)
+    local _w; _w, th = lcd.getTextSize("0")
+    DRW.th[font] = th
+  end
+  return th
+end
+
+-- needW: Breite auch bei Ausrichtung links liefern (sonst nil, spart getTextSize)
+local function drawT(x, y, boxW, str, font, color, align, needW)
+  DRW.font(font)
+  DRW.color(color)
+  local tw, th
+  if align == "c" or align == "r" or needW then tw, th = lcd.getTextSize(str) else th = textH(font) end
   local px = x
   if align == "c" then px = x + (boxW - tw) / 2
   elseif align == "r" then px = x + boxW - tw end
-  lcd.drawText(fl(px), fl(y), str)
+  lcd.drawText((px + 0.5) // 1 | 0, (y + 0.5) // 1 | 0, str)
   return th, tw
-end
-
-local function textH(font)
-  lcd.font(font)
-  local _, th = lcd.getTextSize("0")
-  return th
 end
 
 
@@ -3885,7 +3969,7 @@ local function arrow(x, y, ux, uy, L, sw, hw)
 end
 
 local function planeSymbol(cx, cy, size, color)
-  lcd.color(color)
+  DRW.color(color)
   tri(math.floor(cx), math.floor(cy - size), math.floor(cx - size * 0.7), math.floor(cy + size * 0.7),
     math.floor(cx + size * 0.7), math.floor(cy + size * 0.7))
 end
@@ -3898,7 +3982,7 @@ local function flatXY(T, x, y) return x * T.ux + y * T.uy, -(x * T.px + y * T.py
 local function planeFlat(T, px, py, crs, s, color)
   local hx, hy = flatXY(T, dirVec(crs or T.dir))
   local nx, ny = -hy, hx
-  lcd.color(color)
+  DRW.color(color)
   tri(px + hx * s, py + hy * s, px - hx * s * 0.7 + nx * s * 0.7, py - hy * s * 0.7 + ny * s * 0.7,
     px - hx * s * 0.7 - nx * s * 0.7, py - hy * s * 0.7 - ny * s * 0.7)
 end
@@ -3914,7 +3998,7 @@ local function predFlat(P, f, color, w)
   local ae, an = f.ve - wx, f.vn - wy
   local x, y = f.x, f.y
   local ax, ay = P(x, y)
-  lcd.color(color)
+  DRW.color(color)
   local N, dt = PRED_S * 2, 0.5
   for k = 1, N do
     local a = om * (k - 0.5) * dt                                   -- Kurs in der Mitte des Schritts
@@ -3934,7 +4018,7 @@ local function windFlat(w, T, wx0, wy0, x0)
   if not w.windOk then return end
   local sx, sy = flatXY(T, w.wx, w.wy)
   local n = math.sqrt(sx * sx + sy * sy)
-  lcd.color(C_BLUE)
+  DRW.color(C_BLUE)
   if n > 0.3 then arrow(wx0 - sx / n * 16, wy0 - sy / n * 16, sx / n, sy / n, 32, 4, 8) end
   drawT(x0, wy0 - math.floor(textH(FONT_S) / 2), wx0 - 22 - x0, string.format("%d km/h", math.floor(n * KMH + 0.5)), FONT_S, C_BLUE, "r")
 end
@@ -3972,7 +4056,7 @@ end
 
 local function header(w, W)
   local th = math.max(textH(FONT_S), textH(FONT_STD))
-  lcd.color(rgb(25, 25, 25))
+  DRW.color(rgb(25, 25, 25))
   rect(0, 0, W, th + 4)
   -- Status rechts: Zustand, Uhr
   local st, col = "BEREIT", C_DIM
@@ -4007,14 +4091,14 @@ local function header(w, W)
   if rest then
     local rc = not running and C_DIM or (rest < 120 and C_RED or (rest < 300 and C_ORANGE or C_WHITE))
     if rest < 0 then rest = 0 end
-    _, restW = drawT(6, 1, W * 0.5, "REST " .. fmtMS(rest), FONT_STD, rc, "l")
+    _, restW = drawT(6, 1, W * 0.5, "REST " .. fmtMS(rest), FONT_STD, rc, "l", true)
   end
   -- Ballast und Fluggewicht in der Mitte
   local bt, bc, bg = BAL.label(w)
   if bt then
     local gap = SMALL and 8 or 16
     local x0, x1 = 6 + restW + gap, W - 6 - stW - gap
-    lcd.font(FONT_S)
+    DRW.font(FONT_S)
     local barW = fl(th * 1.4)
     local txt
     for _, t in ipairs(bt) do
@@ -4025,9 +4109,9 @@ local function header(w, W)
       local tw = lcd.getTextSize(txt)
       local bw = tw + (w.balFr and barW + 6 or 0)
       local bx = x0 + (x1 - x0 - bw) / 2
-      if bg then lcd.color(bg); rect(bx - 6, 0, bw + 12, th + 4) end
+      if bg then DRW.color(bg); rect(bx - 6, 0, bw + 12, th + 4) end
       if w.balFr then
-        lcd.color(bc)
+        DRW.color(bc)
         local by, bh = 2 + th * 0.25, th * 0.5
         rect(bx, by, barW, 1); rect(bx, by + bh - 1, barW, 1); rect(bx, by, 1, bh); rect(bx + barW - 1, by, 1, bh)
         if w.balFr > 0 then rect(bx + 2, by + 2, (barW - 4) * w.balFr, bh - 4) end
@@ -4043,13 +4127,13 @@ end
 local function tabBar(w, W, H)
   local tb = textH(FONT_S) + 8
   local y0 = H - tb
-  lcd.color(rgb(25, 25, 25))
+  DRW.color(rgb(25, 25, 25))
   rect(0, y0, W, tb)
   local NP = #PAGE_NAMES
   local tabW = math.floor(W / NP)
   for i = 1, NP do
     local on = (i == w.page)
-    if on then lcd.color(rgb(0, 90, 160)); rect((i - 1) * tabW, y0, tabW - 2, tb) end
+    if on then DRW.color(rgb(0, 90, 160)); rect((i - 1) * tabW, y0, tabW - 2, tb) end
     drawT((i - 1) * tabW, y0 + 4, tabW - 2, (W < 600 and PAGE_SHORT or PAGE_NAMES)[i], FONT_S, on and C_WHITE or C_DIM, "c")
   end
   w.hdrBox = {x = 0, y = y0, w = tabW * NP, h = tb}
@@ -4064,7 +4148,7 @@ local function footerMsg(w, W, H, now)
   if w.missTP and w.state == S_STARTED then msg = string.format("TP%d VERPASST - ZURÜCK IN DEN SEKTOR", w.missTP) end
   if msg then
     local h = textH(FONT_S) + 4
-    lcd.color(rgb(120, 0, 0))
+    DRW.color(rgb(120, 0, 0))
     rect(0, H - h, W, h)
     drawT(0, H - h + 2, W, msg, FONT_S, C_WHITE, "c")
   end
@@ -4086,7 +4170,7 @@ local function fillSector(P, c, bd, x0, y0, bw, bh)
     if a * bxs + b * bys + k < 0 then a, b, k = -a, -b, -k end
     HP[#HP + 1] = {a, b, k}
   end
-  lcd.color(rgb(0, 55, 25))
+  DRW.color(rgb(0, 55, 25))
   fillHP(HP, x0, y0, bw, bh)
 end
 
@@ -4159,8 +4243,8 @@ local function drawZones(w, T, P, x0, y0, bw, bh)
         poly[#poly + 1] = zx + r * math.cos(a)
         poly[#poly + 1] = zy + r * math.sin(a)
       end
-      if hot then lcd.color(rgb(120, 20, 20)); fillPoly(poly, x0, y0, bw, bh) end
-      lcd.color(rgb(230, 60, 60))
+      if hot then DRW.color(rgb(120, 20, 20)); fillPoly(poly, x0, y0, bw, bh) end
+      DRW.color(rgb(230, 60, 60))
       for k = 1, n do
         local j = k % n + 1
         line(poly[2 * k - 1], poly[2 * k], poly[2 * j - 1], poly[2 * j])
@@ -4185,10 +4269,10 @@ local function drawZones(w, T, P, x0, y0, bw, bh)
           if a * mxs + b * mys + kk < 0 then a, b, kk = -a, -b, -kk end
           HP[#HP + 1] = {a, b, kk}
         end
-        lcd.color(rgb(120, 20, 20))
+        DRW.color(rgb(120, 20, 20))
         fillHP(HP, x0, y0, bw, bh)
       end
-      lcd.color(rgb(230, 60, 60))
+      DRW.color(rgb(230, 60, 60))
       for k = 1, 4 do local a1, a2 = c[k], c[k % 4 + 1]; line(a1[1], a1[2], a2[1], a2[2]) end
     end
   end
@@ -4205,10 +4289,10 @@ function lapRoute(w, T)
   -- nur neu rechnen, wenn sich Wind (1 m/s), Fahrt (2 m/s), Radien oder Aufgabe merklich aendern
   local wx, wy = w.windOk and w.wx or 0, w.windOk and w.wy or 0
   local V = w.tasF or 20
-  local key = string.format("%d %d %d %.0f %.0f %.0f %s %d", floor(wx + 0.5), floor(wy + 0.5), floor(V / 2 + 0.5),
+  local key = string.format("%d %d %d %.0f %.0f %.0f %s %d", math.floor(wx + 0.5), math.floor(wy + 0.5), math.floor(V / 2 + 0.5),
     radius(w, 1), radius(w, 2), radius(w, 3), tostring(T), w.margin)
   if not w.ovPlan or w.ovPlanKey ~= key then
-    local pr = planPath(0, 0, floor(wx + 0.5), floor(wy + 0.5), floor(V / 2 + 0.5) * 2, radius(w, 1), cornersFrom(T, 1, 4, radiusFn(w), w.margin))
+    local pr = planPath(0, 0, math.floor(wx + 0.5), math.floor(wy + 0.5), math.floor(V / 2 + 0.5) * 2, radius(w, 1), cornersFrom(T, 1, 4, radiusFn(w), w.margin))
     local pts = {}
     for k = 2, #(pr.pts or {}) do pts[#pts + 1] = pr.pts[k] end
     w.ovPlan, w.ovPlanKey = pts, key
@@ -4223,7 +4307,7 @@ local function paintOver(w, W, H, top)
   local mw = SMALL and (W - 2 * m) or math.floor(W * 0.64)
   local mh = H - y - m
   local mx0 = m
-  lcd.color(rgb(15, 15, 15))
+  DRW.color(rgb(15, 15, 15))
   rect(mx0, y, mw, mh)
   if not T then
     drawT(mx0, y + mh / 2 - 10, mw, "Keine Aufgabe", FONT_L, C_RED, "c")
@@ -4259,7 +4343,7 @@ local function paintOver(w, W, H, top)
     local a, b = -(by - ay), bx - ax
     local k = -(a * ax + b * ay)
     if a * tx + b * ty + k < 0 then a, b, k = -a, -b, -k end
-    lcd.color(rgb(60, 14, 14))
+    DRW.color(rgb(60, 14, 14))
     fillHP({{a, b, k}}, mx0, y, mw, mh)
   elseif w.state == S_STARTED and ni <= 3 then
     fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
@@ -4269,7 +4353,7 @@ local function paintOver(w, W, H, top)
   for i = 1, 3 do
     local c = T.tp[i]
     local bd = bearingOf(c.bx, c.by)
-    lcd.color((w.state == S_STARTED and i == ni) and rgb(0, 140, 60) or rgb(0, 70, 35))
+    DRW.color((w.state == S_STARTED and i == ni) and rgb(0, 140, 60) or rgb(0, 70, 35))
     for _, off in ipairs({-45, 45}) do
       local ex, ey = dirVec(bd + off)
       local ax, ay = P(c.x, c.y)
@@ -4277,7 +4361,7 @@ local function paintOver(w, W, H, top)
       line(ax, ay, bx, by)
     end
   end
-  lcd.color(rgb(90, 90, 90))
+  DRW.color(rgb(90, 90, 90))
   for i = 1, 3 do
     local a, b = T.tp[i], T.tp[i % 3 + 1]
     local ax, ay = P(a.x, a.y)
@@ -4288,7 +4372,7 @@ local function paintOver(w, W, H, top)
   local lineNext = before or (w.state == S_STARTED and ni > 3)
   local l1x, l1y = P(T.px * LINE_HALF, T.py * LINE_HALF)
   local l2x, l2y = P(-T.px * LINE_HALF, -T.py * LINE_HALF)
-  lcd.color(lineNext and C_YELLOW or rgb(140, 125, 0))
+  DRW.color(lineNext and C_YELLOW or rgb(140, 125, 0))
   line(l1x, l1y, l2x, l2y)
   if lineNext then line(l1x, l1y + 1, l2x, l2y + 1) end
   -- Optimale Route (blau) wie in der Eckansicht: in der Aufgabe vom Modell ueber die naechsten Ecken,
@@ -4299,7 +4383,7 @@ local function paintOver(w, W, H, top)
     route = lapRoute(w, T)
   end
   if route then
-    lcd.color(C_BLUE)
+    DRW.color(C_BLUE)
     polyAff(route, cx - ccx * sc, T.ux * sc, T.uy * sc, cy - ccy * sc, -T.px * sc, -T.py * sc)
   end
   -- Flugweg: vor dem Start grau, in der Aufgabe weiss. Die Bildpunkte werden zwischengespeichert (der Massstab
@@ -4346,7 +4430,7 @@ local function paintOver(w, W, H, top)
   if lim > 0 then
     local lastOn
     for k = 2, n do
-      if on[k] ~= lastOn then lastOn = on[k]; lcd.color(on[k] and C_WHITE or rgb(100, 100, 100)) end
+      if on[k] ~= lastOn then lastOn = on[k]; DRW.color(on[k] and C_WHITE or rgb(100, 100, 100)) end
       line(xs[k - 1], ys[k - 1], xs[k], ys[k])
     end
     -- das juengste Stueck bis zur aktuellen Position
@@ -4359,7 +4443,7 @@ local function paintOver(w, W, H, top)
   for _, mk in ipairs(w.marks or {}) do
     local ax, ay = P(mk.x, mk.y)
     if inClip(ax, ay) then
-      lcd.color(mk.k == "STA" and C_YELLOW or (mk.k == "TPC" and C_GREEN or C_BLUE))
+      DRW.color(mk.k == "STA" and C_YELLOW or (mk.k == "TPC" and C_GREEN or C_BLUE))
       disc(ax, ay, 3)
     end
   end
@@ -4370,7 +4454,7 @@ local function paintOver(w, W, H, top)
       local nextOne = w.state == S_STARTED and i == ni
       local done = w.state == S_STARTED and i < ni
       local col = nextOne and C_GREEN or (done and rgb(0, 120, 50) or C_DIM)
-      lcd.color(col)
+      DRW.color(col)
       disc(tx, ty, nextOne and 5 or 3)
       drawT(tx + 7, ty - 7, 60, "TP" .. i, FONT_XS, col, "l")
     end
@@ -4465,12 +4549,12 @@ local function paintStart(w, W, H, top)
   -- Draufsicht im festen Kartenbild (Hypotenuse waagrecht): Linie senkrecht, Startsektor (TP3-Seite) links,
   -- TP1-Seite rechts, TP2 oben
   local cx, cy = m + mapW * 0.6, y + mapH * 0.7
-  lcd.color(rgb(20, 20, 20))
+  DRW.color(rgb(20, 20, 20))
   rect(m, y, mapW, mapH)
   -- Vor dem Start: TP1-Seite der Linie ist die falsche Seite (rot)
   local before = w.state ~= S_STARTED and w.state ~= S_STOPPED
   if before then
-    lcd.color(rgb(60, 14, 14))
+    DRW.color(rgb(60, 14, 14))
     rect(math.floor(cx), y, math.max(1, math.floor(m + mapW - cx)), mapH)
   end
   -- fester Massstab aus der App: startSpan Meter von der Linie bis zum linken Rand (Modell weiter weg bleibt am Rand)
@@ -4479,23 +4563,23 @@ local function paintStart(w, W, H, top)
   if T then
     drawZones(w, T, function(x, yv) local a, b = flatXY(T, x, yv); return cx + a * scale, cy + b * scale end, m, y, mapW, mapH)
     local d = T.dist * scale
-    lcd.color(C_GRID)
+    DRW.color(C_GRID)
     line(cx - d, cy, cx + d, cy)
     line(cx - d, cy, cx, cy - d)
     line(cx, cy - d, cx + d, cy)
     -- optimale Runde (blau): zeigt vor dem Start, wo man von TP3 her durch die Linie zu TP1 fliegt
     local route = before and lapRoute(w, T) or (w.gc and w.gc.plan and w.gc.plan.pts)
     if route then
-      lcd.color(C_BLUE)
+      DRW.color(C_BLUE)
       polyAff(route, cx, T.ux * scale, T.uy * scale, cy, -T.px * scale, -T.py * scale)
     end
   end
   -- Linie +-2 km
-  lcd.color(C_YELLOW)
+  DRW.color(C_YELLOW)
   line(cx, cy - LINE_HALF * scale, cx, cy + LINE_HALF * scale)
   line(cx + 1, cy - LINE_HALF * scale, cx + 1, cy + LINE_HALF * scale)
   CLIP = nil
-  lcd.color(C_WHITE)
+  DRW.color(C_WHITE)
   disc(math.floor(cx), math.floor(cy), 3)
   drawT(math.floor(cx) + 4, y + 2, mapW, "Linie", FONT_XS, C_YELLOW, "l")
   drawT(m + 2, y + 2, mapW, "Start >", FONT_XS, C_DIM, "l")
@@ -4517,7 +4601,7 @@ local function paintStart(w, W, H, top)
       if tNow - (p.t or 0) >= 90 then break end
       local ax, ay = cx + p.x * ux + p.y * uy, cy - p.x * qx - p.y * qy
       if ax >= x0 and ax <= x1 and ay >= y0 and ay <= y1 then
-        lcd.color(p.on and C_WHITE or C_DIM); rect(math.floor(ax) - 1, math.floor(ay) - 1, 2, 2)
+        DRW.color(p.on and C_WHITE or C_DIM); rect(math.floor(ax) - 1, math.floor(ay) - 1, 2, 2)
       end
     end
     CLIP = nil
@@ -4528,7 +4612,7 @@ local function paintStart(w, W, H, top)
     -- Projektion zur Linie
     if c.predLat then
       local qy = clamp(cy - c.predLat * scale, y + 2, y + mapH - 2)
-      lcd.color(math.abs(c.predLat) <= LINE_HALF and C_GREEN or C_RED)
+      DRW.color(math.abs(c.predLat) <= LINE_HALF and C_GREEN or C_RED)
       line(px, py, cx, qy)
       disc(math.floor(cx), math.floor(qy), 4)
     end
@@ -4547,7 +4631,7 @@ local function paintStart(w, W, H, top)
   -- Zu tief: Pfeil von unten nach oben (steigen/weniger sinken), zu hoch: Pfeil von oben nach unten.
   local px0 = m * 2 + mapW
   local profW = math.floor(W * 0.24)
-  lcd.color(rgb(20, 20, 20))
+  DRW.color(rgb(20, 20, 20))
   rect(px0, y, profW, mapH)
   if T then
     local FS = 50
@@ -4558,13 +4642,13 @@ local function paintStart(w, W, H, top)
     local k = (gh / 2 - 2) / FS
     local half = w.winLo / 2
     -- Fensterband und Mittellinie
-    lcd.color(rgb(0, 70, 30))
+    DRW.color(rgb(0, 70, 30))
     local bh = math.max(2, math.floor(half * k))
     rect(px0 + 4, gcy - bh, profW - 8, 2 * bh)
-    lcd.color(C_GREEN)
+    DRW.color(C_GREEN)
     line(px0 + 4, gcy, px0 + profW - 4, gcy)
     -- Teilstriche alle 10 m
-    lcd.color(C_GRID)
+    DRW.color(C_GRID)
     for d = -FS, FS, 10 do
       if d ~= 0 then
         local ty = math.floor(gcy - d * k)
@@ -4580,7 +4664,7 @@ local function paintStart(w, W, H, top)
       local aw = math.floor(profW * 0.28)
       local fV = SMALL and FONT_STD or FONT_L
       if math.abs(e) <= half then
-        lcd.color(C_GREEN)
+        DRW.color(C_GREEN)
         disc(gcx, math.floor(gcy - clamp(e, -FS, FS) * k), math.max(5, math.floor(profW / 10)))
         drawT(px0, gy0 + gh - textH(FONT_S) - 2, profW, "IM FENSTER", FONT_S, C_GREEN, "c")
       else
@@ -4592,7 +4676,7 @@ local function paintStart(w, W, H, top)
         local tailY = math.floor(gcy + dir * (bh + clamp(over, 5, FS) * k))
         local sw = math.max(2, math.floor(aw / 4))
         local hh = math.max(6, math.floor(aw * 0.7))
-        lcd.color(col)
+        DRW.color(col)
         if math.abs(tailY - tipY) > hh then
           local sy = tipY + dir * hh
           local ty0, ty1 = math.min(sy, tailY), math.max(sy, tailY)
@@ -4659,7 +4743,7 @@ local function paintStart(w, W, H, top)
       txt = (w.rsArm and os.clock() - w.rsArm < (w.rsWin or 4)) and "NOCHMAL = NEUER FLUG" or "NEUSTART (2x tippen/schalten)"
     end
     w.armBox = {x = rx, y = yy, w = rw, h = textH(bf) + 8}
-    lcd.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
+    DRW.color((canRestart and w.badEntry) and rgb(110, 70, 0) or rgb(70, 50, 0))
     rect(rx, yy, rw, w.armBox.h)
     drawT(rx, yy + 4, rw, txt, bf, C_ORANGE, "c")
     yy = yy + w.armBox.h + 6
@@ -4668,7 +4752,7 @@ local function paintStart(w, W, H, top)
   if w.qlRaw and not w.flying and (not f or (f.gs or 0) < 2) and w.state ~= S_STARTED then
     local h = textH(FONT_S) + 8
     w.qlBox = {x = rx, y = yy, w = rw, h = h}
-    lcd.color(w.qlPress and rgb(0, 70, 30) or rgb(40, 40, 40))
+    DRW.color(w.qlPress and rgb(0, 70, 30) or rgb(40, 40, 40))
     rect(rx, yy, rw, h)
     drawT(rx, yy + 4, rw, string.format("QL %+.0f°  (2 s drücken = nullen)", w.qlPhi or 0), FONT_S, C_WHITE, "c")
   end
@@ -4679,7 +4763,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   local T, f = w.task, w.cur
   local i = g.corner
   local c = T.tp[i]
-  lcd.color(rgb(15, 15, 15))
+  DRW.color(rgb(15, 15, 15))
   rect(x0, y0, bw, bh)
   local d = math.sqrt((f.x - c.x) ^ 2 + (f.y - c.y) ^ 2)
   local span = clamp(d * 1.3, 80, 400)
@@ -4696,7 +4780,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   local done = w.tp > 0 and i <= w.tp
   if not done then fillSector(P, c, bd, x0, y0, bw, bh) end
   drawZones(w, T, P, x0, y0, bw, bh)
-  lcd.color(rgb(0, 110, 50))
+  DRW.color(rgb(0, 110, 50))
   for _, off in ipairs({-45, 45}) do
     local ex, ey = dirVec(bd + off)
     local ax, ay = P(c.x, c.y)
@@ -4704,7 +4788,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
     line(ax, ay, bx, by)
   end
   -- Schenkel des Dreiecks
-  lcd.color(C_DIM)
+  DRW.color(C_DIM)
   for _, j in ipairs({(i + 1) % 3 + 1, i % 3 + 1}) do
     local o = T.tp[j]
     local ax, ay = P(c.x, c.y)
@@ -4713,7 +4797,7 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   end
   -- geplanter Weg
   if g.plan and i == g.next then
-    lcd.color(C_BLUE)
+    DRW.color(C_BLUE)
     polyAff(g.plan.pts, cx - (mx * T.ux + my * T.uy) * sc, T.ux * sc, T.uy * sc, cy + (mx * T.px + my * T.py) * sc, -T.px * sc, -T.py * sc)
   end
   -- Spur der letzten 40 s (gefaerbt nach Vario), Projektion ausgeschrieben: diese Schleife ist die teuerste
@@ -4728,13 +4812,13 @@ local function paintCorner(w, g, x0, y0, bw, bh)
       local ax, ay = cx + dx * kux + dy * kuy, cy - (dx * kpx + dy * kpy)
       if ax >= c1 and ax <= c3 and ay >= c2 and ay <= c4 then
         local col = (p.v or 0) > 0.5 and C_YELLOW or C_WHITE
-        if col ~= lastCol then lcd.color(col); lastCol = col end
-        lcd.drawFilledRectangle(floor(ax) - 1, floor(ay) - 1, 2, 2)
+        if col ~= lastCol then DRW.color(col); lastCol = col end
+        lcd.drawFilledRectangle(((ax) // 1 | 0) - 1, ((ay) // 1 | 0) - 1, 2, 2)
       end
     end
   end
   local vx, vy = P(c.x, c.y)
-  lcd.color(C_YELLOW)
+  DRW.color(C_YELLOW)
   if inClip(vx, vy) then disc(vx, vy, 4) end
   local ax, ay = P(f.x, f.y)
   if inClip(ax, ay) then predFlat(P, f, C_ORANGE, w); planeFlat(T, ax, ay, f.crs, 8, C_WHITE)
@@ -4752,39 +4836,39 @@ local function paintCorner(w, g, x0, y0, bw, bh)
   if w.qlPhi then
     local k = SMALL and 0.6 or 1
     local bx, by = x0 + 6, y0 + bh - 6 - 64 * k
-    lcd.color(rgb(10, 10, 10))
+    DRW.color(rgb(10, 10, 10))
     rect(bx, by, 96 * k, 64 * k)
-    lcd.color(C_WHITE)
+    DRW.color(C_WHITE)
     BAL.QL.draw(w, bx + 48 * k, by + 36 * k, k, 0)
   end
 end
 
 -- Sollfahrt-Balken (Mitte = Soll), wie im Widget Sollfahrt
 local function stfBar(w, x0, y0, bw, bh)
-  lcd.color(rgb(40, 40, 40))
+  DRW.color(rgb(40, 40, 40))
   rect(x0, y0, bw, bh)
   local mid = y0 + math.floor(bh / 2)
   local range = 20
   local px = (bh / 2 - 4) / range
-  lcd.color(rgb(0, 70, 30))
+  DRW.color(rgb(0, 70, 30))
   local dz = math.floor(w.dead * px)
   rect(x0, mid - dz, bw, math.max(dz * 2, 1))
   if w.stfDv then
     local dv = clamp(w.stfDv, -range, range)
     local h = math.floor(math.abs(dv) * px)
     local ex = math.abs(w.stfDv) - w.dead
-    lcd.color(ex <= 0 and C_GREEN or (ex > 8 and C_RED or C_ORANGE))
+    DRW.color(ex <= 0 and C_GREEN or (ex > 8 and C_RED or C_ORANGE))
     if dv >= 0 then rect(x0 + 3, mid - h, bw - 6, math.max(h, 1))
     else rect(x0 + 3, mid, bw - 6, math.max(h, 1)) end
   end
-  lcd.color(C_WHITE)
+  DRW.color(C_WHITE)
   line(x0 - 3, mid, x0 + bw + 2, mid)
 end
 
 -- Flugzeug von hinten, um die Querlage gekippt, daneben die Gradzahl (grau, wenn der Sensor nicht passt)
 function BAL.QL.draw(w, px, py, k, side)
   local phi = clamp(w.qlPhi, -80, 80)
-  if w.qlBad then lcd.color(C_DIM) end
+  if w.qlBad then DRW.color(C_DIM) end
   local c, s = math.cos(math.rad(phi)), math.sin(math.rad(phi))
   local L, t = 36 * k, 2.5 * k                                  -- halbe Spannweite, halbe Strichdicke
   local ax, ay, bx, by = px - L * c, py - L * s, px + L * c, py + L * s
@@ -4827,7 +4911,7 @@ local function paintGlide(w, W, H, top)
   local function fitFont(fields, fw, fh)
     local hL = textH(FONT_XS)
     for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L, FONT_STD}) do
-      lcd.font(fo)
+      DRW.font(fo)
       local _, th = lcd.getTextSize("0")
       local ok = true
       if leftVals then
@@ -4836,7 +4920,7 @@ local function paintGlide(w, W, H, top)
       end
       if ok and fields then
         if textH(FONT_S) + th + 4 > fh then ok = false end
-        lcd.font(fo)
+        DRW.font(fo)
         for _, v in ipairs(fields) do if ok and v[2] and lcd.getTextSize(v[2]) > fw - 14 then ok = false end end
       end
       if ok then return fo end
@@ -4853,10 +4937,10 @@ local function paintGlide(w, W, H, top)
           w.mcBox = {x = tx, y = y + 2 * step, w = tw, h = step}
           -- MC ZEIT mit Pfeil nach unten: Hoehe wird abgebaut
           if rzM and rz.down then
-            lcd.font(FONT_XS)
+            DRW.font(FONT_XS)
             local lw2, lh2 = lcd.getTextSize(v[1])
             local ax, ay = tx + lw2 + 4 + lh2 * 0.3, y + 2 * step + lh2 * 0.5
-            lcd.color(C_BLUE)
+            DRW.color(C_BLUE)
             tri(ax, ay + lh2 * 0.3, ax - lh2 * 0.3, ay - lh2 * 0.1, ax + lh2 * 0.3, ay - lh2 * 0.1)
           end
         end
@@ -4911,7 +4995,7 @@ local function paintGlide(w, W, H, top)
   local yy = y + th + 4
   local cdiH = SMALL and 54 or 100
   local k = cdiH / 100
-  lcd.color(rgb(25, 25, 25))
+  DRW.color(rgb(25, 25, 25))
   rect(nx, yy, hb, cdiH)
   rect(cx0, yy, cw, cdiH)
   -- Gegenwind: Pfeil vom oberen Rand nach unten (orange), Rueckenwind vom unteren Rand nach oben (gruen)
@@ -4920,7 +5004,7 @@ local function paintGlide(w, W, H, top)
     local hcx = nx + hb / 2
     local L = clamp(math.abs(hw) * 14 * k, 4, cdiH - 44 * k)
     local hcol = hw > 0 and C_ORANGE or C_GREEN
-    lcd.color(hcol)
+    DRW.color(hcol)
     local sw, hh, hl = 6 * k, 17 * k, 18 * k
     local num = string.format("%d", math.floor(math.abs(hw) + 0.5))
     local nh = textH(FONT_S)
@@ -4944,19 +5028,19 @@ local function paintGlide(w, W, H, top)
     local xp = g.xtPred or xt
     local rng = (math.max(math.abs(xt), math.abs(xp)) > 100) and 300 or 100
     local half = cw / 2 - 4
-    lcd.color(C_GRID)
+    DRW.color(C_GRID)
     for j = -3, 3 do if j ~= 0 then local tx = ccx + j * half / 4; line(tx, yy, tx, yy + cdiH) end end
     -- Balken oben: erwartete Ablage in PRED_S s, von der Soll-Linie bis dorthin
     local qx = ccx + clamp(xp / rng, -1, 1) * half
-    lcd.color(math.abs(xp) < 20 and C_GREEN or C_ORANGE)
+    DRW.color(math.abs(xp) < 20 and C_GREEN or C_ORANGE)
     rect(math.min(ccx, qx), yy + 4 * k, math.max(math.abs(qx - ccx), 2), 34 * k)
-    lcd.color(C_BLUE)
+    DRW.color(C_BLUE)
     line(ccx, yy, ccx, yy + cdiH)
     line(ccx + 1, yy, ccx + 1, yy + cdiH)
     drawT(ccx + 4, yy + 40 * k, cw / 2, string.format("±%d m", rng), FONT_XS, C_DIM, "l")
     -- Flugzeug (Dreieck) bei der aktuellen Ablage, zwischen Balken und Seitenwindpfeil
     local ppx = ccx + clamp(xt / rng, -1, 1) * half
-    lcd.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
+    DRW.color(math.abs(xt) < 20 and C_GREEN or C_WHITE)
     if w.qlPhi then BAL.QL.draw(w, ppx, yy + 62 * k, k, ppx > ccx and -1 or 1)
     else tri(ppx, yy + 43 * k, ppx - 14 * k, yy + 76 * k, ppx + 14 * k, yy + 76 * k) end
   end
@@ -4966,7 +5050,7 @@ local function paintGlide(w, W, H, top)
     local L = clamp(math.abs(cr) * 14 * k, 4, cw / 2 - 40)
     local ay = yy + cdiH - 11 * k
     local num = string.format("%d", math.floor(math.abs(cr) + 0.5))
-    lcd.color(C_BLUE)
+    DRW.color(C_BLUE)
     if cr > 0 then
       local x0 = cx0 + 2
       rect(x0, ay - 3 * k, L, 6 * k)
@@ -5035,28 +5119,28 @@ local function paintGlide(w, W, H, top)
   if fh > 20 then
     local hL = textH(FONT_S)
     -- Werte aller drei Felder auf gleicher Hoehe: Wert und Zeile darunter zusammen mittig unter der Beschriftung
-    lcd.font(vf)
+    DRW.font(vf)
     local _, thv = lcd.getTextSize("0")
     local vy = yy + 2 + hL + math.max(math.floor((fh - 2 - hL - thv - hL) / 2), 0)
     for i = 1, 3 do
       local x = nx + (i - 1) * fw
-      lcd.color(rgb(17, 17, 17))
+      DRW.color(rgb(17, 17, 17))
       rect(x + 2, yy, fw - 4, fh)
       local v = vals[i]
       if v[1] then
         drawT(x + 8, yy + 2, fw - 12, v[1], FONT_S, C_DIM, "l")
-        local th, tw = drawT(x + 8, vy, fw - 12, v[2], vf, v[3], "l")
+        local th, tw = drawT(x + 8, vy, fw - 12, v[2], vf, v[3], "l", true)
         if v[6] then
           -- Feld der Restzeit-Sollfahrt: Dreieck hinter der Zahl, Zeile darunter
           local function triO(tx0, ty0, sz, col)
-            lcd.color(col)
+            DRW.color(col)
             line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
           end
           -- Ziffern stehen etwa von 4 % bis 64 % der Zeilenhoehe: Dreieck mit gleicher Unterkante
           triO(x + 8 + tw + th * 0.15, vy + th * 0.14, th * 0.5, v[3])
           if v[4] and vy + th + hL <= yy + fh then
             local sy = vy + th
-            local _, w1 = drawT(x + 8, sy, fw - 12, v[4], FONT_S, v[6], "l")
+            local _, w1 = drawT(x + 8, sy, fw - 12, v[4], FONT_S, v[6], "l", true)
             if v[5] then
               triO(x + 12 + w1, sy + hL * 0.14, hL * 0.5, v[6])
               if v[5] ~= "" then drawT(x + 16 + w1 + hL * 0.6, sy, fw - 12, v[5], FONT_S, v[6], "l") end
@@ -5155,7 +5239,7 @@ local function paintTherm(w, W, H, top)
   for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L}) do
     local ok = hX + textH(fo) <= rh
     if ok then
-      lcd.font(fo)
+      DRW.font(fo)
       for i = 1, 4 do if ok and vals[i][2] and lcd.getTextSize(vals[i][2]) > half - 6 then ok = false end end
     end
     if ok then vf = fo; break end
@@ -5167,7 +5251,7 @@ local function paintTherm(w, W, H, top)
   end
   -- Kasten Endanflug
   local by = H - m - bH
-  lcd.color(rgb(17, 17, 17))
+  DRW.color(rgb(17, 17, 17))
   rect(m, by, lw, bH)
   local bx = m + 6
   drawT(bx, by + 3, lw - 12, lab, FONT_XS, C_DIM, "l")
@@ -5176,7 +5260,7 @@ local function paintTherm(w, W, H, top)
   if arrowUp then
     -- Pfeil nach oben vor dem Wert, Hoehe wie die Ziffern
     local ax, ay, s = bx + th * 0.3, vy2 + th * 0.06, th * 0.6
-    lcd.color(col)
+    DRW.color(col)
     tri(ax, ay, ax - s * 0.4, ay + s * 0.45, ax + s * 0.4, ay + s * 0.45)
     rect(ax - s * 0.1, ay + s * 0.4, s * 0.2, s * 0.6)
     bx = bx + th * 0.75
@@ -5190,21 +5274,21 @@ local function paintTherm(w, W, H, top)
     for _, s in ipairs(sub) do
       if s == true then
         local sz = hS * 0.5
-        lcd.color(col)
+        DRW.color(col)
         local tx0, ty0 = x + 3, sy + hS * 0.14
         line(tx0, ty0 + sz, tx0 + sz * 1.1, ty0 + sz); line(tx0, ty0 + sz, tx0 + sz * 0.55, ty0); line(tx0 + sz * 1.1, ty0 + sz, tx0 + sz * 0.55, ty0)
         x = x + sz * 1.1 + 4
       else
-        local _, tw = drawT(x, sy, lw - 12, s, FONT_S, col, "l")
+        local _, tw = drawT(x, sy, lw - 12, s, FONT_S, col, "l", true)
         x = x + tw
       end
     end
   elseif sub then drawT(bx, sy, lw - 12, sub, FONT_S, C_DIM, "l") end
   if prog then
     local bw = lw - 12
-    lcd.color(rgb(50, 50, 50))
+    DRW.color(rgb(50, 50, 50))
     rect(bx, by + bH - 7, bw, 4)
-    lcd.color(col)
+    DRW.color(col)
     rect(bx, by + bH - 7, math.floor(bw * clamp(prog, 0, 1)), 4)
   end
   -- Abflughoehe im Bart erreicht: Banner ueber der Karte (am Ende gezeichnet)
@@ -5213,7 +5297,7 @@ local function paintTherm(w, W, H, top)
   local mx0 = lw + m * 2
   local mw = W - mx0 - m
   local mh = H - y - m
-  lcd.color(rgb(15, 15, 15))
+  DRW.color(rgb(15, 15, 15))
   rect(mx0, y, mw, mh)
   if f then
     local R = radius(w)
@@ -5286,21 +5370,21 @@ local function paintTherm(w, W, H, top)
       -- aktiver Sektor gefuellt wie in der Eckansicht
       fillSector(P, T.tp[ni], bearingOf(T.tp[ni].bx, T.tp[ni].by), mx0, y, mw, mh)
       drawZones(w, T, P, mx0, y, mw, mh)
-      lcd.color(rgb(90, 90, 90))
+      DRW.color(rgb(90, 90, 90))
       for i = 1, 3 do
         local a, b = T.tp[i], T.tp[i % 3 + 1]
         local ax, ay = P(a.x, a.y)
         local bx, by = P(b.x, b.y)
         line(ax, ay, bx, by)
       end
-      lcd.color(C_YELLOW)
+      DRW.color(C_YELLOW)
       local lh = math.min(LINE_HALF, T.dist * 0.4)
       local l1x, l1y = P(T.px * lh, T.py * lh)
       local l2x, l2y = P(-T.px * lh, -T.py * lh)
       line(l1x, l1y, l2x, l2y)
       local c = T.tp[ni]
       local bd = bearingOf(c.bx, c.by)
-      lcd.color(rgb(0, 110, 50))
+      DRW.color(rgb(0, 110, 50))
       for _, off in ipairs({-45, 45}) do
         local ex, ey = dirVec(bd + off)
         local ax, ay = P(c.x, c.y)
@@ -5311,7 +5395,7 @@ local function paintTherm(w, W, H, top)
         local tx, ty = P(T.tp[i].x, T.tp[i].y)
         if inClip(tx, ty) then
           local nextOne = (w.state == S_STARTED or w.state == S_ARMED) and i == ni
-          lcd.color(nextOne and C_GREEN or C_DIM)
+          DRW.color(nextOne and C_GREEN or C_DIM)
           disc(tx, ty, nextOne and 5 or 3)
           if inClip(tx + 30, ty + 14) then drawT(tx + 6, ty - 6, 40, tostring(i), FONT_XS, nextOne and C_GREEN or C_DIM, "l") end
         end
@@ -5362,10 +5446,10 @@ local function paintTherm(w, W, H, top)
         if mx >= c1 and mx <= c3 and my >= c2 and my <= c4 and px >= c1 and px <= c3 and py >= c2 and py <= c4
           and nx >= c1 and nx <= c3 and ny >= c2 and ny <= c4 then
           local col = pv0 > 1.5 and C_RED or (pv0 > 0.5 and C_YELLOW or (pv0 > 0 and C_GREEN or C_BLUE))
-          if col ~= lastCol then lcd.color(col); lastCol = col end
+          if col ~= lastCol then DRW.color(col); lastCol = col end
           local d, e = nx - mx, ny - my
           d = (d < 0 and -d or d) + (e < 0 and -e or e)
-          local x0, y0 = floor(mx), floor(my)
+          local x0, y0 = ((mx) // 1 | 0), ((my) // 1 | 0)
           if d > 14 then
             -- B(t) = m + 2t(c - m) + t^2 (m - 2c + n), in k gleichen Schritten
             local k = d > 28 and 3 or 2
@@ -5373,12 +5457,12 @@ local function paintTherm(w, W, H, top)
             local bx, by = mx - px - px + nx, my - py - py + ny
             for j = 1, k - 1 do
               local t = j / k
-              local x1, y1 = floor(mx + t * (ax + t * bx)), floor(my + t * (ay + t * by))
+              local x1, y1 = ((mx + t * (ax + t * bx)) // 1 | 0), ((my + t * (ay + t * by)) // 1 | 0)
               seg(x0, y0, x1, y1)
               x0, y0 = x1, y1
             end
           end
-          seg(x0, y0, floor(nx), floor(ny))
+          seg(x0, y0, ((nx) // 1 | 0), ((ny) // 1 | 0))
         end
         px, py, pv0, mx, my = vx, vy, pv, nx, ny
       else
@@ -5388,14 +5472,14 @@ local function paintTherm(w, W, H, top)
     -- letztes halbes Stueck bis zum neuesten Punkt
     if px and mx >= c1 and mx <= c3 and my >= c2 and my <= c4 and px >= c1 and px <= c3 and py >= c2 and py <= c4 then
       local col = pv0 > 1.5 and C_RED or (pv0 > 0.5 and C_YELLOW or (pv0 > 0 and C_GREEN or C_BLUE))
-      if col ~= lastCol then lcd.color(col) end
-      seg(floor(mx), floor(my), floor(px), floor(py))
+      if col ~= lastCol then DRW.color(col) end
+      seg(((mx) // 1 | 0), ((my) // 1 | 0), ((px) // 1 | 0), ((py) // 1 | 0))
     end
     local ax0, ay0 = P(f.x, f.y)
     -- rote Linie zum besten Steigen der Spur (App thBest, Vorgabe aus)
     if best and bv > 0.3 then
       local bx, by = P(bx0, by0)
-      lcd.color(C_RED)
+      DRW.color(C_RED)
       if inClip(bx, by) then ring(bx, by, 7) end
       line(ax0, ay0, bx, by)
     end
@@ -5419,7 +5503,7 @@ local function paintTherm(w, W, H, top)
         local k = math.min((mw / 2 - 6) / math.max(math.abs(ex), 1e-3), (mh / 2 - (ey > 0 and 26 or 6)) / math.max(math.abs(ey), 1e-3))
         local L = 34
         local hx, hy = ccx + ex * k, ccy + ey * k
-        lcd.color(C_GREEN)
+        DRW.color(C_GREEN)
         arrow(hx - ex * L, hy - ey * L, ex, ey, L, 6, 9)
         -- Beschriftung hinter dem Pfeilende, bei waagrechtem Pfeil darueber
         local lx, ly = hx - ex * (L + 70), hy - ey * (L + 20)
@@ -5438,10 +5522,10 @@ local function paintTherm(w, W, H, top)
   if banner then
     local txt = "BART VERLASSEN · ENDANFLUG"
     local bf2 = F_L
-    lcd.font(bf2)
-    if lcd.getTextSize(txt) > mw - 12 then bf2 = FONT_STD; lcd.font(bf2); if lcd.getTextSize(txt) > mw - 12 then txt = "ENDANFLUG" end end
+    DRW.font(bf2)
+    if lcd.getTextSize(txt) > mw - 12 then bf2 = FONT_STD; DRW.font(bf2); if lcd.getTextSize(txt) > mw - 12 then txt = "ENDANFLUG" end end
     local hb = textH(bf2) + 8
-    lcd.color(C_GREEN)
+    DRW.color(C_GREEN)
     rect(mx0, y, mw, hb)
     drawT(mx0, y + 4, mw, txt, bf2, C_BG, "c")
   end
@@ -5469,7 +5553,7 @@ local function paintEval(w, W, H, top)
   -- Rundentabelle
   local cols = {"Runde", "Zeit", "km/h", "Index", "Höhe", "dH"}
   local cw = math.floor((W - 2 * m) / #cols)
-  lcd.color(rgb(40, 40, 40))
+  DRW.color(rgb(40, 40, 40))
   local rh = textH(FONT_S) + 2
   rect(m, y, W - 2 * m, rh)
   for k, c in ipairs(cols) do drawT(m + (k - 1) * cw, y + 1, cw - 6, c, FONT_S, C_DIM, "r") end
@@ -5490,18 +5574,19 @@ local function paintEval(w, W, H, top)
   local bw = math.floor(W * 0.22)
   w.resetBox = {x = W - m - bw, y = H - m - rh - 4, w = bw, h = rh + 4}
   local armed = w.resetArmed and os.clock() - w.resetArmed < 4
-  lcd.color(armed and rgb(120, 30, 0) or rgb(50, 50, 50))
+  DRW.color(armed and rgb(120, 30, 0) or rgb(50, 50, 50))
   rect(w.resetBox.x, w.resetBox.y, bw, rh + 4)
   drawT(w.resetBox.x, w.resetBox.y + 2, bw, armed and "NOCHMAL = NEU" or "NEUER FLUG", FONT_S, C_WHITE, "c")
 end
 
 local function paint(w)
+  DRW.c, DRW.f = nil, nil                -- Zustand von Ethos zwischen den Bildern unbekannt
   colors()
   local W, H = lcd.getWindowSize()
   local small = W < 600 or H < 260
   F_L, F_XL = small and FONT_STD or FONT_L, small and FONT_L or FONT_XL
   SMALL = small
-  lcd.color(C_BG)
+  DRW.color(C_BG)
   rect(0, 0, W, H)
   local top = header(w, W)
   H = tabBar(w, W, H)
