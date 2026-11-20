@@ -77,19 +77,6 @@ local CLASSES = {
 
 -- ---------------------------------------------------------------- Hilfsfunktionen
 
--- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
--- Fehlt die Datei, bleibt der Faktor 1.
-local VMOD
-local function varioModul()
-  if VMOD == nil then
-    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
-    local ok2, m = false, nil
-    if ok and f then ok2, m = pcall(f) end
-    VMOD = (ok2 and type(m) == "table") and m or false
-  end
-  return VMOD or nil
-end
-
 local function clamp(x, lo, hi)
   if x < lo then return lo end
   if x > hi then return hi end
@@ -1097,6 +1084,19 @@ local TEXT_DEFS = {
 -- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 local BAL = {}
+-- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
+-- Fehlt die Datei, bleibt der Faktor 1.
+BAL.VM = {}
+function BAL.VM.modul()
+  if BAL.VM.mod == nil then
+    local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
+    local ok2, m = false, nil
+    if ok and f then ok2, m = pcall(f) end
+    BAL.VM.mod = (ok2 and type(m) == "table") and m or false
+  end
+  return BAL.VM.mod or nil
+end
+
 
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
@@ -1649,7 +1649,7 @@ local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
   -- Eichfaktor des Vario lernen (Hoehe: Baro bevorzugt, sonst GPS) und anwenden, bevor Fusion und TE rechnen
   local vraw = readNumber(w.vario)
-  local vm = varioModul()
+  local vm = BAL.VM.modul()
   if vm then
     w.vst = w.vst or {}
     if not w.vstLoaded then vm.load(w.vst, storage.read); w.vstLoaded = true end

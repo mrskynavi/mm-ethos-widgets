@@ -67,15 +67,15 @@ local NUM_DEFS = {
 
 -- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
 -- Fehlt die Datei, bleibt der Faktor 1.
-local VMOD
-local function varioModul()
-  if VMOD == nil then
+local VMG = {}
+function VMG.modul()
+  if VMG.mod == nil then
     local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
     local ok2, m = false, nil
     if ok and f then ok2, m = pcall(f) end
-    VMOD = (ok2 and type(m) == "table") and m or false
+    VMG.mod = (ok2 and type(m) == "table") and m or false
   end
-  return VMOD or nil
+  return VMG.mod or nil
 end
 
 local function clamp(x, lo, hi)
@@ -500,7 +500,7 @@ local function measure(now)
   s.airKorr = ias and ias * (w.airK or 1000) / 1000     -- Quelle "Fahrt korr." (IAS wie der Logger, in m/s)
   local vraw = readNumber(w.vario)
   -- Eichfaktor lernen (Hoehe nur fuer die Aenderung, daher egal welche Hoehenquelle) und anwenden
-  local vm = varioModul()
+  local vm = VMG.modul()
   if vm then
     s.vst = s.vst or {}
     if not s.vstLoaded then vm.load(s.vst, storage.read); s.vstLoaded = true end

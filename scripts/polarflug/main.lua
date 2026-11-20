@@ -70,15 +70,15 @@ local NUM_DEFS = {
 
 -- Vario-Eichfaktor: gemeinsames Modul scripts/gemeinsam/vario.lua (dieselbe Rechnung in allen Widgets).
 -- Fehlt die Datei, bleibt der Faktor 1.
-local VMOD
-local function varioModul()
-  if VMOD == nil then
+local VMG = {}
+function VMG.modul()
+  if VMG.mod == nil then
     local ok, f = pcall(loadScript, "/scripts/gemeinsam/vario.lua")
     local ok2, m = false, nil
     if ok and f then ok2, m = pcall(f) end
-    VMOD = (ok2 and type(m) == "table") and m or false
+    VMG.mod = (ok2 and type(m) == "table") and m or false
   end
-  return VMOD or nil
+  return VMG.mod or nil
 end
 
 local function clamp(x, lo, hi)
@@ -1119,7 +1119,7 @@ local function wakeup(w)
   local vraw = readNumber(w.vario)
   local alt = readNumber(w.gpsAlt)
   -- Eichfaktor lernen (nur mit GPS-Hoehe, sonst waere die Hoehe aus dem Vario selbst gerechnet) und anwenden
-  local vm = varioModul()
+  local vm = VMG.modul()
   if vm then
     w.vst = w.vst or {}
     if not w.vstLoaded then vm.load(w.vst, storage.read); w.vstLoaded = true end
