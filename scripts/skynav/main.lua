@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.47
+-- @version 1.48
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.47"
+local VERSION = "1.48"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3148,6 +3148,7 @@ end
 function BAL.VO.set(w, now, on)
   local v = on and w.varioRaw or 0
   v = clamp(v, -20, 20)
+  BAL.VO.on = on
   BAL.VO.v, BAL.VO.t = v, now
   local s = BAL.VO.sensor(w, now)
   if not s then return end
@@ -3215,7 +3216,8 @@ end
 -- Bildaufbau den Takt aufhalten. Gemessen werden pro 10 s: Dauer von wakeup und paint (Mittel/Maximum) und der
 -- Abstand zwischen zwei wakeup (Takt; enthaelt auch das Zeichnen von Ethos selbst). Anzeige in der Konfiguration.
 -- Dazu "Bildaufbau" (drawIv): wie oft das Widget neu zeichnen laesst.
-BAL.TM = {CV = {1, 2, 4}, IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil}
+BAL.TM = {CV = {1, 2, 4}, IV = {0.15, 0.3, 0.6, 1.0}, c = {}, r = nil, t0 = nil, last = nil,
+  GOV_RATE = 0.12, GOV_MAX = 0.04, GOV_DRAW = 1.5}
 function BAL.TM.add(k, d)
   local c = BAL.TM.c
   local e = c[k]
@@ -3229,7 +3231,34 @@ function BAL.TM.wake(f, w)
   local T = BAL.TM
   local t = os.clock()
   if T.last then T.add("g", t - T.last) end
+  -- 1.48 Lastbremse: Test am Sender (Christoph 20.11.2026, fest -2 m/s): 10 ms in jedem Aufruf und 100 ms einmal
+  -- pro Sekunde klingen sauber, 20 ms pro Aufruf hackt. Der Sinkton vertraegt also einzelne lange Aufrufe, aber
+  -- nicht viel Last im Schnitt. Darum ein Eimer: jede Lua-Zeit (Rechnen, Zeichnen) kommt hinein, er leert sich mit
+  -- GOV_RATE (Anteil der Zeit). Solange der Varioton laeuft und der Eimer ueber GOV_MAX steht, schreibt ein Aufruf
+  -- nur den letzten Vario-Wert; gezeichnet wird dann hoechstens alle GOV_DRAW s.
+  T.ld = math.max(0, (T.ld or 0) - (T.last and (t - T.last) or 0) * T.GOV_RATE)
   T.last = t
+  T.gov = w.vtOn and (w.calcIv or 1) == 1
+  -- spaetestens nach 1 s wieder voll rechnen (Wertung und IGC bekommen mindestens einen Fix pro Sekunde)
+  if T.gov and T.ld > T.GOV_MAX and t - (T.full or 0) < 1 then
+    -- Vario-Wert trotzdem frisch vom Sensor (wie in readInputs), damit der Ton ohne Verzoegerung folgt
+    local s = w.voSens
+    if s and w.vtDev == 2 and w.voMode then
+      local v = 0
+      if BAL.VO.on then
+        v = readNumber(w.vario)
+        if v ~= nil and w.varioType == 2 then v = v + (w.teDE or 0) end
+        v = v and clamp(v, -20, 20) or (BAL.VO.v or 0)
+      end
+      BAL.VO.v = v
+      BAL.VO.write(s, w.voMode, v)
+    end
+    local d = os.clock() - t
+    T.ld = T.ld + d
+    T.add("l", d)
+    T.add("b", d)
+    return
+  end
   -- 1.39 Rechentakt (calcIv): Der Sinkton des Ethos-Varios klickert auch auf dem Hauptbildschirm, also ohne
   -- Zeichnen (Christoph 13.11.2026); der Takt lag bei rund 100 ms, davon 20 bis 27 ms Rechnen. Zum Eingrenzen
   -- rechnet das Widget wahlweise nur in jedem 2. oder 4. Aufruf voll; dazwischen schreibt es nur den Vario-Wert.
@@ -3260,9 +3289,10 @@ function BAL.TM.wake(f, w)
   -- 1.44: einmal nach ~20 s ein Kurztest statt der Rechnung: was kostet am Sender ein Lua-Schritt, ein Aufruf
   -- von math.floor, os.clock und ein Sensor-Wert (Mikrosekunden, Anzeige in der Konfiguration)
   if not T.B and T.wn >= 200 then T.bench(w); T.add("l", os.clock() - t); return end
-  T.mk = t
+  T.mk, T.full = t, t
   f(w)
   local t2 = os.clock()
+  T.ld = T.ld + (t2 - t)
   T.add("w", t2 - t)
   if not T.t0 then T.t0 = t2 elseif t2 - T.t0 >= 10 then T.r, T.c, T.t0 = T.c, {}, t2 end
 end
@@ -3326,12 +3356,13 @@ function BAL.TM.paint(f, w)
   local ok, err = pcall(f, w)
   local d = os.clock() - t
   if probe then lcd = T.real; T.add("q", d) else T.add("p", d) end
+  T.ld = (T.ld or 0) + d
   if not ok then error(err, 0) end
 end
 function BAL.TM.info()
   local r, t = BAL.TM.r, {}
   if not r then return {"Messung laeuft (10 s)"} end
-  for _, d in ipairs({{"w", "Rechnen"}, {"l", "Leer"}, {"p", "Zeichnen"}, {"g", "Takt"}}) do
+  for _, d in ipairs({{"w", "Rechnen"}, {"l", "Leer"}, {"b", "Bremse"}, {"p", "Zeichnen"}, {"g", "Takt"}}) do
     local e = r[d[1]]
     if e and e.n > 0 then t[#t + 1] = string.format("%s %.0f/%.0f ms n%d", d[2], e.s / e.n * 1000, e.m * 1000, e.n) end
   end
@@ -3858,7 +3889,9 @@ local function wakeup(w)
     elseif w.page == P_GLIDE then glideTones(w, w.gc, now, warn) end
   end
 
-  if now - w.lastInvalidate >= (BAL.TM.IV[w.drawIv or 1] or 0.15) then
+  local ivD = BAL.TM.IV[w.drawIv or 1] or 0.15
+  if BAL.TM.gov and w.vtOn then ivD = math.max(ivD, BAL.TM.GOV_DRAW) end   -- 1.48 Lastbremse beim Varioton
+  if now - w.lastInvalidate >= ivD then
     w.lastInvalidate = now
     lcd.invalidate()
   end
