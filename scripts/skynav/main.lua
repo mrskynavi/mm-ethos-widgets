@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.49.1
+-- @version 1.50
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.49.1"
+local VERSION = "1.50"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1478,7 +1478,36 @@ function BAL.isKmh(un)
   end
   return BAL.kmhU ~= false and un == BAL.kmhU
 end
-function BAL.AS.read(w, now, dt)
+-- 1.50 TEK- und Fahrt-Korrektur der TEK-Kalibrierung selbst gerechnet (gleich wie deren Quellen "TEK korr." und
+-- "Fahrt korr."): TEK korr. = Logger-TEK + tekX/1000 * d(TAS^2/2g)/dt (0.1-s-Raster, lpf 0.25 s, um tekLag
+-- Schritte verzoegert), Fahrt korr. = Logger-Fahrt * airK/1000. Nur fuer automatisch gefundene Logger-Quellen.
+BAL.TK = {}
+function BAL.TK.on(w, k)
+  return w.korrV ~= nil and w.snKorrK ~= nil and w.snKorrK[k] and w.snFound ~= nil and w[k] == w.snFound[k]
+end
+function BAL.TK.step(w, dt, tasRaw)
+  local s = w.tk
+  if not s then s = {acc = 0, ri = 0, r = {}}; w.tk = s end
+  s.acc = s.acc + dt
+  if s.acc >= 0.1 then
+    s.acc = s.acc - 0.1
+    if s.acc > 0.1 then s.acc = 0 end
+    local Es0 = s.Es
+    s.Es = lpf(s.Es, tasRaw * tasRaw / 19.62, 0.1, 0.25)
+    s.ri = s.ri % 16 + 1
+    s.r[s.ri] = Es0 and (s.Es - Es0) / 0.1 or 0
+  end
+end
+function BAL.TK.corr(w)
+  local s, K = w.tk, w.korrV
+  if not (s and K and s.ri > 0) then return 0 end
+  return K.tekX / 1000 * (s.r[(s.ri - K.tekLag - 1) % 16 + 1] or 0)
+end
+
+function BAL.AS.read(w, now)
+  -- 1.50: eigener Zeitschritt (laeuft auch in den leichten Aufrufen der Lastbremse)
+  local dt = w.asT and math.min(now - w.asT, 0.5) or 0
+  w.asT = now
   local src = validSource(w.airSrc)
   local v = src and readNumber(src)
   if not v then w.asOk, w.asTas = false, nil; return end
@@ -1496,8 +1525,10 @@ function BAL.AS.read(w, now, dt)
   if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
   local f = w.cur
   local h = f and f.msl or 0
-  local sigma = (1 - 2.2558e-5 * clamp(h, -500, 6000)) ^ 4.2559
-  local tas = ias / math.sqrt(sigma)
+  local sq = math.sqrt((1 - 2.2558e-5 * clamp(h, -500, 6000)) ^ 4.2559)
+  if w.korrV and BAL.TK.on(w, "vario") then BAL.TK.step(w, dt, ias / sq) end      -- TEK aus der rohen Fahrt
+  if w.korrV and BAL.TK.on(w, "airSrc") then ias = ias * w.korrV.airK / 1000 end
+  local tas = ias / sq
   w.asTas = lpf(w.asTas, tas, dt, 0.2)
   local gs = f and f.gs or 0
   w.asOk = now - (w.asChg or now) < 5 and not (tas < 5 and gs > 12)
@@ -1594,12 +1625,28 @@ function BAL.SN.get(spec, tele)
 end
 
 -- Gibt es eine Korrektur der TEK-Kalibrierung fuer dieses Modell? (gleicher Dateiname wie in scripts/tekkal)
-function BAL.SN.korrFile()
+function BAL.SN.korrFile(w)
+  -- 1.50: Werte gleich mitlesen (tekX, tekLag in 0.1 s, airK in Promille); SkyNav korrigiert selbst (BAL.TK),
+  -- das Widget TEK-Kalibrierung braucht es nur noch zum Kalibrieren (Christoph 20.11.2026)
+  if w then w.korrV = nil end
   if not (io and io.open) then return false end
   local name = "korrektur_" .. tostring(currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
   for _, d in ipairs(BAL.SN.KORR_DIRS) do
     local ok, f = pcall(io.open, d .. name, "r")
-    if ok and f then pcall(f.close, f); return true end
+    if ok and f then
+      local okR, text = pcall(f.read, f, "*a")
+      pcall(f.close, f)
+      text = okR and tostring(text or "") or ""
+      local r = {}
+      local a, b = text:match("^(%-?%d+);(%d+)")
+      if a then r.tekX, r.tekLag = a, b end
+      for k, v in text:gmatch("([%w]+)=([^\r\n]*)") do r[k] = v end
+      if w then
+        w.korrV = {tekX = clamp(tonumber(r.tekX) or 0, -500, 500), tekLag = clamp(tonumber(r.tekLag) or 0, 0, 15),
+          airK = clamp(tonumber(r.airK) or 1000, 500, 2000)}
+      end
+      return true
+    end
   end
   return false
 end
@@ -1639,7 +1686,8 @@ function BAL.SN.resolve(w, k)
   local R = BAL.SN.ROLE[k]
   local found, korr = nil, false
   if BAL.SN.wanted(w, R) then
-    if R.korr and w.devMain == 1 and w.snKorr then found = BAL.SN.get(R.korr, false); korr = found ~= nil end
+    -- 1.50: nicht mehr die Quellen "TEK korr."/"Fahrt korr." des Kalibrier-Widgets, sondern die Logger-Sensoren;
+    -- die Korrektur aus der Datei rechnet SkyNav selbst (BAL.TK)
     local desc = R.dev == "baro" and w.devMain == 1 and w.devStabi == true
     for _, id in ipairs(R.ids or {}) do
       if found then break end
@@ -1653,6 +1701,7 @@ function BAL.SN.resolve(w, k)
       found = BAL.SN.get(n, true)
     end
   end
+  korr = (R.korr and w.devMain == 1 and w.snKorr and found ~= nil) and true or false
   w.snFound[k] = found
   w.snKorrK[k] = korr
   BAL.SN.applyKey(w, k)
@@ -1661,7 +1710,7 @@ end
 function BAL.SN.resolveAll(w)
   if not w.man then return end
   w.snFound, w.snKorrK = w.snFound or {}, w.snKorrK or {}
-  w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false
+  w.snKorr = (w.devMain == 1) and BAL.SN.korrFile(w) or false
   for _, k in ipairs(BAL.SN.KEYS) do BAL.SN.resolve(w, k) end
 end
 
@@ -1686,7 +1735,7 @@ function BAL.SN.step(w, now)
     return
   end
   w.snFound, w.snKorrK = w.snFound or {}, w.snKorrK or {}
-  if i == 1 and not fly then w.snKorr = (w.devMain == 1) and BAL.SN.korrFile() or false end
+  if i == 1 and not fly then w.snKorr = (w.devMain == 1) and BAL.SN.korrFile(w) or false end
   BAL.SN.resolve(w, k)
   w.snI = i
 end
@@ -1731,6 +1780,7 @@ end
 local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
   local vario = readNumber(w.vario)
+  if vario ~= nil and w.korrV and BAL.TK.on(w, "vario") then vario = vario + BAL.TK.corr(w) end   -- 1.50 TEK korr.
   if vario ~= nil then w.vSlow2 = lpf(w.vSlow2, vario, dt, 2) end   -- Sensor wie er kommt (Vertikalgeschwindigkeit, 3D-Speed)
   w.vSens = vario                                                     -- fuer die Fusion mit AccZ (BAL.VF)
   -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
@@ -3774,6 +3824,7 @@ local function wakeup(w, lite)
   -- oder Scharfstellen laeuft der volle Aufruf mit diesem Punkt weiter.
   local fLite
   if lite then
+    if w.korrV then BAL.AS.read(w, now) end              -- TEK-Korrektur braucht jeden Fahrt-Wert
     local f = readInputs(w, now, rdt)
     if not f then return end
     if w.armPending then fLite = f
