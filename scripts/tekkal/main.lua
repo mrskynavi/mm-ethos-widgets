@@ -1,5 +1,5 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.7.2
+-- @version 1.7.3
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
@@ -644,8 +644,11 @@ local function ksGet(now, key, ref)
   pcall(sn.protocolDecimals, sn, 2)
   pcall(sn.decimals, sn, D.dec)
   -- 1.7.1: Ein neuer DIY-Sensor hat den Bereich 0..10000, negative Werte kamen als 0 an (Christoph 20.11.2026)
-  pcall(sn.minimum, sn, D.lo)
-  pcall(sn.maximum, sn, D.hi)
+  -- 1.7.3: Ethos nimmt Minimum/Maximum in Schritten der Anzeige-Dezimalen (500 wurde 50.0 km/h, Christoph
+  -- 21.11.2026), darum mit 10^Dezimalen; ist es doch in ganzen Einheiten, ist der Bereich nur breiter
+  local sc = 10 ^ D.dec
+  pcall(sn.minimum, sn, math.floor(D.lo * sc))
+  pcall(sn.maximum, sn, math.floor(D.hi * sc))
   e.s = sn
   return sn
 end
