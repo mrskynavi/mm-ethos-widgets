@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.51.2
+-- @version 1.52
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.51.2"
+local VERSION = "1.52"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -665,17 +665,26 @@ local function extractLatLon(v)
   return nil
 end
 
+-- 1.52: der Leseweg, der zuletzt eine Position lieferte, kommt zuerst (FELD.gpsRd 1 = Tabelle, 2 = Breite/Laenge
+-- einzeln; in FELD, weil BAL erst weiter unten steht und das Hauptkapitel keine lokale Variable mehr frei hat).
+-- Spart pro Aufruf bis zu eine Sensor-Lesung (~0.12 ms am Sender) und zwei neue Tabellen.
 local function readPosition(src)
   if not validSource(src) then return nil end
-  local ok, v = pcall(src.value, src)
-  if ok then
-    local la, lo = extractLatLon(v)
-    if la then return la, lo end
+  local opt = OPTION_LATITUDE and OPTION_LONGITUDE
+  if FELD.gpsRd ~= 2 or not opt then
+    local ok, v = pcall(src.value, src)
+    if ok then
+      local la, lo = extractLatLon(v)
+      if la then FELD.gpsRd = 1; return la, lo end
+    end
   end
-  if OPTION_LATITUDE and OPTION_LONGITUDE then
-    local ok1, la = pcall(src.value, src, {options = OPTION_LATITUDE})
-    local ok2, lo = pcall(src.value, src, {options = OPTION_LONGITUDE})
-    if ok1 and ok2 and type(la) == "number" and type(lo) == "number" then return la, lo end
+  if opt then
+    FELD.optLa = FELD.optLa or {options = OPTION_LATITUDE}
+    FELD.optLo = FELD.optLo or {options = OPTION_LONGITUDE}
+    local ok1, la = pcall(src.value, src, FELD.optLa)
+    local ok2, lo = pcall(src.value, src, FELD.optLo)
+    if ok1 and ok2 and type(la) == "number" and type(lo) == "number" then FELD.gpsRd = 2; return la, lo end
+    if FELD.gpsRd == 2 then FELD.gpsRd = nil end                 -- naechstes Mal wieder beide Wege
   end
   return nil
 end
@@ -1512,7 +1521,10 @@ function BAL.AS.read(w, now)
   local v = src and readNumber(src)
   if not v then w.asOk, w.asTas = false, nil; return end
   local u = w.airUnit or 1
+  -- 1.52: automatische Einheit nur einmal pro Quelle bestimmen (vorher in jedem Aufruf unit(), 6x rawget, neue Funktion)
+  if u == 1 and w.asUSrc == src and w.asU then u = w.asU end
   if u == 1 then
+    w.asUSrc = src
     local ok, un = pcall(src.unit, src)
     if not ok then un = nil end
     local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
@@ -1520,6 +1532,7 @@ function BAL.AS.read(w, now)
     elseif is("UNIT_KPH", "km/h") or is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") or BAL.isKmh(un) then u = 2
     elseif is("UNIT_MPH", "mph") then u = 5
     else u = 3 end                                            -- Knoten oder ohne Einheit (DIY-Sensor): Knoten
+    w.asU = u
   end
   local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
   if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
@@ -2491,7 +2504,19 @@ local function glideCalc(w, f, full)
       end
     end
   end
-  plan = plan or planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C, f.hdg)
+  -- 1.52: Auf dem Schenkel (Kurve nach Plan in mehr als 12 s, Eckansicht noch mehr als 2 s entfernt) den Weg nur
+  -- einmal pro Sekunde neu planen. Ablage, Balken und Kurs-Kommando kommen dort aus der Soll-Linie (crossTrack), der
+  -- Plan zaehlt erst ab Kurve in 6 s (Kurs-Kommando, Kurs-Ansage, Wendeton). Spart pro GPS-Punkt die teuerste
+  -- Rechnung (bis 6 Iterationen) und einen grossen Teil des Speichermuells.
+  if not plan and not lm then
+    local op = w.gc and w.gc.plan
+    if op and w.planFix and w.planFix.tp == w.tp and f.clk and f.clk >= w.planFix.clk and f.clk - w.planFix.clk < 1
+      and (op.tT or 0) > 12 and (op.t1 or 0) > w.zoomSec + 2 and not op.late and not op.inTurn and not op.turnDir then plan = op end
+  end
+  if not plan then
+    plan = planPath(f.x, f.y, wx, wy, w.tasF or f.tas or 20, R, C, f.hdg)
+    w.planFix = {clk = f.clk or 0, tp = w.tp}
+  end
   if plan.late and not missed and w.tp < 3 then
     local now = os.clock()
     if not lm or now - lm.t >= 1 then w.lateMiss = {j = j, t = now, t2 = plan.t2 or 1e9, plan = plan, pending = true} end
@@ -2780,7 +2805,10 @@ function turnTone(w, g, now)
   -- den Sektor sicher erreicht. Zeigt der Kurs so, dass keine Kurve den Zielpunkt erreicht, zaehlt der Plan (die
   -- Kurs-Ansage sagt, wohin); bei "Ecke geschnitten" ohne erreichbaren Zielpunkt sofort.
   local tT = p.tT or 99
-  local th = w.cur and headingTurnT(w, g, w.cur)
+  -- 1.52: nur nahe der Kurve rechnen. Das Ergebnis zaehlt erst ab rund 7 s (Einzaehlen, Kurs-Ansage); bei Kurve nach
+  -- Plan in mehr als 15 s kommt vom jetzigen Kurs aus keine Kurve so viel frueher in den Sektor. Spart pro GPS-Punkt
+  -- 24 Bogenschritte auf dem Schenkel.
+  local th = w.cur and (tT <= 15 or p.missed or p.late or p.inTurn or wt) and headingTurnT(w, g, w.cur) or nil
   if th then tT = th
   elseif p.missed then tT = (g.dV or 0) < 2 * ((g.C and g.C[1] and g.C[1].R) or R_DEFAULT) and 0 or 99
   else
@@ -3107,6 +3135,18 @@ function BAL.VT.climb(st, v)
   local per = 150 + (5 - v) * 90
   return 500 + 200 * v, per, per - math.floor(per / 3)
 end
+-- 1.52 Sinkton aktiv? Lastbremse und "Bildaufbau beim Varioton" gelten nur dann (im Steigen und in der Stille
+-- zeichnet das Widget normal). Ein sofort, sobald der Wert unter der Stillegrenze liegt; aus erst 3 s danach, damit die
+-- Bildrate an der Grenze nicht flackert. Stillegrenze: Ethos-Vario = Konfig "Ethos-Vario still ab" (vsLo, muss zur
+-- Einstellung "Mitte" im Sender passen), Widget-Toene = Totzone aus der App (vzLo).
+function BAL.VT.sinking(w, t)
+  if not w.vtOn then w.vtSinkT = nil; return false end
+  local v, lo
+  if w.vtDev == 2 then v, lo = w.varioRaw, (w.vsLo or 6) / 10 else v, lo = w.vtV, (w.vzLo or 3) / 10 end
+  if v and v < -lo then w.vtSinkT = t end
+  return w.vtSinkT ~= nil and t - w.vtSinkT < 3
+end
+
 function BAL.VT.sink(st, v)
   local a = -v
   if st == 2 then return 350 / (1 + 0.85 * a) end
@@ -3300,7 +3340,8 @@ function BAL.TM.wake(f, w)
   T.ld = math.max(0, (T.ld or 0) - (T.last and (t - T.last) or 0) * T.GOV_RATE)
   T.last = t
   -- 1.49: nie in der Naehe einer Ecke (dort schweigt der Varioton ohnehin, der Wendeton hat Vorrang)
-  T.gov = w.vtOn and (w.calcIv or 1) == 1 and not w.nearC
+  -- 1.52: nur solange der Sinkton wirklich klingt (Christoph 22.11.2026: im Steigen hackt es nie), siehe BAL.VT.sinking
+  T.gov = w.vtOn and (w.calcIv or 1) == 1 and not w.nearC and BAL.VT.sinking(w, t)
   -- spaetestens nach 1 s wieder voll rechnen (Weg, Seiten, Toene)
   if T.gov and T.ld > T.GOV_MAX and t - (T.full or 0) < 1 then
     -- 1.49 leicht: jeden neuen GPS-Punkt einlesen und werten; ein Ereignis rechnet den Aufruf voll
@@ -3308,7 +3349,7 @@ function BAL.TM.wake(f, w)
     f(w, true)
     -- Bild auch aus dem leichten Aufruf (Position aus dem letzten Punkt, Weg aus der letzten vollen Rechnung)
     if w.lastInvalidate and t - w.lastInvalidate >= (T.VD[w.vtDraw or 2] or 0.6) then
-      w.lastInvalidate = t
+      w.lastInvalidate, w.drawFix = t, nil
       lcd.invalidate()
     end
     -- Vario-Wert frisch (readInputs hat ihn eben gelesen), damit der Ton ohne Verzoegerung folgt
@@ -3836,6 +3877,7 @@ local function wakeup(w, lite)
       assess(w, f, now)
       w.fix = f
       w.cur = f
+      w.drawFix = true                                       -- 1.52: neuer Punkt, Bild faellig
       w.calcDue = (w.calcDue or 0) + 1
       if w.lastEventT ~= now then return end
       fLite = f
@@ -3895,6 +3937,7 @@ local function wakeup(w, lite)
     end
     assess(w, f, now)
     w.fix = f
+    w.drawFix = true                                           -- 1.52: neuer Punkt, Bild faellig
   end
   local cur = w.fix
   if cur and now - cur.clk > 3 then cur = nil end
@@ -3981,9 +4024,13 @@ local function wakeup(w, lite)
   end
 
   local ivD = BAL.TM.IV[w.drawIv or 1] or 0.15
-  if BAL.TM.gov and w.vtOn then ivD = math.max(ivD, BAL.TM.VD[w.vtDraw or 2] or 0.6) end   -- 1.48/1.49 beim Varioton
-  if now - w.lastInvalidate >= ivD then
-    w.lastInvalidate = now
+  if BAL.TM.gov and w.vtOn then ivD = math.max(ivD, BAL.TM.VD[w.vtDraw or 2] or 0.6) end   -- 1.48/1.49 beim Sinkton (1.52)
+  -- 1.52 Bild synchron zum GPS (Christoph 22.11.2026): gezeichnet wird, sobald ein neuer Punkt gerechnet ist, so
+  -- zeigt jedes Bild den frischesten Punkt. Nie oefter als "Bildaufbau" (ivD); ohne neuen Punkt (kein GPS, am
+  -- Boden) wie bisher nach Uhr, dann hoechstens jede Sekunde.
+  local since = now - w.lastInvalidate
+  if since >= ivD and (w.drawFix or not w.gpsOk or since >= math.max(ivD, 1)) then
+    w.lastInvalidate, w.drawFix = now, nil
     lcd.invalidate()
   end
   BAL.TM.mark("t")
@@ -4940,17 +4987,29 @@ local function paintCorner(w, g, x0, y0, bw, bh)
     DRW.color(C_BLUE)
     polyAff(g.plan.pts, cx - (mx * T.ux + my * T.uy) * sc, T.ux * sc, T.uy * sc, cy + (mx * T.px + my * T.py) * sc, -T.px * sc, -T.py * sc)
   end
-  -- Spur der letzten 40 s (gefaerbt nach Vario), Projektion ausgeschrieben: diese Schleife ist die teuerste
+  -- Spur der letzten 40 s (gefaerbt nach Vario), Projektion ausgeschrieben: diese Schleife ist die teuerste.
+  -- 1.52: wie auf der Thermik-Seite hoechstens 40 Punkte (Beginn per Halbierung, gleichmaessige Schritte bis zum
+  -- neuesten Punkt) und keiner naeher als 3 px am zuletzt gezeichneten; vorher bis 160 Punkte umgerechnet.
   do
     local kux, kuy, kpx, kpy = T.ux * sc, T.uy * sc, T.px * sc, T.py * sc
     local c1, c2, c3, c4 = x0, y0, x0 + bw - 1, y0 + bh - 1
     local tr, nowc, lastCol = w.trail, os.clock(), nil
-    for i = #tr, 1, -1 do
+    local n = #tr
+    local lo, hi, tmin = 1, n, nowc - 40
+    while lo < hi do
+      local mid = (lo + hi) // 2
+      if tr[mid].t < tmin then lo = mid + 1 else hi = mid end
+    end
+    local step = n > lo and (n - lo) // 40 + 1 or 1
+    lo = n - (n - lo) // step * step
+    local lx, ly = -99, -99
+    for i = lo, n, step do
       local p = tr[i]
-      if nowc - p.t > 40 then break end
       local dx, dy = p.x - mx, p.y - my
       local ax, ay = cx + dx * kux + dy * kuy, cy - (dx * kpx + dy * kpy)
-      if ax >= c1 and ax <= c3 and ay >= c2 and ay <= c4 then
+      local ex, ey = ax - lx, ay - ly
+      if ax >= c1 and ax <= c3 and ay >= c2 and ay <= c4 and (ex * ex + ey * ey >= 9 or i == n) then
+        lx, ly = ax, ay
         local col = (p.v or 0) > 0.5 and C_YELLOW or C_WHITE
         if col ~= lastCol then DRW.color(col); lastCol = col end
         lcd.drawFilledRectangle(((ax) // 1 | 0) - 1, ((ay) // 1 | 0) - 1, 2, 2)
@@ -5028,6 +5087,27 @@ function BAL.QL.draw(w, px, py, k, side)
   else drawT(px - 44 * k - tw, py + 8 * k, tw, txt, FONT_S, w.qlBad and C_DIM or C_WHITE, "r") end
 end
 
+-- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen (Seite Gleiten)
+function BAL.fitFont(leftVals, tw, hLeft, fields, fw, fh)
+  local hL = textH(FONT_XS)
+  for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L, FONT_STD}) do
+    DRW.font(fo)
+    local _, th = lcd.getTextSize("0")
+    local ok = true
+    if leftVals then
+      if 4 * (hL + th) > hLeft then ok = false end
+      for _, v in ipairs(leftVals) do if ok and lcd.getTextSize(v[2]) > tw then ok = false end end
+    end
+    if ok and fields then
+      if textH(FONT_S) + th + 4 > fh then ok = false end
+      DRW.font(fo)
+      for _, v in ipairs(fields) do if ok and v[2] and lcd.getTextSize(v[2]) > fw - 14 then ok = false end end
+    end
+    if ok then return fo end
+  end
+  return FONT_STD
+end
+
 local function paintGlide(w, W, H, top)
   local T, f, g = w.task, w.cur, w.gc or {}
   local m = 6
@@ -5048,24 +5128,17 @@ local function paintGlide(w, W, H, top)
     {"NETTO", w.netto and string.format("%+.1f", w.netto) or "--", (w.netto or 0) >= 0.1 and C_GREEN or ((w.netto or 0) <= -0.1 and C_RED or C_WHITE)},
   } or nil
   -- groesste Schrift, in der alle Werte (links und unten) in ihre Felder passen; alle gleich gross
+  -- 1.52: Ergebnis gemerkt; neu gemessen wird nur, wenn sich Kasten oder Laenge eines Werts aendert (Ziffern sind
+  -- gleich breit). Vorher in jedem Bild bis 5 Schriften mit je ~9 getTextSize (je ~0.19 ms am Sender).
   local function fitFont(fields, fw, fh)
-    local hL = textH(FONT_XS)
-    for _, fo in ipairs({FONT_XXL, FONT_XL, F_L, FONT_L, FONT_STD}) do
-      DRW.font(fo)
-      local _, th = lcd.getTextSize("0")
-      local ok = true
-      if leftVals then
-        if 4 * (hL + th) > H - y - m then ok = false end
-        for _, v in ipairs(leftVals) do if ok and lcd.getTextSize(v[2]) > tw then ok = false end end
-      end
-      if ok and fields then
-        if textH(FONT_S) + th + 4 > fh then ok = false end
-        DRW.font(fo)
-        for _, v in ipairs(fields) do if ok and v[2] and lcd.getTextSize(v[2]) > fw - 14 then ok = false end end
-      end
-      if ok then return fo end
-    end
-    return FONT_STD
+    local key = ((tw * 1000 + (H - y - m)) * 1000 + (fields and fw or 0) // 1) * 1000 + (fields and fh or 0) // 1
+    local key2 = 0
+    if leftVals then for _, v in ipairs(leftVals) do key2 = key2 * 32 + math.min(#v[2], 31) end end
+    if fields then for _, v in ipairs(fields) do key2 = key2 * 32 + (v[2] and math.min(#v[2], 31) or 0) end end
+    if w.ffK == key and w.ffK2 == key2 and w.ffV then return w.ffV end
+    w.ffK, w.ffK2 = key, key2
+    w.ffV = BAL.fitFont(leftVals, tw, H - y - m, fields, fw, fh)
+    return w.ffV
   end
   local function drawLeft(vf)
     if leftVals then
@@ -5857,6 +5930,10 @@ local function configure(w)
   addChoice(w, "Höhe für Wertung", "altMode", {{"GPS minus Platzhöhe", 1}, {"Relative Höhe", 2}})
   addChoice(w, "Varioton-Ausgabe", "vtDev", {{"Widget-Toene", 1}, {"Ethos-Vario (Sensor SkyNav Vario)", 2}})
   if w.vtDev == 2 then
+    -- 1.52: Grenze, ab der das Ethos-Vario sinkt (wie "Mitte" in der Sonderfunktion Vario abspielen)
+    local ch = {}
+    for k = 1, 15 do ch[k] = {string.format("-%.1f m/s", k / 10), k} end
+    addChoice(w, "Ethos-Vario still bis", "vsLo", ch)
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
   addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5},
@@ -5944,6 +6021,7 @@ local function setDefaults(w)
   w.airSrc, w.airUnit, w.crsSrc, w.satSrc = nil, 1, nil, nil
   w.vtStyle, w.vtDev = 1, 1
   w.drawIv, w.calcIv, w.vtDraw = 1, 1, 2
+  w.vsLo = 6
   w.devMain, w.devStabi, w.varioType = 1, false, 0   -- 1.30: neue Widgets suchen die Sensoren des SM GPS-Logger 3
 end
 
@@ -5999,6 +6077,9 @@ local function read(w)
       w.devStabi = d == 1
       w.drawIv = (e >= 1 and e <= 4) and e or 1
     end
+    -- 1.52: Stillegrenze Ethos-Vario gepackt im ungenutzten radMode: 1000 + vsLo (0.1 m/s)
+    local rm = w.radMode
+    w.vsLo = (type(rm) == "number" and rm >= 1001 and rm <= 1015) and (math.floor(rm) - 1000) or 6
   end
   BAL.SN.load(w)
   w.mcValue = w.mc / 10
@@ -6006,6 +6087,7 @@ local function read(w)
 end
 
 local function write(w)
+  w.radMode = 1000 + (w.vsLo or 6)
   w.radFix = 10000000 * (w.vtDraw or 2) + 1000000 + 100000 * (w.calcIv or 1) + (w.vtStyle or 1) + 10 * (w.vtDev or 1) + 100 * (w.devMain or 0) + 1000 * (w.devStabi and 1 or 0) + 10000 * (w.drawIv or 1)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, BAL.SN.stored(w, k)) end
