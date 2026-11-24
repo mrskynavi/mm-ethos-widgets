@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52.3
+-- @version 1.52.4
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52.3"
+local VERSION = "1.52.4"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -720,6 +720,7 @@ end
 -- Bildschirm ist. nil = Ereignis (Wendeton, Sektor, Start, Ziel, Zone): kommt auf jeder Seite und auch,
 -- wenn am Sender ein anderer Bildschirm offen ist (die Wertung laeuft ja weiter).
 local function audible(w, page)
+  if w.forceSay then return true end            -- 1.52.4: "Wende rechts" und "verpasst" kommen immer
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
   -- Wendevorhersage hat Vorrang vor allem: rund um die Wende (w.prioUntil, siehe turnTone) schweigen alle anderen
@@ -2673,9 +2674,10 @@ end
 -- tv  = Vorhalt (s) fuer "Jetzt", pro Modell in radien.lua (tv), gelernt aus der Sektortiefe nach jeder Wende.
 -- early = Warnung, wenn das Modell vor dem Sektor schon so eindreht, dass die Kurve (volle Drehrate V/R) den
 --         Sektor nicht erreicht: tiefer Doppelton + Vibration ("kurz geradeaus").
--- miss  = Alarm, wenn der naechste TP ohne Sektor hinter dem Modell liegt (nahe vorbei, Abstand waechst 3 s im
---         Geradeausflug) oder das Modell im Sektor des uebernaechsten TP ist: Toene, Vibration, "Wendepunkt n
---         verpasst" (audio/wendepunkt.wav, verpasst.wav), alle 6 s, Balken "TPn FEHLT" bis der Sektor erreicht ist.
+-- miss  = Alarm (1.52.4, Christoph 24.11.2026): das Modell war hoechstens BAL.WV.NEAR m am TP, ohne den Sektor zu
+--         erreichen, und fliegt danach BAL.WV.STEADY s gerade auf das naechste Ziel zu (naechster TP bzw. Ziellinie):
+--         Toene, Vibration, "Wendepunkt n verpasst" (audio/wendepunkt.wav, verpasst.wav), genau einmal pro TP und
+--         durch nichts unterdrueckt (Ton aus, Vorrang, Seite); Balken "TPn FEHLT" bis der Sektor erreicht ist.
 BAL.WV = {TV0 = 1.0, LO = 0.3, HI = 1.5}
 
 function BAL.WV.tv(w)
@@ -2697,16 +2699,39 @@ function BAL.WV.jetzt(w, g)
   w.wvJ = {j = g.next, vb = f.ve * c.bx + f.vn * c.by, lap = #w.laps}
 end
 
-BAL.WV.NEAR = 100
+BAL.WV.NEAR, BAL.WV.STEADY = 50, 4
 function BAL.WV.alarm(w, now, j)
   prioHold(w, now, 3.5)
-  w.prioPlay = true
+  w.prioPlay, w.forceSay = true, true
   tone(w, nil, 900, 150); tone(w, nil, 700, 150); tone(w, nil, 500, 300)
   haptic(w, nil, 500)
   if audioFile("verpasst.wav") then
     sayWord(w, nil, "wendepunkt.wav"); sayNumber(w, nil, j, UNIT_RAW, 0); sayWord(w, nil, "verpasst.wav")
   end
-  w.prioPlay = nil
+  w.prioPlay, w.forceSay = nil, nil
+end
+
+-- 1.52.4 Wende entgegen der normalen Richtung (Christoph 24.11.2026): rechnet der Weg nach geschnittener Ecke die
+-- schnellere Wende zur anderen Seite (normal: links), einmal pro Ecke "Wende rechts" (audio/wende_rechts.wav, bei
+-- Aufgaben im Uhrzeigersinn "Wende links"), durch nichts unterdrueckt. Ohne Datei: Zwitscher wie die Kurs-Ansage.
+function BAL.WV.reverse(w, g, now, key)
+  local p, T = g.plan, w.task
+  local c = T and g.next and T.tp[g.next]
+  if not (p and p.turnDir and c and c.s) or w.wrKey == key then return false end
+  local left = p.turnDir > 0
+  if (left and 1 or -1) == c.s then return false end            -- normale Richtung: keine Ansage
+  w.wrKey = key
+  prioHold(w, now, 2.5)
+  w.prioPlay, w.forceSay = true, true
+  if not sayWord(w, nil, left and "wende_links.wav" or "wende_rechts.wav") then
+    if not sayWord(w, nil, left and "links.wav" or "rechts.wav") then
+      tone(w, nil, left and 2200 or 1500, 120); tone(w, nil, left and 1500 or 2200, 120)
+    end
+  end
+  haptic(w, nil, 300)
+  w.prioPlay, w.forceSay = nil, nil
+  w.quietUntil = now + 2
+  return true
 end
 
 function BAL.WV.learn(w, M)
@@ -2738,13 +2763,6 @@ function BAL.WV.step(w, f, now, dt)
   end
   -- Alarm wiederholen (auch ohne neuen Fix)
   local X = w.wvX
-  -- 1.52.3 (Christoph 24.11.2026: Alarm kam im Bart und ohne je nahe am TP gewesen zu sein): nur im Gleiten
-  -- (kein Kreisen, kein Bart), auch die Wiederholung
-  local glide = not (w.therm or w.circSince or w.vtCirc)
-  if w.missTP and X and X.nextT and now >= X.nextT and glide then
-    X.nextT = now + 6
-    if not X.toward then BAL.WV.alarm(w, now, w.missTP) end
-  end
   if not (f and f.ve) or f.clk == w.wvClk then return end
   w.wvClk = f.clk
   -- Tiefe nach dem Sektor-Eintritt: bis sie wieder abnimmt (Kurve fertig), hoechstens 12 s, nicht im Bart
@@ -2785,23 +2803,20 @@ function BAL.WV.step(w, f, now, dt)
   end
   -- verpasst (nur TP1..3, nicht die Ziellinie; nicht im Landeanflug unter 50 m)
   if w.tp >= 3 or (f.agl or 999) < 50 then return end
-  if not X or X.j ~= j then X = {j = j, dmin = dist, dprev = dist}; w.wvX = X end
+  if not X or X.j ~= j then X = {j = j, dmin = dist}; w.wvX = X end
   if dist < X.dmin then X.dmin = dist end
-  local cosA = gs > 3 and dist > 1 and ((c.x - f.x) * f.ve + (c.y - f.y) * f.vn) / (dist * gs) or 0
-  X.toward = cosA > 0.5
-  local away = cosA < -0.17 and dist > X.dprev and (w.omega or 0) < math.rad(15)
-  X.dprev = dist
-  if away then X.awayT = X.awayT or now else X.awayT = nil end
-  if not w.missTP then
-    -- 1.52.3: nur, wenn das Modell unmittelbar am TP war (naeher als BAL.WV.NEAR m; vorher 250 m, und im Sektor
-    -- des naechsten TP auch ohne je in der Naehe gewesen zu sein: die Sektoren reichen 1.5 km weit)
-    local near = X.dmin < BAL.WV.NEAR
-    local passed = near and dist > X.dmin + 40 and X.awayT and now - X.awayT >= 3
-    local nextSec = near and j < 3 and inSector(T, j + 1, f.x, f.y)
-    if glide and (passed or nextSec) then
-      w.missTP, X.nextT = j, now + 6
-      BAL.WV.alarm(w, now, j)
-    end
+  -- 1.52.4: am TP (hoechstens NEAR m) vorbei, dann gerade aufs naechste Ziel (naechster TP, nach TP3 der Ursprung
+  -- auf der Ziellinie): Kurs ueber Grund hoechstens 30 Grad daneben, keine Kurve, STEADY s lang, und schon 30 m weg
+  local nx, ny = 0, 0
+  if j < 3 then nx, ny = T.tp[j + 1].x, T.tp[j + 1].y end
+  local ex, ey = nx - f.x, ny - f.y
+  local el = math.sqrt(ex * ex + ey * ey)
+  local onWay = X.dmin <= BAL.WV.NEAR and dist > X.dmin + 30 and gs > 3 and el > 1
+    and (ex * f.ve + ey * f.vn) / (el * gs) > 0.87 and (w.omega or 0) < math.rad(8)
+  if onWay then X.wayT = X.wayT or now else X.wayT = nil end
+  if not w.missTP and not X.fired and X.wayT and now - X.wayT >= BAL.WV.STEADY then
+    X.fired, w.missTP = true, j
+    BAL.WV.alarm(w, now, j)
   end
 end
 
@@ -2812,6 +2827,8 @@ function turnTone(w, g, now)
   local key = #w.laps * 4 + w.tp
   local wt = w.warn
   if wt and wt.key ~= key then wt = nil; w.warn = nil end
+  -- 1.52.4: Wende zur ungewohnten Seite ansagen; ersetzt "Jetzt" dieser Ecke (sonst kaeme der Ton mitten hinein)
+  if BAL.WV.reverse(w, g, now, key) then w.warn = {key = key, done = true}; return true end
   if wt and wt.done then
     -- deutlich weg von der Kurve (abgebrochen, z. B. Bart): fuer diese Ecke wieder frei
     if not (p.inTurn or p.missed or p.late) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warn = nil end
