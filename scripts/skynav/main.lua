@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52
+-- @version 1.52.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52"
+local VERSION = "1.52.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2415,7 +2415,11 @@ function BAL.QA.step(w, now, dt)
   end
   local k = (m and m.qk) or w.qaRate or 30
   if not fly then w.qaB = bg
-  else w.qaB = (w.qaB or bg) + dt * k * qq + dt / ((w.qaTau or 25) / 10) * (bg - w.qaB) end
+  else
+    -- 1.52.1: Startwert auch im Klammerausdruck (Simulator: nil, wenn der Flug ohne Knueppel-Wert begann)
+    local b = w.qaB or bg
+    w.qaB = b + dt * k * qq + dt / ((w.qaTau or 25) / 10) * (bg - b)
+  end
   if not sens then w.qlPhi, w.qlEst = clamp(w.qaB, -80, 80), true end
 end
 
@@ -2812,9 +2816,15 @@ function turnTone(w, g, now)
   if th then tT = th
   elseif p.missed then tT = (g.dV or 0) < 2 * ((g.C and g.C[1] and g.C[1].R) or R_DEFAULT) and 0 or 99
   else
-    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: kein "Jetzt", dafuer kurz vor der Ecke die Kurs-Ansage
-    -- nach dem Plan ("15 rechts"), alle 3 s, auf jeder Seite
-    if (p.tT or 99) - w.lead / 10 <= w.warnSec + 3 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
+    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: vor dem Einzaehlen die Kurs-Ansage nach dem Plan
+    -- ("15 rechts", alle 3 s, auf jeder Seite), dann zaehlt der Plan.
+    -- 1.52.1 (Christoph 24.11.2026: vor den Wenden oft Kurskorrektur statt "drei, zwei, eins"): Das Einzaehlen hat
+    -- Vorrang. Vorher sprang die Restzeit ohne erreichbare Kurve auf 99, ein laufendes Einzaehlen verstummte und die
+    -- Kurs-Ansage kam mitten hinein. Jetzt: Kurs-Ansage nur, bis das Einzaehlen beginnt (Fenster 4 bis 9 s vor
+    -- der Kurve, Platz fuer eine Ansage), danach zaehlt der Plan weiter bis "Jetzt".
+    local tp = (p.tT or 99) - BAL.WV.tv(w)                     -- wie das Einzaehlen unten (Vorhalt)
+    local nC = math.max(w.warnSec, 3)
+    if not wt and tp <= nC + 6 and tp > nC + 2 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
       w.crsT = now
       local right = g.err > 0
       local fn = right and "rechts.wav" or "links.wav"
@@ -2827,7 +2837,7 @@ function turnTone(w, g, now)
       end
       w.prioPlay = nil
     end
-    tT = 99
+    tT = p.tT or 99
   end
   -- Vorhalt (1.43): "Jetzt" kommt tv s VOR dem fruehesten sicheren Kurvenbeginn. Bis die Kurve wirklich dreht,
   -- vergehen Reaktion, Einrollen und Aufbau der Drehrate (ASW-17 am 13.11.: Knueppel bis Drehung 1.2 s, Drehung im
@@ -2888,7 +2898,9 @@ local function glideTones(w, g, now, warn)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
     -- Mit Querlage: Kursfehler nach der vorausgerechneten Drehung (g.rest); HALTEN und AUSLEITEN ohne Kurs-Ansage
     local ge = g.rest or g.err
-    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
+    -- 1.52.1: nur bis 9 s vor der Kurve (vorher 6 s): eine Ansage dauert ~2 s und darf nicht ins Einzaehlen laufen
+    -- (beginnt rund 4 s + Vorhalt vor der Kurve, Vorrang 1.5 s frueher); danach gilt die Kurs-Ansage des Wendetons
+    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 9 and (not w.quietUntil or now > w.quietUntil) then
       local a, right = math.abs(ge), ge > 0
       local xt, xp = g.xt, g.xtPred
       local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
