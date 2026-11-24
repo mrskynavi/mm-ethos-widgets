@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52.4
+-- @version 1.52.5
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52.4"
+local VERSION = "1.52.5"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3662,12 +3662,16 @@ function RZ.table(w, now)
   if #w.laps > r.nl then
     r.nl = #w.laps
     local L = w.laps[r.nl]
-    r.ks[#r.ks + 1] = clamp(r.dist / T.perim, 1, 1.6)
+    local kLap = clamp(r.dist / T.perim, 1, 1.6)
+    r.ks[#r.ks + 1] = kLap
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
     if r.TL and r.mcN > 0 then
       local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
-      local tg, dh = r.k * r.TL[mi], r.k * r.HL[mi]
+      -- 1.52.5 (Christoph 24.11.2026, Log ASW-17: "RAUS" mit 23 min Rest, 4 Dreiecke): Modellzeit mit dem Index
+      -- DIESER Runde. Vorher galt der alte Index (Start 1.05): eine Runde mit Umwegen zaehlte doppelt, im Index
+      -- (1.6) und nochmals im Lernfaktor f (2.3), jede weitere Runde wurde rund 3.5-mal so lang gerechnet.
+      local tg, dh = kLap * r.TL[mi], kLap * r.HL[mi]
       local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.7, 2.5)
       r.f = r.f and (r.f + q) / 2 or q
     end
