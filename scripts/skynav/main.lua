@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52.2
+-- @version 1.52.3
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52.2"
+local VERSION = "1.52.3"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -2697,6 +2697,7 @@ function BAL.WV.jetzt(w, g)
   w.wvJ = {j = g.next, vb = f.ve * c.bx + f.vn * c.by, lap = #w.laps}
 end
 
+BAL.WV.NEAR = 100
 function BAL.WV.alarm(w, now, j)
   prioHold(w, now, 3.5)
   w.prioPlay = true
@@ -2737,7 +2738,10 @@ function BAL.WV.step(w, f, now, dt)
   end
   -- Alarm wiederholen (auch ohne neuen Fix)
   local X = w.wvX
-  if w.missTP and X and X.nextT and now >= X.nextT then
+  -- 1.52.3 (Christoph 24.11.2026: Alarm kam im Bart und ohne je nahe am TP gewesen zu sein): nur im Gleiten
+  -- (kein Kreisen, kein Bart), auch die Wiederholung
+  local glide = not (w.therm or w.circSince or w.vtCirc)
+  if w.missTP and X and X.nextT and now >= X.nextT and glide then
     X.nextT = now + 6
     if not X.toward then BAL.WV.alarm(w, now, w.missTP) end
   end
@@ -2789,9 +2793,12 @@ function BAL.WV.step(w, f, now, dt)
   X.dprev = dist
   if away then X.awayT = X.awayT or now else X.awayT = nil end
   if not w.missTP then
-    local passed = X.dmin < 250 and dist > X.dmin + 40 and X.awayT and now - X.awayT >= 3
-    local nextSec = j < 3 and inSector(T, j + 1, f.x, f.y)
-    if passed or nextSec then
+    -- 1.52.3: nur, wenn das Modell unmittelbar am TP war (naeher als BAL.WV.NEAR m; vorher 250 m, und im Sektor
+    -- des naechsten TP auch ohne je in der Naehe gewesen zu sein: die Sektoren reichen 1.5 km weit)
+    local near = X.dmin < BAL.WV.NEAR
+    local passed = near and dist > X.dmin + 40 and X.awayT and now - X.awayT >= 3
+    local nextSec = near and j < 3 and inSector(T, j + 1, f.x, f.y)
+    if glide and (passed or nextSec) then
       w.missTP, X.nextT = j, now + 6
       BAL.WV.alarm(w, now, j)
     end
