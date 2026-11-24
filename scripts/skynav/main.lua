@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52.1
+-- @version 1.52.2
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52.1"
+local VERSION = "1.52.2"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1799,6 +1799,11 @@ local function readInputs(w, now, dt)
   -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
   if vario ~= nil and w.varioType == 2 then vario = vario + (w.teDE or 0) end
   w.varioRaw = vario
+  -- 1.52.2 Wert fuer das Ethos-Vario (Christoph 24.11.2026): nur im Sinken leicht geglaettet (0.3 s), damit kurze
+  -- Ausschlaege den Sinkton nicht vor der Schwelle ausloesen; Steigen und jedes Ansteigen gehen unverzoegert durch
+  if vario == nil then w.voV = nil
+  elseif vario >= 0 or w.voV == nil or vario >= w.voV then w.voV = vario
+  else w.voV = lpf(w.voV, vario, dt, 0.3) end
   if vario ~= nil then w.vFast = lpf(w.vFast, vario, dt, 0.6) end
   if lat == nil then
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
@@ -3154,7 +3159,7 @@ end
 function BAL.VT.sinking(w, t)
   if not w.vtOn then w.vtSinkT = nil; return false end
   local v, lo
-  if w.vtDev == 2 then v, lo = w.varioRaw, (w.vsLo or 6) / 10 else v, lo = w.vtV, (w.vzLo or 3) / 10 end
+  if w.vtDev == 2 then v, lo = w.voV, (w.vsLo or 6) / 10 else v, lo = w.vtV, (w.vzLo or 3) / 10 end
   if v and v < -lo then w.vtSinkT = t end
   return w.vtSinkT ~= nil and t - w.vtSinkT < 3
 end
@@ -3248,7 +3253,7 @@ function BAL.VO.write(s, mode, v)
   return pcall(s.value, s, v)
 end
 function BAL.VO.set(w, now, on)
-  local v = on and w.varioRaw or 0
+  local v = on and (w.voV or w.varioRaw) or 0
   v = clamp(v, -20, 20)
   BAL.VO.on = on
   BAL.VO.v, BAL.VO.t = v, now
@@ -3367,7 +3372,7 @@ function BAL.TM.wake(f, w)
     -- Vario-Wert frisch (readInputs hat ihn eben gelesen), damit der Ton ohne Verzoegerung folgt
     local s = w.voSens
     if s and w.vtDev == 2 and w.voMode then
-      local v = BAL.VO.on and clamp(w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
+      local v = BAL.VO.on and clamp(w.voV or w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
       BAL.VO.v = v
       if BAL.VO.write(s, w.voMode, v) then w.voLast = v end
     end
@@ -3390,6 +3395,7 @@ function BAL.TM.wake(f, w)
   if w.calcIv and w.calcIv >= 4 and w.calcIv <= 9 then
     -- 1.47: Laststufen 6..9 ebenfalls mit festen -2 m/s (am Boden steht das echte Vario bei 0 = still)
     w.varioRaw = (w.calcIv == 4) and (readNumber(w.vario) or 0) or -2
+    w.voV = w.varioRaw                                         -- Testwerte ungeglaettet
     BAL.VO.set(w, t, true)
     local busy = ({0, 0, 0.010, 0.020, 0.040, 0})[w.calcIv - 3]
     if w.calcIv == 9 and t - (T.bz or 0) >= 1 then T.bz, busy = t, 0.100 end
