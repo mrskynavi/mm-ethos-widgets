@@ -3334,7 +3334,7 @@ local function thermCalc(w, f, now, dt)
       local d = math.abs(angDiff(bearingOf(tg.x - f.x, tg.y - f.y), f.crs))
       if r.awTh ~= w.therm then
         r.awTh, r.awArm, r.awDue = w.therm, d < 90, true
-        r.cirT, r.cirH, r.cirV, r.cirVp, r.cirMax = now, f.agl, nil, nil, nil
+        r.cirT, r.cirH, r.cirV, r.cirVp, r.cirMax = nil, nil, nil, nil, nil
       else
         if d < 90 then r.awArm = true end
         if r.awArm and d >= 145 then
@@ -4093,8 +4093,11 @@ function RZ.search(w, now)
   -- Echtes Steigen im aktuellen Bart (nicht auf +0.2 geklemmt!):
   -- nach dem ersten vollen 360-Grad-Kreis zaehlt der Kreis-Steigwert (bei Nachlassen sofort der letzte Kreis,
   -- sonst leicht mit dem vorigen geglaettet); davor der Gewinn seit Beginn des Einkreisens (ohne Gleit-Vorlauf).
-  local vh
+  local vh, avg30
   if w.therm then
+    local a, n = 0, w.avg30 and #w.avg30 or 0
+    for j = 1, n do a = a + w.avg30[j] end
+    avg30 = n > 0 and a / n or 0
     if r.cirV ~= nil then
       vh = (r.cirVp and r.cirVp > 0 and r.cirV >= r.cirVp) and (0.65 * r.cirV + 0.35 * r.cirVp) or r.cirV
     else
@@ -4102,9 +4105,7 @@ function RZ.search(w, now)
       if dt0 >= 6 then
         vh = (f.agl - (w.therm.cH0 or w.therm.h0)) / dt0
       else
-        local a, n = 0, w.avg30 and #w.avg30 or 0
-        for j = 1, n do a = a + w.avg30[j] end
-        vh = n > 0 and a / n or 0
+        vh = avg30
       end
     end
   end
@@ -4144,8 +4145,9 @@ function RZ.search(w, now)
   local vRef = Vc
   if not vRef and w.therm and r.cirMax and r.cirMax >= 0.8 then vRef = r.cirMax * 0.72 end
   -- Prueft N Dreiecke mit optional weiteren Baerten (vFut, inkl. 30 s Such-/Zentrierzeit fuer jeden weiteren Bart).
-  -- Ist vFut staerker als der aktuelle Bart vh, zaehlt auch die Option "jetzt gehen und spaeter in vFut steigen".
-  local vFut = vRef or (vh and vh > 0.2 and vh or nil)
+  -- Im Bart nie ohne realistisches Folgesteigen (mind. 0.5 m/s bzw. MC) rechnen, sonst kollabiert nMult bei
+  -- 20+ min Restzeit auf die aktuelle Gleithoehe und meldet faelschlich ENDANFLUG.
+  local vFut = w.therm and (vRef or math.max(vh or 0, avg30 or 0, w.mcValue or 0, 0.5)) or Vc
   local room = (vh and vh > 0.05) and math.max(0, hmax - f.agl) or 0
   local function evalMulti(N, j1, j2)
     local fT, fJ, fDh
@@ -4222,26 +4224,37 @@ function RZ.search(w, now)
   if not r.Ns or Nshow == r.Ns or w.therm then r.Ns, r.Nt = Nshow, nil
   elseif not r.Nt then r.Nt = now
   elseif now - r.Nt >= 10 then r.Ns, r.Nt = Nshow, nil end
-  r.vh = vh
+  r.vh = w.therm and (r.cirV ~= nil and vh or math.max(vh or 0, avg30 or 0)) or vh
 
   -- Entscheid im Bart: WEITER KREISEN oder AUF STRECKE GEHEN (RAUS)
   if w.therm then
     local hLap0 = math.max(40, k * math.max(HL[1], 10) * fH)
     local hSafe = math.min(hmax - 40, hmin + 1.5 * hLap0)
+    -- Echtes Sinken vs. kurzes Wackeln beim Zentrieren (z. B. -2 m Gewinn bei +0.3 m/s ueber 30 s)
+    local realSink = ((vh or 0) <= -0.15 and (avg30 or 0) <= 0.05) or ((vh or 0) <= -0.35)
     r.forSpeed, r.lowSave = false, false
 
     if f.agl >= hmax then
       r.act, r.Nh, r.hgo, r.over = "go_max", nMult, hmax, false
-    elseif (vh or 0) <= 0.10 then
-      if nNow > 0 and nMult <= nNow then
-        r.act, r.Nh, r.hgo, r.over = "go_end", nNow, f.agl, false
-      else
-        r.act, r.Nh, r.hgo, r.over = "go_sink", nNow, nil, false
-      end
     elseif nMult <= nEnd then
-      -- ENDANFLUG-BEREICH: kein weiterer Bart noetig/moeglich -> direkter Vergleich JETZT vs. WEITER STEIGEN
+      -- ENDANFLUG-BEREICH: auch mit weiteren Baerten (vFut >= 0.5) passen nicht mehr als nEnd Dreiecke
       if nEnd == 0 then
         r.act, r.Nh, r.hgo, r.over = "go_zero", 0, nil, false
+      elseif realSink or (vh or 0) <= 0.10 then
+        if nNow > 0 and nMult <= nNow then
+          r.act, r.Nh, r.hgo, r.over = "go_end", nNow, f.agl, false
+        elseif realSink then
+          r.act, r.Nh, r.hgo, r.over = "go_sink", nNow, nil, false
+        else
+          -- beim Zentrieren noch kein klares Kreissteigen, aber avg30 > 0 und mehr Hoehe bringt mehr Dreiecke
+          local vTry = math.max(avg30 or 0, 0.2)
+          local nT, _, _, hT = bestSingle(dh0, vTry, hmax, 1, nm)
+          if nT > nNow and hT and hT - f.agl > 5 then
+            r.act, r.Nh, r.hgo, r.over = "climb", nT, hT, false
+          else
+            r.act, r.Nh, r.hgo, r.over = "go_end", nNow, f.agl, false
+          end
+        end
       elseif nEnd > nNow then
         -- Weiterkreisen bringt mindestens 1 zusaetzliches Dreieck (und hEnd ist geschwindigkeitsoptimal)
         if hEnd - f.agl <= 5 then
@@ -4259,11 +4272,13 @@ function RZ.search(w, now)
         end
       end
     else
-      -- STRECKENFLUG-BEREICH: es braucht spaeter ohnehin weitere Baerte
-      if vRef and vh < 0.70 * vRef and f.agl >= hSafe then
+      -- STRECKENFLUG-BEREICH: noch genuegend Arbeitszeit, es braucht spaeter ohnehin weitere Baerte
+      if realSink then
+        r.act, r.Nh, r.hgo, r.over = "go_sink", nMult, nil, true
+      elseif r.cirV ~= nil and vRef and (vh or 0) < 0.70 * vRef and (avg30 or 0) < 0.75 * vRef and f.agl >= hSafe then
         r.act, r.Nh, r.hgo, r.over = "go_weak", nMult, nil, true
       else
-        r.lowSave = (vRef ~= nil and vh < 0.70 * vRef)
+        r.lowSave = (r.cirV ~= nil and vRef ~= nil and (vh or 0) < 0.70 * vRef)
         local tgt = r.lowSave and hSafe or hmax
         r.act, r.Nh, r.hgo, r.over = "stay", nMult, tgt, not r.lowSave
       end
