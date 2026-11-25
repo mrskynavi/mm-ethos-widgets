@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.53
+-- @version 1.53.1
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.53"
+local VERSION = "1.53.1"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3745,10 +3745,25 @@ function RZ.search(w, now)
   local hmax, hmin = T.maxAlt - 30, w.rzHmin
   local dh0 = math.min(f.agl, hmax) - hmin
   -- Zeit fuer N Dreiecke mit MC-Index mi (Pilotfaktor auf den letzten zwei Runden)
+  -- 1.53.1 (Christoph 25.11.2026: "RAUS" im Bart mit 25 min Rest und 4 Dreiecken, "mit der Hoehe waeren es 12"):
+  -- im Bart wird die fehlende Hoehe zuerst HIER gestiegen (laufender Bart, bis Hoehenlimit), erst der Rest mit
+  -- dem gelernten Steigen Vc. Vorher galt nur Vc; ohne gelernten Bart (Motorsteigen zaehlt nicht) ist das fast
+  -- 0, die Dreiecke waren dann auf die aktuelle Hoehe begrenzt und die Abflughoehe war immer schon erreicht.
+  -- Steigen hier: Mittel des Barts ab 20 s, mindestens das Vario-Mittel der letzten 30 s (beim Einkreisen ist der
+  -- Gewinn des Barts noch negativ), mindestens 0.2 m/s
+  local vh
+  if w.therm then
+    local a, n = 0, w.avg30 and #w.avg30 or 0
+    for j = 1, n do a = a + w.avg30[j] end
+    vh = math.max(r.vcG, Vc, n > 0 and a / n or 0)
+  end
+  local room = vh and math.max(0, hmax - f.agl) or 0
   local function ev(N, mi, h0)
     local cp, cl = k * (N <= 2 and 1 + z or 1), k * (N - 1 + z * math.min(2, N - 1))
     local tg, dh = cp * TP[mi] + cl * TL[mi], cp * HP[mi] + cl * HL[mi]
-    return tg + math.max(0, dh - h0) / Vc, tg, dh
+    local d = math.max(0, dh - h0)
+    local d1 = math.min(d, room)
+    return tg + (vh and d1 / vh or 0) + (d - (vh and d1 or 0)) / Vc, tg, dh
   end
   -- kleinster MC-Index, mit dem N Dreiecke passen
   local function fits(N) for mi = 1, nm do if ev(N, mi, dh0) <= availM then return mi end end end
@@ -3805,7 +3820,7 @@ function RZ.search(w, now)
     for j = mm or 1, mm or nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
-      local t = math.max(0, need - f.agl) / r.vcG + tg
+      local t = math.max(0, need - f.agl) / (vh or r.vcG) + tg
       if t <= availM then
         if need <= hmax then
           if not tb or t < tb then tb, nb = t, need end
