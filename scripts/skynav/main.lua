@@ -1446,6 +1446,8 @@ local TEXT_DEFS = {
 -- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 -- BAL wurde an den Dateianfang gezogen (0 extra Top-Level-Locals)
+-- Restzeit (1.53): Index ohne konstante Runden, Runden mit Index darueber lernen nichts
+BAL.RZ_K0, BAL.RZ_KOK = 1.20, 1.30
 
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
@@ -3943,24 +3945,30 @@ function RZ.table(w, now)
   if #w.laps > r.nl then
     r.nl = #w.laps
     local L = w.laps[r.nl]
-    local kLap = clamp(r.dist / T.perim, 1, 1.6)
-    r.ks[#r.ks + 1] = kLap
+    -- 1.53 (Christoph 25.11.2026, gleicher Log, 1.52.5 noch RAUS mit 25 min Rest und 3 Dreiecken): "rechne mit
+    -- Index 120, solange kein vernuenftiges Dreieck mit Konstanz geflogen wurde; runtersetzen, wenn die Dreiecke
+    -- konstant mit tieferem Index geflogen werden". Eine Runde mit Schlaufen/Umwegen (Index ueber 1.30) lernt
+    -- nichts, weder Index noch Lernfaktor f. Der Index geht nie ueber 1.20.
+    local kRaw = r.dist / math.max(T.perim, 1)
+    local ok = kRaw <= BAL.RZ_KOK
+    r.ks[#r.ks + 1] = ok and clamp(kRaw, 1, BAL.RZ_K0) or false
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
-    if r.TL and r.mcN > 0 then
+    if ok and r.TL and r.mcN > 0 then
       local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
-      -- 1.52.5 (Christoph 24.11.2026, Log ASW-17: "RAUS" mit 23 min Rest, 4 Dreiecke): Modellzeit mit dem Index
-      -- DIESER Runde. Vorher galt der alte Index (Start 1.05): eine Runde mit Umwegen zaehlte doppelt, im Index
-      -- (1.6) und nochmals im Lernfaktor f (2.3), jede weitere Runde wurde rund 3.5-mal so lang gerechnet.
+      local kLap = clamp(kRaw, 1, BAL.RZ_K0)
       local tg, dh = kLap * r.TL[mi], kLap * r.HL[mi]
-      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.7, 2.5)
+      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.8, 1.5)
       r.f = r.f and (r.f + q) / 2 or q
     end
     r.mcS, r.mcN = 0, 0
   end
-  local k = 0
-  for _, v in ipairs(r.ks) do k = k + v end
-  r.k = #r.ks > 0 and k / #r.ks or 1.05
+  -- Index: 1.20, bis die letzten zwei Runden beide vernuenftig und konstant waren (Unterschied hoechstens 0.08);
+  -- dann der groessere der beiden (vorsichtig), nie ueber 1.20.
+  local n, k = #r.ks, BAL.RZ_K0
+  local a, b = r.ks[n], r.ks[n - 1]
+  if a and b and math.abs(a - b) <= 0.08 then k = math.min(BAL.RZ_K0, math.max(a, b)) end
+  r.k = k
   -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant), mit
   -- abnehmendem Trend fuer die Restzeit. Fuer die Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst
   -- die gelernten.
@@ -4018,10 +4026,29 @@ function RZ.search(w, now)
   local hmax, hmin = T.maxAlt - 30, w.rzHmin
   local dh0 = math.min(f.agl, hmax) - hmin
   -- Zeit fuer N Dreiecke mit MC-Index mi (Pilotfaktor auf den letzten zwei Runden)
+  -- 1.53.1 (Christoph 25.11.2026: "RAUS" im Bart mit 25 min Rest und 4 Dreiecken, "mit der Hoehe waeren es 12"):
+  -- im Bart wird die fehlende Hoehe zuerst HIER gestiegen (laufender Bart, bis Hoehenlimit), erst der Rest mit
+  -- dem gelernten Steigen Vc. Vorher galt nur Vc; ohne gelernten Bart (Motorsteigen zaehlt nicht) ist das fast
+  -- 0, die Dreiecke waren dann auf die aktuelle Hoehe begrenzt und die Abflughoehe war immer schon erreicht.
+  -- Steigen hier: Mittel des Barts ab 20 s, mindestens das Vario-Mittel der letzten 30 s (beim Einkreisen ist der
+  -- Gewinn des Barts noch negativ), mindestens 0.2 m/s
+  local vh
+  if w.therm then
+    local a, n = 0, w.avg30 and #w.avg30 or 0
+    for j = 1, n do a = a + w.avg30[j] end
+    vh = math.max(r.vcG, r.vcE or 0, n > 0 and a / n or 0)
+  end
+  -- 2.0-dev Fix: Ohne gelernten Bart (not r.vcE) nicht mit 0.001 m/s rechnen (sonst werden Dreiecke auf 1 Bart
+  -- gekappt und schon bei 25 min Restzeit "ENDANFLUG RAUS" gemeldet). Realistische Basis: aktueller Bart vh oder
+  -- konservativ max(MC, 0.5 m/s). Sobald ein Bart ausgekurbelt ist, gilt r.vcE.
+  local vcNext = r.vcE or math.max(vh or 0, w.mcValue or 0, 0.5)
+  local room = vh and math.max(0, hmax - f.agl) or 0
   local function ev(N, mi, h0)
     local cp, cl = k * (N <= 2 and 1 + z or 1), k * (N - 1 + z * math.min(2, N - 1))
     local tg, dh = cp * TP[mi] + cl * TL[mi], cp * HP[mi] + cl * HL[mi]
-    return tg + math.max(0, dh - h0) / Vc, tg, dh
+    local d = math.max(0, dh - h0)
+    local d1 = math.min(d, room)
+    return tg + (vh and d1 / vh or 0) + (d - (vh and d1 or 0)) / vcNext, tg, dh
   end
   -- kleinster MC-Index, mit dem N Dreiecke passen
   local function fits(N) for mi = 1, nm do if ev(N, mi, dh0) <= availM then return mi end end end
@@ -4078,7 +4105,7 @@ function RZ.search(w, now)
     for j = mm or 1, mm or nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
-      local t = math.max(0, need - f.agl) / r.vcG + tg
+      local t = math.max(0, need - f.agl) / (vh or r.vcG) + tg
       if t <= availM then
         if need <= hmax then
           if not tb or t < tb then tb, nb = t, need end
@@ -4088,6 +4115,11 @@ function RZ.search(w, now)
     r.hgo = nb or lowN
   end
   r.over = r.hgo and r.hgo > hmax
+  -- Regel 2 (Plausibilitaets-Sperre): Solange nach den N Dreiecken noch mehr als 2 volle Runden ungenutzte
+  -- Restzeit uebrig bleiben (slack > 2 * k * TL[1]), ist es KEIN Endanflug -> mindestens 1 Bart mehr!
+  if r.hgo and not r.over and r.slack and TL[1] and r.slack > 2 * k * TL[1] then
+    r.over = true
+  end
   -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt), neue Zahl erst, wenn sie
   -- 10 s gleich bleibt
   if N ~= r.Nn then r.Nn, r.Nt = N, now end
