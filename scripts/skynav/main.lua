@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.53.1
+-- @version 1.53.2
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.53.1"
+local VERSION = "1.53.2"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3814,11 +3814,20 @@ function RZ.search(w, now)
   if not r.mcz then r.mcz = 0 end
   -- Abflughoehe fuer den Endanflug ohne weiteren Bart: die mit der kuerzesten Gesamtzeit (Steigen hier plus
   -- Gleiten) fuer die N Dreiecke, unter dem Hoehenlimit; geht keine darunter, die tiefste
+  -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt). 1.53.2: die angezeigte Zahl
+  -- Ns wechselt, sobald N 10 s lang davon abweicht (vorher musste N 10 s lang GLEICH bleiben; im Bart schwankt N
+  -- mit dem Steigen, Ns blieb auf dem alten Wert haengen: Christoph 25.11., "ab 516 m · 3 Dreiecke").
+  if not r.Ns or N == r.Ns then r.Ns, r.Nt = N, nil
+  elseif not r.Nt then r.Nt = now
+  elseif now - r.Nt >= 10 then r.Ns, r.Nt = N, nil end
+  -- Abflughoehe fuer die angezeigte Zahl (hoechstens N), damit Hoehe und Dreiecke zusammenpassen
+  local Nh = N > 0 and math.max(1, math.min(r.Ns, N)) or 0
+  r.Nh, r.vh = Nh, vh
   r.hgo = nil
   if mi then
     local tb, nb, lowN
     for j = mm or 1, mm or nm do
-      local _, tg, dh = ev(N, j, 1e9)
+      local _, tg, dh = ev(Nh, j, 1e9)
       local need = hmin + dh
       local t = math.max(0, need - f.agl) / (vh or r.vcG) + tg
       if t <= availM then
@@ -3830,10 +3839,6 @@ function RZ.search(w, now)
     r.hgo = nb or lowN
   end
   r.over = r.hgo and r.hgo > hmax
-  -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt), neue Zahl erst, wenn sie
-  -- 10 s gleich bleibt
-  if N ~= r.Nn then r.Nn, r.Nt = N, now end
-  if not r.Ns or now - r.Nt >= 10 then r.Ns = N end
   -- im Bart die Abflughoehe erreicht: einmal pro Bart melden
   local th = w.therm
   if th and r.hgo and not r.over and f.agl >= r.hgo and r.goTh ~= th then
@@ -5483,7 +5488,7 @@ local function paintTherm(w, W, H, top)
   local hX, hS = textH(FONT_XS), textH(FONT_S)
   local bF = SMALL and FONT_L or FONT_XL
   local bH = hX + textH(bF) + hS + 14
-  local N = rz and (rz.Ns or rz.N)
+  local N = rz and (rz.Nh or rz.Ns or rz.N)
   local lab, val, col, sub, prog, arrowUp = "ENDANFLUG", "--", C_DIM, nil, nil, false
   if not (T and f and w.state == S_STARTED) then sub = "nach dem Start"
   elseif not rz then sub = w.rzOn and "rechnet ..." or "Restzeit-Rechnung aus"
@@ -5506,7 +5511,7 @@ local function paintTherm(w, W, H, top)
       sub = {string.format("%d m erreicht · %d", math.floor(rz.hgo + 0.5), N), true}
       prog = 1
     else
-      local t = need / rz.vcG
+      local t = need / (rz.vh or rz.vcG)                -- 1.53.2: gleiches Steigen wie die Rechnung (vorher 0.2 m/s)
       lab, val, col, arrowUp = SMALL and "NOCH TANKEN" or "ENDANFLUG: NOCH TANKEN", string.format("+%d m", math.floor(need + 0.5)), C_BLUE, true
       sub = {string.format("ab %d m · %d", math.floor(rz.hgo + 0.5), N), true, t < 100 and string.format(" · ca. %d s", math.floor(t + 0.5)) or (" · ca. " .. fmtMS(t))}
       prog = tm and (f.agl - h0) / math.max(rz.hgo - h0, 1) or nil
