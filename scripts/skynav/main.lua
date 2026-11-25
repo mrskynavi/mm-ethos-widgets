@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.52.5
+-- @version 1.53
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52.5"
+local VERSION = "1.53"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1167,6 +1167,8 @@ local TEXT_DEFS = {
 -- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 local BAL = {}
+-- Restzeit (1.53): Index ohne konstante Runden, Runden mit Index darueber lernen nichts
+BAL.RZ_K0, BAL.RZ_KOK = 1.20, 1.30
 
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
@@ -3662,24 +3664,30 @@ function RZ.table(w, now)
   if #w.laps > r.nl then
     r.nl = #w.laps
     local L = w.laps[r.nl]
-    local kLap = clamp(r.dist / T.perim, 1, 1.6)
-    r.ks[#r.ks + 1] = kLap
+    -- 1.53 (Christoph 25.11.2026, gleicher Log, 1.52.5 noch RAUS mit 25 min Rest und 3 Dreiecken): "rechne mit
+    -- Index 120, solange kein vernuenftiges Dreieck mit Konstanz geflogen wurde; runtersetzen, wenn die Dreiecke
+    -- konstant mit tieferem Index geflogen werden". Eine Runde mit Schlaufen/Umwegen (Index ueber 1.30) lernt
+    -- nichts, weder Index noch Lernfaktor f. Der Index geht nie ueber 1.20.
+    local kRaw = r.dist / math.max(T.perim, 1)
+    local ok = kRaw <= BAL.RZ_KOK
+    r.ks[#r.ks + 1] = ok and clamp(kRaw, 1, BAL.RZ_K0) or false
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
-    if r.TL and r.mcN > 0 then
+    if ok and r.TL and r.mcN > 0 then
       local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
-      -- 1.52.5 (Christoph 24.11.2026, Log ASW-17: "RAUS" mit 23 min Rest, 4 Dreiecke): Modellzeit mit dem Index
-      -- DIESER Runde. Vorher galt der alte Index (Start 1.05): eine Runde mit Umwegen zaehlte doppelt, im Index
-      -- (1.6) und nochmals im Lernfaktor f (2.3), jede weitere Runde wurde rund 3.5-mal so lang gerechnet.
+      local kLap = clamp(kRaw, 1, BAL.RZ_K0)
       local tg, dh = kLap * r.TL[mi], kLap * r.HL[mi]
-      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.7, 2.5)
+      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.8, 1.5)
       r.f = r.f and (r.f + q) / 2 or q
     end
     r.mcS, r.mcN = 0, 0
   end
-  local k = 0
-  for _, v in ipairs(r.ks) do k = k + v end
-  r.k = #r.ks > 0 and k / #r.ks or 1.05
+  -- Index: 1.20, bis die letzten zwei Runden beide vernuenftig und konstant waren (Unterschied hoechstens 0.08);
+  -- dann der groessere der beiden (vorsichtig), nie ueber 1.20.
+  local n, k = #r.ks, BAL.RZ_K0
+  local a, b = r.ks[n], r.ks[n - 1]
+  if a and b and math.abs(a - b) <= 0.08 then k = math.min(BAL.RZ_K0, math.max(a, b)) end
+  r.k = k
   -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant), mit
   -- abnehmendem Trend fuer die Restzeit. Fuer die Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst
   -- die gelernten.
