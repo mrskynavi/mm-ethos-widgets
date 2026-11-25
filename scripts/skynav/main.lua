@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.53.3
+-- @version 1.54
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.53.3"
+local VERSION = "1.54"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3663,7 +3663,6 @@ function RZ.table(w, now)
   -- Runde fertig: Index und Lernfaktor f (Hoehengewinn/-verlust der Runde mit Vc umgerechnet)
   if #w.laps > r.nl then
     r.nl = #w.laps
-    local L = w.laps[r.nl]
     -- 1.53 (Christoph 25.11.2026, gleicher Log, 1.52.5 noch RAUS mit 25 min Rest und 3 Dreiecken): "rechne mit
     -- Index 120, solange kein vernuenftiges Dreieck mit Konstanz geflogen wurde; runtersetzen, wenn die Dreiecke
     -- konstant mit tieferem Index geflogen werden". Eine Runde mit Schlaufen/Umwegen (Index ueber 1.30) lernt
@@ -3673,13 +3672,6 @@ function RZ.table(w, now)
     r.ks[#r.ks + 1] = ok and clamp(kRaw, 1, BAL.RZ_K0) or false
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
-    if ok and r.TL and r.mcN > 0 then
-      local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
-      local kLap = clamp(kRaw, 1, BAL.RZ_K0)
-      local tg, dh = kLap * r.TL[mi], kLap * r.HL[mi]
-      local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.8, 1.5)
-      r.f = r.f and (r.f + q) / 2 or q
-    end
     r.mcS, r.mcN = 0, 0
   end
   -- Index: 1.20, bis die letzten zwei Runden beide vernuenftig und konstant waren (Unterschied hoechstens 0.08);
@@ -3736,10 +3728,16 @@ function RZ.search(w, now)
   local r, T, f = w.rz, w.task, w.cur
   -- startT fehlt nach "Neustart: wieder scharf" zwischen Tabelle und Suche (1.43.1, Simulator-Fehler 14.11.)
   if not (r and r.TL and f and T and w.startT and w.state == S_STARTED) then w.rz = nil; return end
-  -- 1.53.3 (Christoph 25.11.2026): im Bart einmal pro Vollkreis rechnen, und zwar wenn das Modell vom naechsten
-  -- TP wegfliegt (Kurs hoechstens 30 Grad neben der Gegenrichtung). Dann weiss der Pilot fuer den naechsten Kreis,
-  -- ob er bleibt oder geht. Scharf wieder, sobald der Kurs halbwegs zum TP zeigt (unter 90 Grad daneben).
-  -- Vorher lief die Suche auch im Bart rund jede Sekunde. Im Gleitflug unveraendert (hoechstens 1x pro s).
+  -- Entscheid im Bart "weiter kreisen oder gehen" (1.54, Christoph 25.11.2026):
+  --  * gerechnet wird sofort beim Einkreisen (das Ergebnis aus dem Gleitflug gilt im Bart nicht: 1.53.3 zeigte
+  --    damit sofort RAUS) und danach einmal pro Kreis, wenn das Modell vom naechsten TP wegfliegt (Kurs hoechstens
+  --    30 Grad neben der Gegenrichtung; wieder scharf, sobald er weniger als 90 Grad neben dem TP liegt)
+  --  * Gehen: Dreiecke aus der jetzigen Hoehe ohne weiteren Bart. Bleiben: Dreiecke, wenn hier mit dem Steigen
+  --    (Vario-Mittel 30 s, mind. 0.2 m/s) hoeher gestiegen wird, bis zum Hoehenlimit; Steigzeit geht von der Restzeit
+  --    ab. Abflughoehe = tiefste Hoehe, die die meisten Dreiecke bringt. Darunter: bleiben, darueber: RAUS.
+  --  * Rundenzeit und Hoehe pro Dreieck: Polare mit Wind und Netto pro Schenkel, mal Index (1.20, bis zwei saubere
+  --    Runden konstant tiefer waren). Kein Lernfaktor mehr (1.53.x: 1.24 aus Runde 1 machte jede Runde 24 % laenger).
+  -- Im Gleitflug unveraendert hoechstens 1x pro s.
   if w.therm and f.crs then
     local leg = math.min(w.tp, 3) + 1
     local tg = T.tp[leg] or {x = 0, y = 0}
@@ -3747,13 +3745,12 @@ function RZ.search(w, now)
     if d < 90 then r.awArm = true end
     if r.awTh == w.therm and not (r.awArm and d >= 150) then return end
     r.awTh, r.awArm = w.therm, false
-    -- neuer Bart: sofort nur, wenn das Modell schon wegfliegt; sonst beim ersten Wegfliegen
-    if d < 150 then return end
   end
+  r.cT = now
   local rest = T.work * 60 - (f.clk - w.startT)
   local avail = rest - math.max(15, rest * w.rzRes / 100)
-  local F = r.f or 1
-  local availM = avail / F
+  local F = 1
+  local availM = avail
   local k, z, Vc, nm = r.k, w.rzPilot / 100, r.vcU, r.nm
   local TP, HP, TL, HL = r.TP, r.HP, r.TL, r.HL
   local hmax, hmin = T.maxAlt - 30, w.rzHmin
@@ -3769,7 +3766,7 @@ function RZ.search(w, now)
   if w.therm then
     local a, n = 0, w.avg30 and #w.avg30 or 0
     for j = 1, n do a = a + w.avg30[j] end
-    vh = math.max(r.vcG, Vc, n > 0 and a / n or 0)
+    vh = math.max(0.2, n > 0 and a / n or 0)          -- 1.54: wie "Ø 30 s" auf der Seite Thermik
   end
   local room = vh and math.max(0, hmax - f.agl) or 0
   local function ev(N, mi, h0)
