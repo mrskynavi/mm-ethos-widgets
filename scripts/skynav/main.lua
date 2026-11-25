@@ -4100,16 +4100,17 @@ function RZ.search(w, now)
   -- Abflughoehe fuer den Endanflug ohne weiteren Bart: die mit der kuerzesten Gesamtzeit (Steigen hier plus
   -- Gleiten) fuer die N Dreiecke, unter dem Hoehenlimit; geht keine darunter, die tiefste
   r.hgo = nil
-  if mi then
+  if mi and N > 0 then
+    local vcHgo = math.max(vh or 0, r.vcG or 0.2, vcNext)
     local tb, nb, lowN
     for j = mm or 1, mm or nm do
       local _, tg, dh = ev(N, j, 1e9)
       local need = hmin + dh
-      local t = math.max(0, need - f.agl) / (vh or r.vcG) + tg
-      if t <= availM then
-        if need <= hmax then
-          if not tb or t < tb then tb, nb = t, need end
-        elseif not lowN or need < lowN then lowN = need end
+      local t = math.max(0, need - f.agl) / vcHgo + tg
+      if need <= hmax and t <= availM then
+        if not tb or t < tb then tb, nb = t, need end
+      elseif not lowN or need < lowN then
+        lowN = need
       end
     end
     r.hgo = nb or lowN
@@ -5778,11 +5779,11 @@ local function paintTherm(w, W, H, top)
   if not (T and f and w.state == S_STARTED) then sub = "nach dem Start"
   elseif not rz then sub = w.rzOn and "rechnet ..." or "Restzeit-Rechnung aus"
   elseif #w.laps < 1 then sub = "ab Runde 2"
-  elseif not rz.hgo then val, col, sub = "0", C_ORANGE, "kein Dreieck mehr möglich"
+  elseif not N or N <= 0 then val, col, sub = "0", C_ORANGE, "kein Dreieck mehr möglich"
   else
     local h0 = tm and tm.h0 or f.agl
-    local need = rz.hgo - f.agl
-    if rz.over then
+    local need = rz.hgo and (rz.hgo - f.agl) or 1e9
+    if rz.over or not rz.hgo then
       local hmax = T.maxAlt - 30
       lab, val, col = SMALL and "ENDANFLUG NOCH NICHT" or "ENDANFLUG NOCH NICHT MÖGLICH", "1 Bart mehr", C_ORANGE
       sub = {string.format("bis %d m steigen · %d", hmax, N), true}
