@@ -1,6 +1,299 @@
 -- @widget  SkyNavigator
--- @version 1.52
+-- @version 2.0-dev
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
+local BAL = {}
+BAL.MM = (function()
+-- >>> BEGIN shared/active.lua
+-- Shared Module: active.lua
+-- Verbindlicher Sender-Grundsatz: „Nur das aktive Widget rechnet“
+-- Verhindert CPU-Last und Varioton-Stottern durch inaktive Widgets auf anderen Ethos-Screens.
+local MM_ACTIVE = {}
+
+function MM_ACTIVE.isVisible()
+  if not (lcd and lcd.isVisible) then return true end
+  local ok, v = pcall(lcd.isVisible)
+  return not ok or v ~= false
+end
+
+-- Entscheidet, ob ein Widget in diesem wakeup voll rechnen darf.
+-- allowBackground: true nur fuer eng begrenzte Minimal-Pfade (z. B. laufender IGC-Mitschnitt / Dateispeicherung).
+function MM_ACTIVE.shouldCompute(allowBackground)
+  if MM_ACTIVE.isVisible() then return true end
+  return allowBackground == true
+end
+-- <<< END shared/active.lua
+-- >>> BEGIN shared/igctime.lua
+-- Shared Module: igctime.lua
+-- Prio-1-Bugfix: Falsches IGC-Datum beheben.
+-- Parst vollstaendige Datums-/Zeit-Strings (YYYY-MM-DD HH:MM:SS, DD.MM.YYYY HH:MM:SS)
+-- aus Ethos GPS-Zeit (stringValue) rein mathematisch nach UTC-Epoch (ohne os.time()-Tücken),
+-- und verhindert ungültige 1970-Daten im IGC-Header (HFDTEDATE).
+local MM_IGCTIME = {}
+
+MM_IGCTIME.MIN_VALID_UTC = 1577836800 -- 2020-01-01T00:00:00Z
+
+-- Howard Hinnant civil-to-days: exakte UTC-Sekunden ab 1970-01-01 fuer beliebige Kalenderdaten
+function MM_IGCTIME.utcFromParts(y, mo, d, h, mi, se)
+  y, mo, d = tonumber(y), tonumber(mo), tonumber(d)
+  h, mi, se = tonumber(h) or 0, tonumber(mi) or 0, tonumber(se) or 0
+  if not (y and mo and d) then return nil end
+  if y < 100 then y = 2000 + y end
+  if y < 2000 or y > 2099 or mo < 1 or mo > 12 or d < 1 or d > 31 then return nil end
+  if h < 0 or h > 23 or mi < 0 or mi > 59 or se < 0 or se > 60 then return nil end
+  local yr = y - (mo <= 2 and 1 or 0)
+  local era = math.floor(yr / 400)
+  local yoe = yr - era * 400
+  local mp = mo + (mo > 2 and -3 or 9)
+  local doy = math.floor((153 * mp + 2) / 5) + d - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  local days = era * 146097 + doe - 719468
+  return days * 86400 + h * 3600 + mi * 60 + se
+end
+
+-- Howard Hinnant days-to-civil: exaktes (y, mo, d) aus UTC-Sekunden (unabhaengig von os.date)
+function MM_IGCTIME.ymdFromUtc(utc)
+  local z = math.floor(math.floor(utc) / 86400) + 719468
+  local era = math.floor((z >= 0 and z or (z - 146096)) / 146097)
+  local doe = z - era * 146097
+  local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+  local y = yoe + era * 400
+  local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+  local mp = math.floor((5 * doy + 2) / 153)
+  local d = doy - math.floor((153 * mp + 2) / 5) + 1
+  local mo = mp + (mp < 10 and 3 or -9)
+  y = y + (mo <= 2 and 1 or 0)
+  return y, mo, d
+end
+
+-- Parst einen GPS-Zeit-String (z. B. "2026-11-24 16:35:04" oder "24.11.2026 16:35:04" oder "16:35:04").
+-- Liefert (value, isFullUtc): bei vollstaendigem Datum isFullUtc=true, sonst Sekunden des Tages.
+function MM_IGCTIME.parseString(s)
+  if type(s) ~= "string" then return nil, false end
+  -- ISO: YYYY-MM-DD[ T]HH:MM[:SS] oder YYYY/MM/DD
+  local y, mo, d, h, mi, se = s:match("(%d%d%d%d)[%-/](%d%d?)[%-/](%d%d?)[%sT]+(%d%d?):(%d%d?):?(%d*)")
+  if y then
+    local utc = MM_IGCTIME.utcFromParts(y, mo, d, h, mi, se ~= "" and se or 0)
+    if utc then return utc, true end
+  end
+  -- Deutsch/EU: DD.MM.YYYY HH:MM[:SS]
+  d, mo, y, h, mi, se = s:match("(%d%d?)%.(%d%d?)%.(%d%d%d%d)[%s]+(%d%d?):(%d%d?):?(%d*)")
+  if y then
+    local utc = MM_IGCTIME.utcFromParts(y, mo, d, h, mi, se ~= "" and se or 0)
+    if utc then return utc, true end
+  end
+  -- Nur Uhrzeit: HH:MM[:SS]
+  h, mi, se = s:match("(%d%d?):(%d%d?):?(%d*)")
+  if h then
+    return tonumber(h) * 3600 + tonumber(mi) * 60 + (tonumber(se) or 0), false
+  end
+  return nil, false
+end
+
+-- Liest Ethos GPS-Zeit-Quelle: probiert ZUERST stringValue (damit volles Datum wie "2026-11-24 16:35:04"
+-- nicht durch numerische Tagessekunden verloren geht!), sonst numerisches value().
+function MM_IGCTIME.readSource(src, gpsSrc)
+  if src then
+    if src.stringValue then
+      local ok, s = pcall(src.stringValue, src)
+      if ok and type(s) == "string" then
+        local v, full = MM_IGCTIME.parseString(s)
+        if v then return v, full end
+      end
+    end
+    if src.value then
+      local ok, v = pcall(src.value, src)
+      if ok and type(v) == "number" and v > 0 then
+        if v >= MM_IGCTIME.MIN_VALID_UTC then return v, true end
+        if v < 86400 then return v, false end
+      end
+    end
+  end
+  if gpsSrc and gpsSrc.value then
+    for _, name in ipairs({"OPTION_DATE_TIME", "OPTION_TIME", "OPTION_GPS_TIME"}) do
+      local opt = rawget(_G, name)
+      if opt then
+        local ok, r = pcall(gpsSrc.value, gpsSrc, {options = opt})
+        if ok and type(r) == "number" and r > 0 then
+          return r, r >= MM_IGCTIME.MIN_VALID_UTC
+        end
+      end
+    end
+  end
+  return nil, false
+end
+
+-- Formatiert das IGC-Datum HFDTEDATE:DDMMYY,NR
+function MM_IGCTIME.igcDateHeader(utc, flightNr)
+  local y, mo, d = MM_IGCTIME.ymdFromUtc(utc)
+  return string.format("HFDTEDATE:%02d%02d%02d,%02d", d, mo, y % 100, flightNr or 1)
+end
+-- <<< END shared/igctime.lua
+-- >>> BEGIN shared/altitude.lua
+-- Shared Module: altitude.lua
+-- Prio-1-Bugfix: Falsche Hoehe bei genullter/relativer GAlt (z. B. SM GPS-Logger 3 / Ethos Reset).
+-- Erkennt automatisch, ob GAlt absolut (MSL) oder relativ (AGL, z. B. -46..+420 m bei Platzhoehe 410 m) ist,
+-- liefert verlaessliche AGL- und MSL-Hoehen und formatiert IGC-B-Record-Hoehen streng normkonform (5 Zeichen).
+local MM_ALT = {}
+
+-- Entscheidet fuer einen Fix die konsistente (agl, msl, pmsl) in Metern.
+-- state: pro Widget gespeichert (haelt gAlt0 / gAltIsRel fuer den aktuellen Flug)
+-- altMode: 1 = Auto/GPS, 2 = Baro AGL (Flughoehe), 3 = GPS strikt MSL
+function MM_ALT.resolve(state, gAlt, relAlt, taskElev, altMode, gsMs)
+  local elev = tonumber(taskElev) or 0
+  local mode = altMode or 1
+
+  -- Boden-Referenz beim Start erfassen (solange Modell noch am Boden: gs < 3 m/s)
+  if state and gAlt ~= nil and state.gAlt0 == nil then
+    if (gsMs or 0) < 3.0 then
+      state.gAlt0 = gAlt
+      -- 1) Platzhoehe bekannt (> 80 m) und GAlt am Boden liegt weit darunter -> GAlt ist relativ/genullt!
+      -- 2) Keine Platzhoehe (elev == 0), aber GAlt am Boden ist deutlich negativ (z. B. -46 m) -> GAlt hat Offset!
+      if (elev > 80 and math.abs(gAlt - elev) > 100 and math.abs(gAlt) < 120)
+         or (elev == 0 and gAlt < -15 and (relAlt == nil or math.abs(relAlt) < 25)) then
+        state.gAltIsRel = true
+      else
+        state.gAltIsRel = false
+      end
+    end
+  end
+
+  local isRel = state and state.gAltIsRel == true
+  local gAlt0 = (state and state.gAlt0) or 0
+  local agl, msl, pmsl
+
+  if mode == 2 and relAlt ~= nil then
+    agl = relAlt
+    msl = elev + agl
+    pmsl = elev + relAlt
+  elseif mode == 3 and gAlt ~= nil then
+    msl = gAlt
+    agl = gAlt - elev
+    pmsl = relAlt ~= nil and (elev + relAlt) or msl
+  else
+    -- Modus 1 (Auto): schuetzt vor -410 m Fehler, wenn GAlt relativ/genullt ist
+    if isRel then
+      if relAlt ~= nil then
+        agl = relAlt
+      elseif gAlt ~= nil then
+        agl = gAlt - gAlt0
+      else
+        agl = 0
+      end
+      msl = elev + agl
+      pmsl = relAlt ~= nil and (elev + relAlt) or msl
+    elseif gAlt ~= nil then
+      msl = gAlt
+      agl = gAlt - elev
+      pmsl = relAlt ~= nil and (elev + relAlt) or msl
+    else
+      agl = relAlt or 0
+      msl = elev + agl
+      pmsl = msl
+    end
+  end
+
+  return agl, msl, pmsl, isRel
+end
+
+-- Formatiert eine Hoehe normkonform als genau 5 Zeichen fuer IGC B-Records (z. B. "00420" oder "-0012").
+function MM_ALT.formatIgcAlt(meters)
+  local a = math.floor((tonumber(meters) or 0) + 0.5)
+  if a < -9999 then a = -9999 elseif a > 99999 then a = 99999 end
+  if a < 0 then
+    return string.format("-%04d", -a)
+  end
+  return string.format("%05d", a)
+end
+-- <<< END shared/altitude.lua
+-- >>> BEGIN shared/density.lua
+-- Shared Module: density.lua
+-- Einheitliche ISA-Luftdichte-Korrektur (Normdichte rho0 = 1.225 kg/m^3 auf Meereshöhe).
+-- Wird identisch in flight-core, aero-core und allen Ethos-Widgets verwendet.
+local MM_DENSITY = {}
+
+MM_DENSITY.RHO0 = 1.225
+
+-- Dichteverhaeltnis sigma = rho(h) / rho0 nach ISA (h in Meter ueber Meer, begrenzt auf -500..8000 m)
+function MM_DENSITY.sigma(altMsl)
+  local h = tonumber(altMsl) or 0
+  if h < -500 then h = -500 elseif h > 8000 then h = 8000 end
+  return (1 - 2.25577e-5 * h) ^ 4.25588
+end
+
+function MM_DENSITY.rho(altMsl)
+  return MM_DENSITY.RHO0 * MM_DENSITY.sigma(altMsl)
+end
+
+-- IAS (auf Normdichte kalibriert) -> TAS bei Hoehe altMsl (m MSL)
+function MM_DENSITY.iasToTas(ias, altMsl)
+  if type(ias) ~= "number" then return nil end
+  return ias / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- TAS -> IAS (Normdichte) bei Hoehe altMsl (m MSL)
+function MM_DENSITY.tasToIas(tas, altMsl)
+  if type(tas) ~= "number" then return nil end
+  return tas * math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- Skaliert Polaren-Sinken von Normdichte auf lokale Dichte: v_tas = v_ias / sqrt(sigma), w_tas = w_ias / sqrt(sigma)
+function MM_DENSITY.speedScale(altMsl)
+  return 1 / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+-- <<< END shared/density.lua
+-- >>> BEGIN shared/tek.lua
+-- Shared Module: tek.lua
+-- Einheitliches Lesen/Schreiben von scripts/tekkal/korrektur_<Modell>.txt
+-- inklusive gelerntem Vario-Faktor pro Modell (varioFactor, Standard 1.0).
+local MM_TEK = {}
+
+function MM_TEK.parseCalibration(text)
+  local out = { airK = 1.0, airKind = 1, tekX = 0.0, tekLag = 0.0, varioFactor = 1.0, sensors = {} }
+  if type(text) ~= "string" then return out end
+  for line in text:gmatch("[^\r\n]+") do
+    local s = line:match("^%s*(.-)%s*$")
+    if s ~= "" and s:sub(1, 1) ~= "#" then
+      local k, v = s:match("^([%w_]+)%s*=%s*(.+)$")
+      if k and v then
+        local n = tonumber(v)
+        if k == "airK" and n and n > 0.5 and n < 1.8 then out.airK = n
+        elseif k == "airKind" and (n == 1 or n == 2) then out.airKind = n
+        elseif k == "tekX" and n and math.abs(n) <= 2.0 then out.tekX = n
+        elseif k == "tekLag" and n and n >= -1.0 and n <= 2.0 then out.tekLag = n
+        elseif k == "varioFactor" and n and n >= 0.5 and n <= 1.8 then out.varioFactor = n
+        else out.sensors[k] = v end
+      else
+        local a, b = s:match("^([%+%-]?%d+%.?%d*);([%+%-]?%d+%.?%d*)$")
+        if a and b then
+          out.tekX = tonumber(a) or 0
+          out.tekLag = tonumber(b) or 0
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- Korrigiert das gemessene Vario um den gelernten Modell-Vario-Faktor und optional den TEK-Anteil.
+function MM_TEK.applyVario(varioRaw, varioFactor, tekCorr)
+  if type(varioRaw) ~= "number" then return nil end
+  local vf = (type(varioFactor) == "number" and varioFactor > 0.5 and varioFactor < 1.8) and varioFactor or 1.0
+  return varioRaw * vf + (tekCorr or 0)
+end
+
+-- Lernt den Vario-Faktor aus Baro-Hoehenaenderung (dh) vs. integriertem Vario (intVario) im Gleitflug.
+-- Schuetzt vor Ausreissern durch Mindest-Hoehenverlust (>= 30 m) und enge Plausibilitaetsgrenzen (0.7..1.4).
+function MM_TEK.estimateVarioFactor(dhMeters, integratedVarioMeters)
+  if type(dhMeters) ~= "number" or type(integratedVarioMeters) ~= "number" then return nil end
+  if math.abs(dhMeters) < 30 or math.abs(integratedVarioMeters) < 20 then return nil end
+  if dhMeters * integratedVarioMeters <= 0 then return nil end
+  local f = dhMeters / integratedVarioMeters
+  if f < 0.70 or f > 1.40 then return nil end
+  return f
+end
+-- <<< END shared/tek.lua
+  return { active = MM_ACTIVE, igctime = MM_IGCTIME, alt = MM_ALT, density = MM_DENSITY, tek = MM_TEK, DEV_TEST = false }
+end)()
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
 -- sie beim Anschliessen des Senders nach scripts/skynav/aufgaben.lua. In der Konfiguration waehlst
@@ -42,7 +335,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.52"
+local VERSION = "2.0-dev"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -853,27 +1146,7 @@ end
 -- Quelle versucht das Widget eine Zeit-Option der GPS-Quelle. Gemerkt wird der Versatz zur Senderuhr, damit die
 -- Zeit zwischen den Telemetrie-Werten weiterlaeuft.
 local function gpsSecs(w)
-  local src = validSource(w.gpsTime)
-  if src then
-    local v = readNumber(src)
-    if v then return v end
-    local ok, s = pcall(src.stringValue, src)
-    if ok and type(s) == "string" then
-      local h, mi, se = s:match("(%d+):(%d+):?(%d*)")
-      if h then return tonumber(h) * 3600 + tonumber(mi) * 60 + (tonumber(se) or 0) end
-    end
-    return nil
-  end
-  if validSource(w.gps) then
-    for _, name in ipairs({"OPTION_TIME", "OPTION_GPS_TIME", "OPTION_DATE_TIME"}) do
-      local opt = rawget(_G, name)
-      if opt then
-        local ok, r = pcall(w.gps.value, w.gps, {options = opt})
-        if ok and type(r) == "number" and r > 0 then return r end
-      end
-    end
-  end
-  return nil
+  return BAL.MM.igctime.readSource(validSource(w.gpsTime), validSource(w.gps))
 end
 
 -- Senderuhr (os.time). Ohne gueltige Uhr wirft os.time() auf dem Sender "time result cannot be represented":
@@ -889,17 +1162,20 @@ do
 end
 
 local function updateGpsClock(w, now)
-  local v = gpsSecs(w)
+  local v, isFull = gpsSecs(w)
   if not v or v <= 0 then return end
   local radio = radioTime()
   local guess = radio - (w.utcOffset or 0) * 60
   local utc
-  w.gpsFull = v > 1e8                                          -- GPS liefert auch das Datum
-  if v > 1e8 then utc = v
+  w.gpsFull = isFull == true or v >= BAL.MM.igctime.MIN_VALID_UTC
+  if w.gpsFull then
+    utc = v
   elseif v < 86400 then
     utc = guess - guess % 86400 + v
     if utc - guess > 43200 then utc = utc - 86400 elseif guess - utc > 43200 then utc = utc + 86400 end
-  else return end
+  else
+    return
+  end
   w.gpsDelta, w.gpsClockT = utc - radio, now
 end
 
@@ -926,8 +1202,11 @@ local function hms(utc)
 end
 
 local function ymd(utc)
+  if type(utc) == "number" and utc >= BAL.MM.igctime.MIN_VALID_UTC then
+    return BAL.MM.igctime.ymdFromUtc(utc)
+  end
   if os and os.date then
-    local ok, t = pcall(os.date, "!*t", math.floor(utc))
+    local ok, t = pcall(os.date, "!*t", math.floor(utc or 0))
     if ok and type(t) == "table" and t.year then return t.year, t.month, t.day end
   end
   return 1970, 1, 1
@@ -958,10 +1237,10 @@ local function igcHash(L, maxChars)
 end
 
 local function bRecord(w, f)
-  local alt = math.floor((f.msl or 0) + 0.5)
-  local pAlt = math.floor((f.pmsl or f.msl or 0) + 0.5)
+  local alt = BAL.MM.alt.formatIgcAlt(f.msl or 0)
+  local pAlt = BAL.MM.alt.formatIgcAlt(f.pmsl or f.msl or 0)
   local sus = math.floor((f.clk % 1) * 100) % 100
-  return string.format("B%s%s%s%s%05d%05d%02d", hms(f.utc), igcLat(f.lat), igcLon(f.lon), f.valid and "A" or "V", pAlt, alt, sus)
+  return string.format("B%s%s%s%s%s%s%02d", hms(f.utc), igcLat(f.lat), igcLon(f.lon), f.valid and "A" or "V", pAlt, alt, sus)
 end
 
 local function writeFile(path, mode, text)
@@ -1165,7 +1444,7 @@ local TEXT_DEFS = {
 }
 -- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
-local BAL = {}
+-- BAL wurde an den Dateianfang gezogen (0 extra Top-Level-Locals)
 
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
@@ -1656,7 +1935,7 @@ function BAL.SN.korrFile(w)
       for k, v in text:gmatch("([%w]+)=([^\r\n]*)") do r[k] = v end
       if w then
         w.korrV = {tekX = clamp(tonumber(r.tekX) or 0, -500, 500), tekLag = clamp(tonumber(r.tekLag) or 0, 0, 15),
-          airK = clamp(tonumber(r.airK) or 1000, 500, 2000)}
+          airK = clamp(tonumber(r.airK) or 1000, 500, 2000), varioFactor = clamp(tonumber(r.varioFactor) or 1, 0.5, 1.8)}
       end
       return true
     end
@@ -1793,7 +2072,10 @@ end
 local function readInputs(w, now, dt)
   local lat, lon = readPosition(w.gps)
   local vario = readNumber(w.vario)
-  if vario ~= nil and w.korrV and BAL.TK.on(w, "vario") then vario = vario + BAL.TK.corr(w) end   -- 1.50 TEK korr.
+  if vario ~= nil and w.korrV then
+    if w.korrV.varioFactor and w.korrV.varioFactor ~= 1 then vario = vario * w.korrV.varioFactor end
+    if BAL.TK.on(w, "vario") then vario = vario + BAL.TK.corr(w) end   -- 1.50 TEK korr.
+  end
   if vario ~= nil then w.vSlow2 = lpf(w.vSlow2, vario, dt, 2) end   -- Sensor wie er kommt (Vertikalgeschwindigkeit, 3D-Speed)
   w.vSens = vario                                                     -- fuer die Fusion mit AccZ (BAL.VF)
   -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
@@ -1825,12 +2107,11 @@ local function readInputs(w, now, dt)
   local dtFix = w.gSeen and (now - w.gSeen) or 1
   w.lastLat, w.lastLon, w.gSeen, w.gpsOk = lat, lon, now, true
   local T = w.task
-  local msl = readNumber(w.gpsAlt)
+  local mslRaw = readNumber(w.gpsAlt)
   local rel = readNumber(w.relAlt)
-  local agl
-  if w.altMode == 2 and rel ~= nil then agl = rel
-  elseif msl ~= nil then agl = msl - (T and T.elev or 0)
-  else agl = rel or 0 end
+  local gsHint = speedMs(w.gpsSpd) or 0
+  local agl, msl, pmslAlt = BAL.MM.alt.resolve(w, mslRaw, rel, T and T.elev or 0, w.altMode, gsHint)
+  w.lastPmsl = pmslAlt
   -- Kurs aus Positionen (ab 3 m), Geschwindigkeit vom Sensor oder aus den Positionen
   local x, y = 0, 0
   if T then x, y = toLocal(T, lat, lon) else
@@ -5936,11 +6217,13 @@ local function configure(w)
     addChoice(w, "Ethos-Vario still bis", "vsLo", ch)
     for i, t in ipairs(BAL.VO.info(w)) do l = form.addLine(i == 1 and "  Stand" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   end
-  addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5},
-    {"-2 m/s + 10 ms (Test)", 6}, {"-2 m/s + 20 ms (Test)", 7}, {"-2 m/s + 40 ms (Test)", 8}, {"-2 m/s + 100 ms/s (Test)", 9}})
+  if BAL.MM.DEV_TEST then
+    addChoice(w, "Rechnen (Test)", "calcIv", {{"jeder Aufruf (normal)", 1}, {"jeder 2. Aufruf", 2}, {"jeder 4. Aufruf", 3}, {"nur Sensor (Test)", 4}, {"fest -2 m/s (Test)", 5},
+      {"-2 m/s + 10 ms (Test)", 6}, {"-2 m/s + 20 ms (Test)", 7}, {"-2 m/s + 40 ms (Test)", 8}, {"-2 m/s + 100 ms/s (Test)", 9}})
+    for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+  end
   addChoice(w, "Bildaufbau", "drawIv", {{"7 pro s (normal)", 1}, {"3 pro s", 2}, {"1.7 pro s", 3}, {"1 pro s", 4}})
   addChoice(w, "Bildaufbau beim Varioton", "vtDraw", {{"alle 0.3 s", 1}, {"alle 0.6 s", 2}, {"alle 1 s", 3}, {"alle 1.5 s", 4}})
-  for i, t in ipairs(BAL.TM.info()) do l = form.addLine(i == 1 and "  Last (Mittel/Max)" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
   addChoice(w, "Varioton-Klang (Widget-Toene)", "vtStyle", {{"XCSoar", 1}, {"OpenVario", 2}, {"XCVario", 3}, {"Ethos/EdgeTX", 4}})
   -- Seiten
   addSwitch(w, "Schalter Seite Übersicht", "swOver")
@@ -6118,7 +6401,15 @@ local function init()
   -- Ethos akzeptiert Widget-Schluessel nur mit weniger als 8 Zeichen.
   system.registerWidget({
     key = "skynav1", name = "SkyNavigator",
-    create = create, paint = function(w) BAL.TM.paint(paint, w) end, wakeup = function(w) BAL.TM.wake(wakeup, w) end, event = eventHandler,
+    create = create,
+    paint = function(w) BAL.TM.paint(paint, w) end,
+    wakeup = function(w)
+      -- Grundsatz: Nur das aktive Widget rechnet (Ausnahme: aktiver Wertungsflug / IGC-Mitschnitt)
+      local activeRace = w and (w.state == S_ARMED or w.state == S_STARTED or w.igc ~= nil)
+      if not BAL.MM.active.shouldCompute(activeRace) then return end
+      BAL.TM.wake(wakeup, w)
+    end,
+    event = eventHandler,
     configure = configure, read = read, write = write,
   })
   if system.registerSource then
@@ -6128,8 +6419,8 @@ end
 
 local M = {init = init}
 M._test = {
-  buildTask = buildTask, inSector = inSector, penaltyOf = penaltyOf, planPath = planPath, cornersFrom = cornersFrom,
-  crossTrack = crossTrack, slotEpoch = slotEpoch, igcLat = igcLat, igcLon = igcLon, create = create, assess = assess,
+  buildTask = buildTask, inSector = inSector, inZone = inZone, penaltyOf = penaltyOf, planPath = planPath, cornersFrom = cornersFrom,
+  crossTrack = crossTrack, slotEpoch = slotEpoch, igcLat = igcLat, igcLon = igcLon, bRecord = bRecord, create = create, assess = assess,
   scoreOf = scoreOf, startCalc = startCalc, rz = RZ, angDiff = angDiff, bearingOf = bearingOf, toLocal = toLocal,
   slotWindow = slotWindow, refreshTasks = refreshTasks, rctLines = rctLines,
   voInfo = BAL.VO.info, tmInfo = BAL.TM.info,

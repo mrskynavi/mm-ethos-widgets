@@ -1,6 +1,181 @@
 -- @widget  Sollfahrt
--- @version 1.7
+-- @version 2.0-dev
 -- Sollfahrt (MacCready Speed-to-Fly) fuer Ethos -- Vollbild-Widget mit Tonausgabe.
+-- >>> BEGIN shared/active.lua
+-- Shared Module: active.lua
+-- Verbindlicher Sender-Grundsatz: „Nur das aktive Widget rechnet“
+-- Verhindert CPU-Last und Varioton-Stottern durch inaktive Widgets auf anderen Ethos-Screens.
+local MM_ACTIVE = {}
+
+function MM_ACTIVE.isVisible()
+  if not (lcd and lcd.isVisible) then return true end
+  local ok, v = pcall(lcd.isVisible)
+  return not ok or v ~= false
+end
+
+-- Entscheidet, ob ein Widget in diesem wakeup voll rechnen darf.
+-- allowBackground: true nur fuer eng begrenzte Minimal-Pfade (z. B. laufender IGC-Mitschnitt / Dateispeicherung).
+function MM_ACTIVE.shouldCompute(allowBackground)
+  if MM_ACTIVE.isVisible() then return true end
+  return allowBackground == true
+end
+-- <<< END shared/active.lua
+-- >>> BEGIN shared/units.lua
+-- Shared Module: units.lua
+-- Einheitliche Geschwindigkeits-Einheitenerkennung (inkl. UNIT_KPH-Fix fuer Ethos)
+-- und SM-GPS-Logger-3-Filter (schliesst 0522 "Flugrichtung" als Kurs konsequent aus).
+local MM_UNITS = {}
+
+MM_UNITS.KMH = 3.6
+MM_UNITS.KN_TO_MS = 0.514444
+MM_UNITS.MPH_TO_MS = 0.44704
+
+-- Erkennt, ob eine Ethos-Einheitskonstante km/h bedeutet (inkl. UNIT_KPH / UNIT_KMH / _G-Scan).
+local kmhCache
+function MM_UNITS.isKmh(un)
+  if un == nil then return false end
+  if un == "km/h" or un == "kmh" or un == "kph" then return true end
+  if not kmhCache then
+    kmhCache = {}
+    for _, nm in ipairs({"UNIT_KMH", "UNIT_KPH", "UNIT_KILOMETER_PER_HOUR", "UNIT_KM_PER_HOUR"}) do
+      local c = rawget(_G, nm)
+      if c ~= nil then kmhCache[c] = true end
+    end
+    for k, v in pairs(_G) do
+      if type(k) == "string" and k:sub(1, 5) == "UNIT_" and type(v) == "number" then
+        local ku = k:upper()
+        if ku:find("KMH", 1, true) or ku:find("KPH", 1, true) or ku:find("KILOMETER", 1, true) then
+          kmhCache[v] = true
+        end
+      end
+    end
+  end
+  return kmhCache[un] == true
+end
+
+-- Wandelt einen Fahrt-Rohwert gemaess Quelle/Einheit sicher in m/s um.
+-- airUnit: 1=auto, 2=km/h, 3=kn, 4=m/s, 5=mph
+function MM_UNITS.speedToMs(v, src, airUnit)
+  if type(v) ~= "number" then return nil end
+  local u = airUnit or 1
+  if u == 1 and src and src.unit then
+    local ok, un = pcall(src.unit, src)
+    if ok and un ~= nil then
+      local function isC(name, txt)
+        local c = rawget(_G, name)
+        return (c ~= nil and un == c) or un == txt
+      end
+      if isC("UNIT_METER_PER_SECOND", "m/s") then u = 4
+      elseif MM_UNITS.isKmh(un) then u = 2
+      elseif isC("UNIT_MPH", "mph") then u = 5
+      elseif isC("UNIT_KNOT", "kn") or isC("UNIT_KNOTS", "kt") or un == "kts" then u = 3
+      else u = 2 end -- Ethos/SM-Logger Standard bei unbekanntem Einheits-Enum: km/h statt Knoten!
+    else
+      u = 2
+    end
+  elseif u == 1 then
+    u = 2
+  end
+  if u == 2 then return v / MM_UNITS.KMH end
+  if u == 3 then return v * MM_UNITS.KN_TO_MS end
+  if u == 5 then return v * MM_UNITS.MPH_TO_MS end
+  return v
+end
+
+-- Prueft, ob ein Sensorname der fehlerhafte SM-GPS-Logger-3 DIY-Wert 0522 ("Flugrichtung") ist.
+function MM_UNITS.isInvalidSmCourseName(name)
+  if type(name) ~= "string" then return false end
+  local lo = name:lower()
+  return lo:find("0522", 1, true) ~= nil or lo:find("flugrichtung", 1, true) ~= nil
+end
+-- <<< END shared/units.lua
+-- >>> BEGIN shared/density.lua
+-- Shared Module: density.lua
+-- Einheitliche ISA-Luftdichte-Korrektur (Normdichte rho0 = 1.225 kg/m^3 auf Meereshöhe).
+-- Wird identisch in flight-core, aero-core und allen Ethos-Widgets verwendet.
+local MM_DENSITY = {}
+
+MM_DENSITY.RHO0 = 1.225
+
+-- Dichteverhaeltnis sigma = rho(h) / rho0 nach ISA (h in Meter ueber Meer, begrenzt auf -500..8000 m)
+function MM_DENSITY.sigma(altMsl)
+  local h = tonumber(altMsl) or 0
+  if h < -500 then h = -500 elseif h > 8000 then h = 8000 end
+  return (1 - 2.25577e-5 * h) ^ 4.25588
+end
+
+function MM_DENSITY.rho(altMsl)
+  return MM_DENSITY.RHO0 * MM_DENSITY.sigma(altMsl)
+end
+
+-- IAS (auf Normdichte kalibriert) -> TAS bei Hoehe altMsl (m MSL)
+function MM_DENSITY.iasToTas(ias, altMsl)
+  if type(ias) ~= "number" then return nil end
+  return ias / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- TAS -> IAS (Normdichte) bei Hoehe altMsl (m MSL)
+function MM_DENSITY.tasToIas(tas, altMsl)
+  if type(tas) ~= "number" then return nil end
+  return tas * math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- Skaliert Polaren-Sinken von Normdichte auf lokale Dichte: v_tas = v_ias / sqrt(sigma), w_tas = w_ias / sqrt(sigma)
+function MM_DENSITY.speedScale(altMsl)
+  return 1 / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+-- <<< END shared/density.lua
+-- >>> BEGIN shared/tek.lua
+-- Shared Module: tek.lua
+-- Einheitliches Lesen/Schreiben von scripts/tekkal/korrektur_<Modell>.txt
+-- inklusive gelerntem Vario-Faktor pro Modell (varioFactor, Standard 1.0).
+local MM_TEK = {}
+
+function MM_TEK.parseCalibration(text)
+  local out = { airK = 1.0, airKind = 1, tekX = 0.0, tekLag = 0.0, varioFactor = 1.0, sensors = {} }
+  if type(text) ~= "string" then return out end
+  for line in text:gmatch("[^\r\n]+") do
+    local s = line:match("^%s*(.-)%s*$")
+    if s ~= "" and s:sub(1, 1) ~= "#" then
+      local k, v = s:match("^([%w_]+)%s*=%s*(.+)$")
+      if k and v then
+        local n = tonumber(v)
+        if k == "airK" and n and n > 0.5 and n < 1.8 then out.airK = n
+        elseif k == "airKind" and (n == 1 or n == 2) then out.airKind = n
+        elseif k == "tekX" and n and math.abs(n) <= 2.0 then out.tekX = n
+        elseif k == "tekLag" and n and n >= -1.0 and n <= 2.0 then out.tekLag = n
+        elseif k == "varioFactor" and n and n >= 0.5 and n <= 1.8 then out.varioFactor = n
+        else out.sensors[k] = v end
+      else
+        local a, b = s:match("^([%+%-]?%d+%.?%d*);([%+%-]?%d+%.?%d*)$")
+        if a and b then
+          out.tekX = tonumber(a) or 0
+          out.tekLag = tonumber(b) or 0
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- Korrigiert das gemessene Vario um den gelernten Modell-Vario-Faktor und optional den TEK-Anteil.
+function MM_TEK.applyVario(varioRaw, varioFactor, tekCorr)
+  if type(varioRaw) ~= "number" then return nil end
+  local vf = (type(varioFactor) == "number" and varioFactor > 0.5 and varioFactor < 1.8) and varioFactor or 1.0
+  return varioRaw * vf + (tekCorr or 0)
+end
+
+-- Lernt den Vario-Faktor aus Baro-Hoehenaenderung (dh) vs. integriertem Vario (intVario) im Gleitflug.
+-- Schuetzt vor Ausreissern durch Mindest-Hoehenverlust (>= 30 m) und enge Plausibilitaetsgrenzen (0.7..1.4).
+function MM_TEK.estimateVarioFactor(dhMeters, integratedVarioMeters)
+  if type(dhMeters) ~= "number" or type(integratedVarioMeters) ~= "number" then return nil end
+  if math.abs(dhMeters) < 30 or math.abs(integratedVarioMeters) < 20 then return nil end
+  if dhMeters * integratedVarioMeters <= 0 then return nil end
+  local f = dhMeters / integratedVarioMeters
+  if f < 0.70 or f > 1.40 then return nil end
+  return f
+end
+-- <<< END shared/tek.lua
 --
 -- Das Widget arbeitet nur zusammen mit dem MM Flight Analyzer: Die App schreibt die Polaren
 -- auf den Sender (scripts/maccready/polaren.lua). Polarendaten werden hier NICHT eingegeben.
@@ -813,20 +988,10 @@ local function airspeedTas(w, now, dt, gs)
   local src = validSource(w.airSrc)
   local v = src and readNumber(src)
   if not v then w.asTas = nil; return nil end
-  local u = w.airUnit or 1
-  if u == 1 then
-    local ok, un = pcall(src.unit, src)
-    if not ok then un = nil end
-    local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
-    if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
-    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h") then u = 2
-    elseif is("UNIT_MPH", "mph") then u = 5
-    else u = 3 end                                     -- Knoten oder ohne Einheit (DIY-Sensor)
-  end
-  local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
+  local ias = MM_UNITS.speedToMs(v, src, w.airUnit or 1)
+  if not ias then w.asTas = nil; return nil end
   if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
-  local sigma = (1 - 2.2558e-5 * clamp(w.alt or 0, -500, 6000)) ^ 4.2559
-  w.asTas = lpf(w.asTas, ias / math.sqrt(sigma), dt, 0.2)
+  w.asTas = lpf(w.asTas, MM_DENSITY.iasToTas(ias, w.alt or 0), dt, 0.2)
   if now - (w.asChg or now) >= 5 or (w.asTas < 5 and (gs or 0) > 12) then return nil end
   return w.asTas
 end
@@ -905,6 +1070,8 @@ local function viewSignature(w)
 end
 
 local function wakeup(w)
+  -- Grundsatz: Nur das aktive Widget rechnet (keine CPU-Last auf inaktiven Ethos-Screens)
+  if not MM_ACTIVE.isVisible() then return end
   local now = os.clock()
   local dt = w.lastT and (now - w.lastT) or 0
   w.lastT = now
@@ -1376,7 +1543,7 @@ local function configure(w)
   line = form.addLine("Fahrt-Sensor: Einheit")
   form.addChoiceField(line, nil, {{"Automatisch (ohne: Knoten)", 1}, {"km/h", 2}, {"Knoten", 3}, {"m/s", 4}},
     function() return w.airUnit or 1 end, function(v) w.airUnit = v end)
-  addSource(w, "Flugrichtung / GPS-Kurs (optional, Grad)", "crsSrc")
+  addSource(w, "GPS-Kurs (optional, nicht SM-Flugrichtung 0522)", "crsSrc")
   addSource(w, "GPS-Satelliten (optional, Warnung unter 6)", "satSrc")
 
   -- MC

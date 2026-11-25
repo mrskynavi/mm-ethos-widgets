@@ -1,6 +1,112 @@
 -- @widget  TEK-Kalibrierung
--- @version 1.7.3
+-- @version 2.0-dev
 -- TEK-Kalibrierung fuer Ethos -- Vollbild-Widget fuer den SM GPS-Logger 3 (Airspeed ueber die TEK-Duese).
+-- >>> BEGIN shared/active.lua
+-- Shared Module: active.lua
+-- Verbindlicher Sender-Grundsatz: „Nur das aktive Widget rechnet“
+-- Verhindert CPU-Last und Varioton-Stottern durch inaktive Widgets auf anderen Ethos-Screens.
+local MM_ACTIVE = {}
+
+function MM_ACTIVE.isVisible()
+  if not (lcd and lcd.isVisible) then return true end
+  local ok, v = pcall(lcd.isVisible)
+  return not ok or v ~= false
+end
+
+-- Entscheidet, ob ein Widget in diesem wakeup voll rechnen darf.
+-- allowBackground: true nur fuer eng begrenzte Minimal-Pfade (z. B. laufender IGC-Mitschnitt / Dateispeicherung).
+function MM_ACTIVE.shouldCompute(allowBackground)
+  if MM_ACTIVE.isVisible() then return true end
+  return allowBackground == true
+end
+-- <<< END shared/active.lua
+-- >>> BEGIN shared/density.lua
+-- Shared Module: density.lua
+-- Einheitliche ISA-Luftdichte-Korrektur (Normdichte rho0 = 1.225 kg/m^3 auf Meereshöhe).
+-- Wird identisch in flight-core, aero-core und allen Ethos-Widgets verwendet.
+local MM_DENSITY = {}
+
+MM_DENSITY.RHO0 = 1.225
+
+-- Dichteverhaeltnis sigma = rho(h) / rho0 nach ISA (h in Meter ueber Meer, begrenzt auf -500..8000 m)
+function MM_DENSITY.sigma(altMsl)
+  local h = tonumber(altMsl) or 0
+  if h < -500 then h = -500 elseif h > 8000 then h = 8000 end
+  return (1 - 2.25577e-5 * h) ^ 4.25588
+end
+
+function MM_DENSITY.rho(altMsl)
+  return MM_DENSITY.RHO0 * MM_DENSITY.sigma(altMsl)
+end
+
+-- IAS (auf Normdichte kalibriert) -> TAS bei Hoehe altMsl (m MSL)
+function MM_DENSITY.iasToTas(ias, altMsl)
+  if type(ias) ~= "number" then return nil end
+  return ias / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- TAS -> IAS (Normdichte) bei Hoehe altMsl (m MSL)
+function MM_DENSITY.tasToIas(tas, altMsl)
+  if type(tas) ~= "number" then return nil end
+  return tas * math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+
+-- Skaliert Polaren-Sinken von Normdichte auf lokale Dichte: v_tas = v_ias / sqrt(sigma), w_tas = w_ias / sqrt(sigma)
+function MM_DENSITY.speedScale(altMsl)
+  return 1 / math.sqrt(MM_DENSITY.sigma(altMsl))
+end
+-- <<< END shared/density.lua
+-- >>> BEGIN shared/tek.lua
+-- Shared Module: tek.lua
+-- Einheitliches Lesen/Schreiben von scripts/tekkal/korrektur_<Modell>.txt
+-- inklusive gelerntem Vario-Faktor pro Modell (varioFactor, Standard 1.0).
+local MM_TEK = {}
+
+function MM_TEK.parseCalibration(text)
+  local out = { airK = 1.0, airKind = 1, tekX = 0.0, tekLag = 0.0, varioFactor = 1.0, sensors = {} }
+  if type(text) ~= "string" then return out end
+  for line in text:gmatch("[^\r\n]+") do
+    local s = line:match("^%s*(.-)%s*$")
+    if s ~= "" and s:sub(1, 1) ~= "#" then
+      local k, v = s:match("^([%w_]+)%s*=%s*(.+)$")
+      if k and v then
+        local n = tonumber(v)
+        if k == "airK" and n and n > 0.5 and n < 1.8 then out.airK = n
+        elseif k == "airKind" and (n == 1 or n == 2) then out.airKind = n
+        elseif k == "tekX" and n and math.abs(n) <= 2.0 then out.tekX = n
+        elseif k == "tekLag" and n and n >= -1.0 and n <= 2.0 then out.tekLag = n
+        elseif k == "varioFactor" and n and n >= 0.5 and n <= 1.8 then out.varioFactor = n
+        else out.sensors[k] = v end
+      else
+        local a, b = s:match("^([%+%-]?%d+%.?%d*);([%+%-]?%d+%.?%d*)$")
+        if a and b then
+          out.tekX = tonumber(a) or 0
+          out.tekLag = tonumber(b) or 0
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- Korrigiert das gemessene Vario um den gelernten Modell-Vario-Faktor und optional den TEK-Anteil.
+function MM_TEK.applyVario(varioRaw, varioFactor, tekCorr)
+  if type(varioRaw) ~= "number" then return nil end
+  local vf = (type(varioFactor) == "number" and varioFactor > 0.5 and varioFactor < 1.8) and varioFactor or 1.0
+  return varioRaw * vf + (tekCorr or 0)
+end
+
+-- Lernt den Vario-Faktor aus Baro-Hoehenaenderung (dh) vs. integriertem Vario (intVario) im Gleitflug.
+-- Schuetzt vor Ausreissern durch Mindest-Hoehenverlust (>= 30 m) und enge Plausibilitaetsgrenzen (0.7..1.4).
+function MM_TEK.estimateVarioFactor(dhMeters, integratedVarioMeters)
+  if type(dhMeters) ~= "number" or type(integratedVarioMeters) ~= "number" then return nil end
+  if math.abs(dhMeters) < 30 or math.abs(integratedVarioMeters) < 20 then return nil end
+  if dhMeters * integratedVarioMeters <= 0 then return nil end
+  local f = dhMeters / integratedVarioMeters
+  if f < 0.70 or f > 1.40 then return nil end
+  return f
+end
+-- <<< END shared/tek.lua
 -- Bestimmt in einem Flug:
 --   1. den Airspeed-Faktor des Loggers (Einstellung 80..120 %) gegen das GPS, der Wind wird dabei
 --      mitgeschaetzt (Kreise mit gleichbleibender Fahrt, dazu Geraden in verschiedene Richtungen),
@@ -1131,6 +1237,8 @@ local function devStep(w, now)
 end
 
 local function wakeup(w)
+  -- Grundsatz: Nur das aktive Widget rechnet (Hintergrund-Quellen laufen ueber fileCfg sparsam weiter)
+  if not MM_ACTIVE.isVisible() then return end
   w.model = currentModelName()
   CFG = w
   local now = os.clock()
