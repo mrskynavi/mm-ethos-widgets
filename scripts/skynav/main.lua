@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.54
+-- @version 1.55
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.54"
+local VERSION = "1.55"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -1167,8 +1167,9 @@ local TEXT_DEFS = {
 -- Ballast (am Sender): Poti 0..100 % und Ballast maximal in 0.1 kg. Steht im Speicher nach den Texten,
 -- damit aeltere Konfigurationen ihre Reihenfolge behalten.
 local BAL = {}
--- Restzeit (1.53): Index ohne konstante Runden, Runden mit Index darueber lernen nichts
-BAL.RZ_K0, BAL.RZ_KOK = 1.20, 1.30
+-- Restzeit (1.53): Index ohne konstante Runden (1.55: in der App einstellbar, rzIdx in %, Standard 120),
+-- Runden mit Index mehr als 0.10 darueber lernen keinen Index
+function BAL.rzK0(w) return (w.rzIdx or 120) / 100 end
 
 -- Querlage (Rollwinkel vom Lagesensor, z. B. Stabi-Empfaenger): rechts haengend positiv. Daraus die Drehrate
 -- omega = g * tan(phi) / v; das Widget rechnet vor, wie weit sich der Kurs in tau s (qlTau, App) noch dreht, und
@@ -1212,7 +1213,7 @@ local APP_SETTINGS = {
   thermF1 = {0, 12}, thermF2 = {0, 12}, thermF3 = {0, 12}, thermF4 = {0, 12},
   margin = {0, 100}, warnSec = {0, 10}, lead = {0, 30}, zoomSec = {3, 60}, zoomAfter = {0, 30}, mc = {0, 50}, mcMax = {10, 100},
   ballast = {50, 300}, bugs = {0, 30}, dead = {0, 20}, compId = "", gliderId = "",
-  rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300},
+  rzOn = true, rzRes = {0, 20}, rzPilot = {0, 20}, rzHmin = {0, 300}, rzIdx = {100, 200},
   qlTau = {0, 30}, qlTrim = true, qaTau = {0, 60}, qaRate = {5, 300}, vzLo = {0, 20}, vzHi = {0, 20}, vDamp = {0, 20}, vtRange = {3, 20}, vtGlide = {0, 30},
   thBest = true,
 }
@@ -3646,6 +3647,14 @@ function RZ.table(w, now)
     if (w.netto or 0) > 4 or (w.teN or 0) > 5 then r.motT = now end
     if w.netto and (w.omega or 0) < math.rad(8) and not (r.motT and now - r.motT < 10) then r.net[leg] = r.net[leg] + (clamp(w.netto, -3, 4) - r.net[leg]) * dt / 60 end
   end
+  -- 1.55 Hoehenverlust der Runde nur im Gleiten: Hoehenaenderung ausserhalb der Baerte, ohne Motor (und 10 s
+  -- danach) und ohne Gewinn beim Einkreisen (Kreisen, bevor der Bart erkannt ist)
+  local ag = f.agl
+  if r.aP and ag and not w.therm and not (r.motT and now - r.motT < 10) then
+    local d = ag - r.aP
+    if d < 0 or (w.omega or 0) < math.rad(8) then r.hG = (r.hG or 0) + d end
+  end
+  r.aP = ag
   -- Steigen: nur aus ausgekurbelten Baerten seit dem Start (mind. 20 s und 15 m Gewinn, 0.2 bis 4 m/s, mehr
   -- ist Motor), die letzten 6 fuer RZ.climb. Vorher rechnet die Restzeit ohne Steigen (nur Abgleiten).
   local lt = w.lastTherm
@@ -3668,17 +3677,33 @@ function RZ.table(w, now)
     -- konstant mit tieferem Index geflogen werden". Eine Runde mit Schlaufen/Umwegen (Index ueber 1.30) lernt
     -- nichts, weder Index noch Lernfaktor f. Der Index geht nie ueber 1.20.
     local kRaw = r.dist / math.max(T.perim, 1)
-    local ok = kRaw <= BAL.RZ_KOK
-    r.ks[#r.ks + 1] = ok and clamp(kRaw, 1, BAL.RZ_K0) or false
+    local ok = kRaw <= BAL.rzK0(w) + 0.10
+    r.ks[#r.ks + 1] = ok and clamp(kRaw, 1, BAL.rzK0(w)) or false
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
+    -- 1.55 (Christoph 25.11.2026: "der Hoehenverlust pro Runde wird nachgefuehrt"): Hoehe pro Runde aus den
+    -- letzten zwei Runden, gemessen nur im Gleiten (siehe oben), als Faktor auf Polare x Index bei dem MC, der in
+    -- der Runde galt. Startwert 1 (Polare x Index 1.20).
+    if r.TL and r.mcN > 0 then
+      local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
+      local mod = r.k * r.HL[mi]
+      if mod > 5 then
+        r.hq = r.hq or {}
+        r.hq[#r.hq + 1] = clamp(-(r.hG or 0) / mod, 0.5, 3)
+        if #r.hq > 2 then table.remove(r.hq, 1) end
+        local a = 0
+        for _, v in ipairs(r.hq) do a = a + v end
+        r.fH, r.hLap, r.hMod = a / #r.hq, -(r.hG or 0), mod
+      end
+    end
+    r.hG = 0
     r.mcS, r.mcN = 0, 0
   end
   -- Index: 1.20, bis die letzten zwei Runden beide vernuenftig und konstant waren (Unterschied hoechstens 0.08);
   -- dann der groessere der beiden (vorsichtig), nie ueber 1.20.
-  local n, k = #r.ks, BAL.RZ_K0
+  local n, k = #r.ks, BAL.rzK0(w)
   local a, b = r.ks[n], r.ks[n - 1]
-  if a and b and math.abs(a - b) <= 0.08 then k = math.min(BAL.RZ_K0, math.max(a, b)) end
+  if a and b and math.abs(a - b) <= 0.08 then k = math.min(BAL.rzK0(w), math.max(a, b)) end
   r.k = k
   -- Steigen fuer die Dreiecke: nur ausgekurbelte Baerte (ohne: fast 0, also kein Steigen eingeplant), mit
   -- abnehmendem Trend fuer die Restzeit. Fuer die Abflughoehe im Bart zaehlt der laufende Bart ab 20 s, sonst
@@ -3750,6 +3775,7 @@ function RZ.search(w, now)
   local rest = T.work * 60 - (f.clk - w.startT)
   local avail = rest - math.max(15, rest * w.rzRes / 100)
   local F = 1
+  local fH = r.fH or 1                                  -- 1.55: gemessene Hoehe pro Runde / Polare x Index
   local availM = avail
   local k, z, Vc, nm = r.k, w.rzPilot / 100, r.vcU, r.nm
   local TP, HP, TL, HL = r.TP, r.HP, r.TL, r.HL
@@ -3771,7 +3797,7 @@ function RZ.search(w, now)
   local room = vh and math.max(0, hmax - f.agl) or 0
   local function ev(N, mi, h0)
     local cp, cl = k * (N <= 2 and 1 + z or 1), k * (N - 1 + z * math.min(2, N - 1))
-    local tg, dh = cp * TP[mi] + cl * TL[mi], cp * HP[mi] + cl * HL[mi]
+    local tg, dh = cp * TP[mi] + cl * TL[mi], (cp * HP[mi] + cl * HL[mi]) * fH
     local d = math.max(0, dh - h0)
     local d1 = math.min(d, room)
     return tg + (vh and d1 / vh or 0) + (d - (vh and d1 or 0)) / Vc, tg, dh
@@ -5522,9 +5548,8 @@ local function paintTherm(w, W, H, top)
       sub = {string.format("%d m erreicht · %d", math.floor(rz.hgo + 0.5), N), true}
       prog = 1
     else
-      local t = need / (rz.vh or rz.vcG)                -- 1.53.2: gleiches Steigen wie die Rechnung (vorher 0.2 m/s)
       lab, val, col, arrowUp = SMALL and "NOCH TANKEN" or "ENDANFLUG: NOCH TANKEN", string.format("+%d m", math.floor(need + 0.5)), C_BLUE, true
-      sub = {string.format("ab %d m · %d", math.floor(rz.hgo + 0.5), N), true, t < 100 and string.format(" · ca. %d s", math.floor(t + 0.5)) or (" · ca. " .. fmtMS(t))}
+      sub = {string.format("ab %d m · %d", math.floor(rz.hgo + 0.5), N), true}   -- 1.55: ohne Tankzeit (Christoph)
       prog = tm and (f.agl - h0) / math.max(rz.hgo - h0, 1) or nil
     end
   end
