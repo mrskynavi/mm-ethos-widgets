@@ -1,5 +1,5 @@
 -- @widget  SkyNavigator
--- @version 1.53.2
+-- @version 1.53.3
 -- SkyNavigator: GPS-Triangle-Navigation fuer Ethos -- Vollbild-Widget mit Tonausgabe.
 --
 -- Die Aufgaben (Dreiecke) kommen aus dem MM Flight Analyzer, Tab "SkyNavigator": Die App schreibt
@@ -42,7 +42,7 @@
 -- scripts/skynav/fluege/ (1 Hz, I-Record SUS, LTSK, C-Records, E-Records PEV/STA/TPC/FIN/STP,
 -- G-Record). Die App holt sie beim naechsten Sync ins Archiv und wertet sie aus.
 
-local VERSION = "1.53.2"
+local VERSION = "1.53.3"
 local KMH = 3.6
 local G = 9.81
 local STORE_VER = 1
@@ -3736,6 +3736,20 @@ function RZ.search(w, now)
   local r, T, f = w.rz, w.task, w.cur
   -- startT fehlt nach "Neustart: wieder scharf" zwischen Tabelle und Suche (1.43.1, Simulator-Fehler 14.11.)
   if not (r and r.TL and f and T and w.startT and w.state == S_STARTED) then w.rz = nil; return end
+  -- 1.53.3 (Christoph 25.11.2026): im Bart einmal pro Vollkreis rechnen, und zwar wenn das Modell vom naechsten
+  -- TP wegfliegt (Kurs hoechstens 30 Grad neben der Gegenrichtung). Dann weiss der Pilot fuer den naechsten Kreis,
+  -- ob er bleibt oder geht. Scharf wieder, sobald der Kurs halbwegs zum TP zeigt (unter 90 Grad daneben).
+  -- Vorher lief die Suche auch im Bart rund jede Sekunde. Im Gleitflug unveraendert (hoechstens 1x pro s).
+  if w.therm and f.crs then
+    local leg = math.min(w.tp, 3) + 1
+    local tg = T.tp[leg] or {x = 0, y = 0}
+    local d = math.abs(angDiff(bearingOf(tg.x - f.x, tg.y - f.y), f.crs))
+    if d < 90 then r.awArm = true end
+    if r.awTh == w.therm and not (r.awArm and d >= 150) then return end
+    r.awTh, r.awArm = w.therm, false
+    -- neuer Bart: sofort nur, wenn das Modell schon wegfliegt; sonst beim ersten Wegfliegen
+    if d < 150 then return end
+  end
   local rest = T.work * 60 - (f.clk - w.startT)
   local avail = rest - math.max(15, rest * w.rzRes / 100)
   local F = r.f or 1
@@ -3817,7 +3831,7 @@ function RZ.search(w, now)
   -- Anzeige: erst ab der zweiten Runde (Netto pro Schenkel und Rundenzeit bekannt). 1.53.2: die angezeigte Zahl
   -- Ns wechselt, sobald N 10 s lang davon abweicht (vorher musste N 10 s lang GLEICH bleiben; im Bart schwankt N
   -- mit dem Steigen, Ns blieb auf dem alten Wert haengen: Christoph 25.11., "ab 516 m · 3 Dreiecke").
-  if not r.Ns or N == r.Ns then r.Ns, r.Nt = N, nil
+  if not r.Ns or N == r.Ns or w.therm then r.Ns, r.Nt = N, nil   -- im Bart gilt die Zahl dieses Kreises sofort
   elseif not r.Nt then r.Nt = now
   elseif now - r.Nt >= 10 then r.Ns, r.Nt = N, nil end
   -- Abflughoehe fuer die angezeigte Zahl (hoechstens N), damit Hoehe und Dreiecke zusammenpassen
