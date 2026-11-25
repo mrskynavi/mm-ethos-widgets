@@ -1013,6 +1013,7 @@ end
 -- Bildschirm ist. nil = Ereignis (Wendeton, Sektor, Start, Ziel, Zone): kommt auf jeder Seite und auch,
 -- wenn am Sender ein anderer Bildschirm offen ist (die Wertung laeuft ja weiter).
 local function audible(w, page)
+  if w.forceSay then return true end            -- 1.52.4: "Wende rechts" und "verpasst" kommen immer
   if not w.sound then return false end
   if validSource(w.soundSw) and (readNumber(w.soundSw) or 0) <= 0 then return false end
   -- Wendevorhersage hat Vorrang vor allem: rund um die Wende (w.prioUntil, siehe turnTone) schweigen alle anderen
@@ -2081,6 +2082,11 @@ local function readInputs(w, now, dt)
   -- Vario-Art barometrisch: das Widget kompensiert selbst (Aenderung der Bewegungsenergie, siehe BAL.TE)
   if vario ~= nil and w.varioType == 2 then vario = vario + (w.teDE or 0) end
   w.varioRaw = vario
+  -- 1.52.2 Wert fuer das Ethos-Vario (Christoph 24.11.2026): nur im Sinken leicht geglaettet (0.3 s), damit kurze
+  -- Ausschlaege den Sinkton nicht vor der Schwelle ausloesen; Steigen und jedes Ansteigen gehen unverzoegert durch
+  if vario == nil then w.voV = nil
+  elseif vario >= 0 or w.voV == nil or vario >= w.voV then w.voV = vario
+  else w.voV = lpf(w.voV, vario, dt, 0.3) end
   if vario ~= nil then w.vFast = lpf(w.vFast, vario, dt, 0.6) end
   if lat == nil then
     w.gpsOk = w.gSeen ~= nil and now - w.gSeen <= 3
@@ -2696,7 +2702,11 @@ function BAL.QA.step(w, now, dt)
   end
   local k = (m and m.qk) or w.qaRate or 30
   if not fly then w.qaB = bg
-  else w.qaB = (w.qaB or bg) + dt * k * qq + dt / ((w.qaTau or 25) / 10) * (bg - w.qaB) end
+  else
+    -- 1.52.1: Startwert auch im Klammerausdruck (Simulator: nil, wenn der Flug ohne Knueppel-Wert begann)
+    local b = w.qaB or bg
+    w.qaB = b + dt * k * qq + dt / ((w.qaTau or 25) / 10) * (bg - b)
+  end
   if not sens then w.qlPhi, w.qlEst = clamp(w.qaB, -80, 80), true end
 end
 
@@ -2945,9 +2955,10 @@ end
 -- tv  = Vorhalt (s) fuer "Jetzt", pro Modell in radien.lua (tv), gelernt aus der Sektortiefe nach jeder Wende.
 -- early = Warnung, wenn das Modell vor dem Sektor schon so eindreht, dass die Kurve (volle Drehrate V/R) den
 --         Sektor nicht erreicht: tiefer Doppelton + Vibration ("kurz geradeaus").
--- miss  = Alarm, wenn der naechste TP ohne Sektor hinter dem Modell liegt (nahe vorbei, Abstand waechst 3 s im
---         Geradeausflug) oder das Modell im Sektor des uebernaechsten TP ist: Toene, Vibration, "Wendepunkt n
---         verpasst" (audio/wendepunkt.wav, verpasst.wav), alle 6 s, Balken "TPn FEHLT" bis der Sektor erreicht ist.
+-- miss  = Alarm (1.52.4, Christoph 24.11.2026): das Modell war hoechstens BAL.WV.NEAR m am TP, ohne den Sektor zu
+--         erreichen, und fliegt danach BAL.WV.STEADY s gerade auf das naechste Ziel zu (naechster TP bzw. Ziellinie):
+--         Toene, Vibration, "Wendepunkt n verpasst" (audio/wendepunkt.wav, verpasst.wav), genau einmal pro TP und
+--         durch nichts unterdrueckt (Ton aus, Vorrang, Seite); Balken "TPn FEHLT" bis der Sektor erreicht ist.
 BAL.WV = {TV0 = 1.0, LO = 0.3, HI = 1.5}
 
 function BAL.WV.tv(w)
@@ -2969,15 +2980,39 @@ function BAL.WV.jetzt(w, g)
   w.wvJ = {j = g.next, vb = f.ve * c.bx + f.vn * c.by, lap = #w.laps}
 end
 
+BAL.WV.NEAR, BAL.WV.STEADY = 50, 4
 function BAL.WV.alarm(w, now, j)
   prioHold(w, now, 3.5)
-  w.prioPlay = true
+  w.prioPlay, w.forceSay = true, true
   tone(w, nil, 900, 150); tone(w, nil, 700, 150); tone(w, nil, 500, 300)
   haptic(w, nil, 500)
   if audioFile("verpasst.wav") then
     sayWord(w, nil, "wendepunkt.wav"); sayNumber(w, nil, j, UNIT_RAW, 0); sayWord(w, nil, "verpasst.wav")
   end
-  w.prioPlay = nil
+  w.prioPlay, w.forceSay = nil, nil
+end
+
+-- 1.52.4 Wende entgegen der normalen Richtung (Christoph 24.11.2026): rechnet der Weg nach geschnittener Ecke die
+-- schnellere Wende zur anderen Seite (normal: links), einmal pro Ecke "Wende rechts" (audio/wende_rechts.wav, bei
+-- Aufgaben im Uhrzeigersinn "Wende links"), durch nichts unterdrueckt. Ohne Datei: Zwitscher wie die Kurs-Ansage.
+function BAL.WV.reverse(w, g, now, key)
+  local p, T = g.plan, w.task
+  local c = T and g.next and T.tp[g.next]
+  if not (p and p.turnDir and c and c.s) or w.wrKey == key then return false end
+  local left = p.turnDir > 0
+  if (left and 1 or -1) == c.s then return false end            -- normale Richtung: keine Ansage
+  w.wrKey = key
+  prioHold(w, now, 2.5)
+  w.prioPlay, w.forceSay = true, true
+  if not sayWord(w, nil, left and "wende_links.wav" or "wende_rechts.wav") then
+    if not sayWord(w, nil, left and "links.wav" or "rechts.wav") then
+      tone(w, nil, left and 2200 or 1500, 120); tone(w, nil, left and 1500 or 2200, 120)
+    end
+  end
+  haptic(w, nil, 300)
+  w.prioPlay, w.forceSay = nil, nil
+  w.quietUntil = now + 2
+  return true
 end
 
 function BAL.WV.learn(w, M)
@@ -3009,10 +3044,6 @@ function BAL.WV.step(w, f, now, dt)
   end
   -- Alarm wiederholen (auch ohne neuen Fix)
   local X = w.wvX
-  if w.missTP and X and X.nextT and now >= X.nextT then
-    X.nextT = now + 6
-    if not X.toward then BAL.WV.alarm(w, now, w.missTP) end
-  end
   if not (f and f.ve) or f.clk == w.wvClk then return end
   w.wvClk = f.clk
   -- Tiefe nach dem Sektor-Eintritt: bis sie wieder abnimmt (Kurve fertig), hoechstens 12 s, nicht im Bart
@@ -3053,20 +3084,20 @@ function BAL.WV.step(w, f, now, dt)
   end
   -- verpasst (nur TP1..3, nicht die Ziellinie; nicht im Landeanflug unter 50 m)
   if w.tp >= 3 or (f.agl or 999) < 50 then return end
-  if not X or X.j ~= j then X = {j = j, dmin = dist, dprev = dist}; w.wvX = X end
+  if not X or X.j ~= j then X = {j = j, dmin = dist}; w.wvX = X end
   if dist < X.dmin then X.dmin = dist end
-  local cosA = gs > 3 and dist > 1 and ((c.x - f.x) * f.ve + (c.y - f.y) * f.vn) / (dist * gs) or 0
-  X.toward = cosA > 0.5
-  local away = cosA < -0.17 and dist > X.dprev and (w.omega or 0) < math.rad(15)
-  X.dprev = dist
-  if away then X.awayT = X.awayT or now else X.awayT = nil end
-  if not w.missTP then
-    local passed = X.dmin < 250 and dist > X.dmin + 40 and X.awayT and now - X.awayT >= 3
-    local nextSec = j < 3 and inSector(T, j + 1, f.x, f.y)
-    if passed or nextSec then
-      w.missTP, X.nextT = j, now + 6
-      BAL.WV.alarm(w, now, j)
-    end
+  -- 1.52.4: am TP (hoechstens NEAR m) vorbei, dann gerade aufs naechste Ziel (naechster TP, nach TP3 der Ursprung
+  -- auf der Ziellinie): Kurs ueber Grund hoechstens 30 Grad daneben, keine Kurve, STEADY s lang, und schon 30 m weg
+  local nx, ny = 0, 0
+  if j < 3 then nx, ny = T.tp[j + 1].x, T.tp[j + 1].y end
+  local ex, ey = nx - f.x, ny - f.y
+  local el = math.sqrt(ex * ex + ey * ey)
+  local onWay = X.dmin <= BAL.WV.NEAR and dist > X.dmin + 30 and gs > 3 and el > 1
+    and (ex * f.ve + ey * f.vn) / (el * gs) > 0.87 and (w.omega or 0) < math.rad(8)
+  if onWay then X.wayT = X.wayT or now else X.wayT = nil end
+  if not w.missTP and not X.fired and X.wayT and now - X.wayT >= BAL.WV.STEADY then
+    X.fired, w.missTP = true, j
+    BAL.WV.alarm(w, now, j)
   end
 end
 
@@ -3077,6 +3108,8 @@ function turnTone(w, g, now)
   local key = #w.laps * 4 + w.tp
   local wt = w.warn
   if wt and wt.key ~= key then wt = nil; w.warn = nil end
+  -- 1.52.4: Wende zur ungewohnten Seite ansagen; ersetzt "Jetzt" dieser Ecke (sonst kaeme der Ton mitten hinein)
+  if BAL.WV.reverse(w, g, now, key) then w.warn = {key = key, done = true}; return true end
   if wt and wt.done then
     -- deutlich weg von der Kurve (abgebrochen, z. B. Bart): fuer diese Ecke wieder frei
     if not (p.inTurn or p.missed or p.late) and (p.tT or 0) - w.lead / 10 > w.warnSec + 4 then w.warn = nil end
@@ -3093,9 +3126,15 @@ function turnTone(w, g, now)
   if th then tT = th
   elseif p.missed then tT = (g.dV or 0) < 2 * ((g.C and g.C[1] and g.C[1].R) or R_DEFAULT) and 0 or 99
   else
-    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: kein "Jetzt", dafuer kurz vor der Ecke die Kurs-Ansage
-    -- nach dem Plan ("15 rechts"), alle 3 s, auf jeder Seite
-    if (p.tT or 99) - w.lead / 10 <= w.warnSec + 3 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
+    -- Mit diesem Kurs fuehrt keine Kurve in den Sektor: vor dem Einzaehlen die Kurs-Ansage nach dem Plan
+    -- ("15 rechts", alle 3 s, auf jeder Seite), dann zaehlt der Plan.
+    -- 1.52.1 (Christoph 24.11.2026: vor den Wenden oft Kurskorrektur statt "drei, zwei, eins"): Das Einzaehlen hat
+    -- Vorrang. Vorher sprang die Restzeit ohne erreichbare Kurve auf 99, ein laufendes Einzaehlen verstummte und die
+    -- Kurs-Ansage kam mitten hinein. Jetzt: Kurs-Ansage nur, bis das Einzaehlen beginnt (Fenster 4 bis 9 s vor
+    -- der Kurve, Platz fuer eine Ansage), danach zaehlt der Plan weiter bis "Jetzt".
+    local tp = (p.tT or 99) - BAL.WV.tv(w)                     -- wie das Einzaehlen unten (Vorhalt)
+    local nC = math.max(w.warnSec, 3)
+    if not wt and tp <= nC + 6 and tp > nC + 2 and g.err and math.abs(g.err) >= 5 and (not w.crsT or now - w.crsT >= 3) then
       w.crsT = now
       local right = g.err > 0
       local fn = right and "rechts.wav" or "links.wav"
@@ -3108,7 +3147,7 @@ function turnTone(w, g, now)
       end
       w.prioPlay = nil
     end
-    tT = 99
+    tT = p.tT or 99
   end
   -- Vorhalt (1.43): "Jetzt" kommt tv s VOR dem fruehesten sicheren Kurvenbeginn. Bis die Kurve wirklich dreht,
   -- vergehen Reaktion, Einrollen und Aufbau der Drehrate (ASW-17 am 13.11.: Knueppel bis Drehung 1.2 s, Drehung im
@@ -3169,7 +3208,9 @@ local function glideTones(w, g, now, warn)
     local turning = (w.omega or 0) > math.rad(8) or (w.tpT and now - w.tpT < 6)
     -- Mit Querlage: Kursfehler nach der vorausgerechneten Drehung (g.rest); HALTEN und AUSLEITEN ohne Kurs-Ansage
     local ge = g.rest or g.err
-    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 6 and (not w.quietUntil or now > w.quietUntil) then
+    -- 1.52.1: nur bis 9 s vor der Kurve (vorher 6 s): eine Ansage dauert ~2 s und darf nicht ins Einzaehlen laufen
+    -- (beginnt rund 4 s + Vorhalt vor der Kurve, Vorrang 1.5 s frueher); danach gilt die Kurs-Ansage des Wendetons
+    if w.navVoice and ge and not turning and not g.plan.inTurn and (g.plan.tT or 0) > 9 and (not w.quietUntil or now > w.quietUntil) then
       local a, right = math.abs(ge), ge > 0
       local xt, xp = g.xt, g.xtPred
       local drift = xt and xp and math.abs(xt) <= 300 and math.abs(xp) >= 15 and math.abs(xp) > math.abs(xt) + 2
@@ -3423,7 +3464,7 @@ end
 function BAL.VT.sinking(w, t)
   if not w.vtOn then w.vtSinkT = nil; return false end
   local v, lo
-  if w.vtDev == 2 then v, lo = w.varioRaw, (w.vsLo or 6) / 10 else v, lo = w.vtV, (w.vzLo or 3) / 10 end
+  if w.vtDev == 2 then v, lo = w.voV, (w.vsLo or 6) / 10 else v, lo = w.vtV, (w.vzLo or 3) / 10 end
   if v and v < -lo then w.vtSinkT = t end
   return w.vtSinkT ~= nil and t - w.vtSinkT < 3
 end
@@ -3517,7 +3558,7 @@ function BAL.VO.write(s, mode, v)
   return pcall(s.value, s, v)
 end
 function BAL.VO.set(w, now, on)
-  local v = on and w.varioRaw or 0
+  local v = on and (w.voV or w.varioRaw) or 0
   v = clamp(v, -20, 20)
   BAL.VO.on = on
   BAL.VO.v, BAL.VO.t = v, now
@@ -3636,7 +3677,7 @@ function BAL.TM.wake(f, w)
     -- Vario-Wert frisch (readInputs hat ihn eben gelesen), damit der Ton ohne Verzoegerung folgt
     local s = w.voSens
     if s and w.vtDev == 2 and w.voMode then
-      local v = BAL.VO.on and clamp(w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
+      local v = BAL.VO.on and clamp(w.voV or w.varioRaw or BAL.VO.v or 0, -20, 20) or 0
       BAL.VO.v = v
       if BAL.VO.write(s, w.voMode, v) then w.voLast = v end
     end
@@ -3659,6 +3700,7 @@ function BAL.TM.wake(f, w)
   if w.calcIv and w.calcIv >= 4 and w.calcIv <= 9 then
     -- 1.47: Laststufen 6..9 ebenfalls mit festen -2 m/s (am Boden steht das echte Vario bei 0 = still)
     w.varioRaw = (w.calcIv == 4) and (readNumber(w.vario) or 0) or -2
+    w.voV = w.varioRaw                                         -- Testwerte ungeglaettet
     BAL.VO.set(w, t, true)
     local busy = ({0, 0, 0.010, 0.020, 0.040, 0})[w.calcIv - 3]
     if w.calcIv == 9 and t - (T.bz or 0) >= 1 then T.bz, busy = t, 0.100 end
@@ -3901,12 +3943,16 @@ function RZ.table(w, now)
   if #w.laps > r.nl then
     r.nl = #w.laps
     local L = w.laps[r.nl]
-    r.ks[#r.ks + 1] = clamp(r.dist / T.perim, 1, 1.6)
+    local kLap = clamp(r.dist / T.perim, 1, 1.6)
+    r.ks[#r.ks + 1] = kLap
     if #r.ks > 3 then table.remove(r.ks, 1) end
     r.dist = 0
     if r.TL and r.mcN > 0 then
       local mi = clamp(math.floor(r.mcS / r.mcN * 4 + 1.5), 1, r.nm)
-      local tg, dh = r.k * r.TL[mi], r.k * r.HL[mi]
+      -- 1.52.5 (Christoph 24.11.2026, Log ASW-17: "RAUS" mit 23 min Rest, 4 Dreiecke): Modellzeit mit dem Index
+      -- DIESER Runde. Vorher galt der alte Index (Start 1.05): eine Runde mit Umwegen zaehlte doppelt, im Index
+      -- (1.6) und nochmals im Lernfaktor f (2.3), jede weitere Runde wurde rund 3.5-mal so lang gerechnet.
+      local tg, dh = kLap * r.TL[mi], kLap * r.HL[mi]
       local q = clamp(L.time / (r.vc and math.max(tg * 0.8, tg + (dh + (L.dAlt or 0)) / r.vc) or tg), 0.7, 2.5)
       r.f = r.f and (r.f + q) / 2 or q
     end

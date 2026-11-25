@@ -225,6 +225,10 @@ end
 --   Flugrichtung / GPS-Kurs (DIY 0522): Kurs vom Empfaenger fuer den Kurven-Filter (mit GPS-Geschw.,
 --   ab 3 m/s, Rohwert in 0.1 Grad wird umgerechnet). GPS-Satelliten: unter 6 orange in der Fusszeile.
 --
+-- Ab 1.6: Konfiguration "Sensor-Geraet" (SM GPS-Logger 3 / FrSky Vario + FrSky-GPS / keines) wie im SkyNavigator.
+--   Das Widget sucht die Quellen selbst und traegt sie in die Felder ein (Vario-Typ und Fahrt-Einheit dazu), mit
+--   TEK-Kalibrierung des Modells "TEK korr." und "Fahrt korr."; Einzelheiten beim Abschnitt Sensor-Geraet.
+
 -- Alle Zahlenfelder sind ganzzahlig.
 
 local KMH = 3.6
@@ -678,15 +682,45 @@ local function pushSample(w, now, tas, vario, crs)
   while #r > 0 and now - r[1].t > 2 * HALF + 1 do table.remove(r, 1) end
 end
 
+-- Einheit km/h fuer system.playNumber. Der Name der Konstante ist je nach Ethos-Version anders
+-- (Ethos 1.6.6 kennt UNIT_KPH nicht). Sonst einmal in _G suchen; ohne Treffer nur die Zahl.
+local kmhUnit
+local function findKmhUnit()
+  if kmhUnit ~= nil then return kmhUnit end
+  kmhUnit = UNIT_KPH or UNIT_KMH or UNIT_KM_PER_HOUR or UNIT_KILOMETER_PER_HOUR or UNIT_KMPH
+  if kmhUnit == nil then
+    for k, v in pairs(_G) do
+      if type(k) == "string" and type(v) == "number" and k:sub(1, 5) == "UNIT_"
+        and (k:find("KPH") or k:find("KMH") or k:find("KM_PER") or k:find("KILOMETER_PER") or k:find("KMPH")) then
+        kmhUnit = v
+        break
+      end
+    end
+  end
+  if kmhUnit == nil then kmhUnit = false end
+  return kmhUnit
+end
+
 -- Fahrt vom Staudruck-Sensor in m/s (wahre Fahrt), nil wenn keiner oder unplausibel (siehe Kopf)
 local function airspeedTas(w, now, dt, gs)
   local src = validSource(w.airSrc)
   local v = src and readNumber(src)
   if not v then w.asTas = nil; return nil end
-  local ias = MM_UNITS.speedToMs(v, src, w.airUnit or 1)
-  if not ias then w.asTas = nil; return nil end
+  local u = w.airUnit or 1
+  if u == 1 then
+    local ok, un = pcall(src.unit, src)
+    if not ok then un = nil end
+    local function is(name, txt) local c = rawget(_G, name); return (c ~= nil and un == c) or un == txt end
+    if is("UNIT_METER_PER_SECOND", "m/s") then u = 4
+    elseif is("UNIT_KMH", "km/h") or is("UNIT_KILOMETER_PER_HOUR", "km/h")
+      or (un ~= nil and findKmhUnit() and un == findKmhUnit()) then u = 2   -- 1.6: z.B. "Fahrt korr." in km/h
+    elseif is("UNIT_MPH", "mph") then u = 5
+    else u = 3 end                                     -- Knoten oder ohne Einheit (DIY-Sensor)
+  end
+  local ias = v * (u == 2 and 1 / KMH or u == 3 and 0.514444 or u == 5 and 0.44704 or 1)
   if v ~= w.asRaw then w.asRaw, w.asChg = v, now end
-  w.asTas = lpf(w.asTas, MM_DENSITY.iasToTas(ias, w.alt or 0), dt, 0.2)
+  local sigma = (1 - 2.2558e-5 * clamp(w.alt or 0, -500, 6000)) ^ 4.2559
+  w.asTas = lpf(w.asTas, ias / math.sqrt(sigma), dt, 0.2)
   if now - (w.asChg or now) >= 5 or (w.asTas < 5 and (gs or 0) > 12) then return nil end
   return w.asTas
 end
@@ -910,25 +944,6 @@ local function clearPoints(w)
 end
 
 -- ---------------------------------------------------------------- Ansage
-
--- Einheit km/h fuer system.playNumber. Der Name der Konstante ist je nach Ethos-Version anders
--- (Ethos 1.6.6 kennt UNIT_KPH nicht). Sonst einmal in _G suchen; ohne Treffer nur die Zahl.
-local kmhUnit
-local function findKmhUnit()
-  if kmhUnit ~= nil then return kmhUnit end
-  kmhUnit = UNIT_KPH or UNIT_KMH or UNIT_KM_PER_HOUR or UNIT_KILOMETER_PER_HOUR or UNIT_KMPH
-  if kmhUnit == nil then
-    for k, v in pairs(_G) do
-      if type(k) == "string" and type(v) == "number" and k:sub(1, 5) == "UNIT_"
-        and (k:find("KPH") or k:find("KMH") or k:find("KILOMETER") or k:find("KM_")) then
-        kmhUnit = v
-        break
-      end
-    end
-  end
-  if kmhUnit == nil then kmhUnit = false end
-  return kmhUnit
-end
 
 local function speak(w, value, now)
   if not widgetVisible() then return end   -- unsichtbar: keine Ansage (wie Sollfahrt)
@@ -1192,10 +1207,172 @@ local function writeMeasuredPolar(w)
   return string.format("polaren.lua: %s neu (%.0f-%.0f km/h%s)", key, p.lo * KMH, p.hi * KMH, p.merged and ", ergaenzt" or "")
 end
 
+-- ---------------------------------------------------------------- Sensor-Geraet (1.6, wie SkyNavigator)
+-- Konfiguration "Sensor-Geraet": das Widget sucht die Telemetrie-Quellen selbst und traegt sie in die Felder ein
+-- (Christoph 24.11.2026). Zuerst ueber die S.Port-AppID mit Instanz 0..15 (sprachunabhaengig), dann ueber die
+-- Ethos-Namen (deutsch/englisch). Beim Logger Vario hoechste Instanz zuerst (hat der Empfaenger ein eigenes Vario,
+-- muss der Logger laut SM eine Instanz ungleich 0 haben). Gibt es fuer das Modell scripts/tekkal/korrektur_<Modell>.txt
+-- und hat die TEK-Kalibrierung die Sensoren "TEK korr." (0x5FF1) und "Fahrt korr." (0x5FF2) angelegt, gelten diese
+-- als Vario und Fahrt (eine falsche Fahrt geht voll in die Polare). Vario-Typ: Logger/TEK korr. = TE, FrSky Vario =
+-- barometrisch. Wechsel des Geraets oder "Neu suchen" ueberschreibt die Felder des Geraets; sonst werden nur leere
+-- Felder gefuellt, auch im Betrieb (eine Rolle pro wakeup, Runde alle 20 s), eine Wahl von Hand bleibt.
+-- dev: 1 = SM GPS-Logger 3, 2 = FrSky Vario (+ FrSky-GPS), 0 = keines (Quellen von Hand wie bis 1.5).
+local SN = {
+  KEYS = {"gps", "gpsSpd", "gpsAlt", "vario", "airSrc", "crsSrc", "satSrc"},
+  ROLE = {
+    gps    = {dev = "gps",   lbl = "GPS",      ids = {0x0800}, names = {"GPS"}},
+    gpsSpd = {dev = "gps",   lbl = "Geschw.",  ids = {0x0830}, names = {"GPS-Geschw.", "GSpd", "GPS Speed"}},
+    gpsAlt = {dev = "gps",   lbl = "GPS-Hoehe", ids = {0x0820}, names = {"GAlt", "GPS-H\195\182he", "GPS Alt"}},
+    vario  = {dev = "baro",  lbl = "Vario",    ids = {0x0110}, names = {"Steigr. Vario", "VSpeed", "Vario"},
+              korr = 0x5FF1, kname = "TEK korr."},
+    airSrc = {dev = "sm",    lbl = "Fahrt",    ids = {0x0A00}, names = {"Airspeed", "ASpd"},
+              korr = 0x5FF2, kname = "Fahrt korr."},
+    crsSrc = {dev = "frgps", lbl = "Kurs",     ids = {0x0840}, names = {"GPS-Kurs", "GPS Course", "Hdg"}},  -- SM: Kurs aus Position
+    satSrc = {dev = "gps",   lbl = "Sats",     ids = {0x0860}, names = {"Satelliten", "Sats", "GPS Sats"}},
+  },
+  KORR_DIRS = {"/scripts/tekkal/", "scripts/tekkal/", "../tekkal/"},
+}
+
+-- Methode einer Ethos-Quelle sicher aufrufen (nil, wenn es sie nicht gibt)
+function SN.call(src, m)
+  local okF, f = pcall(function() return src[m] end)
+  if not (okF and type(f) == "function") then return nil end
+  local ok, v = pcall(f, src)
+  if ok then return v end
+  return nil
+end
+
+-- echte Quelle? (Ethos liefert fuer ein leeres Feld je nach Version nil, false oder eine Quelle "---")
+function SN.isSet(src)
+  if not validSource(src) then return false end
+  local none = rawget(_G, "CATEGORY_NONE")
+  if none ~= nil and SN.call(src, "category") == none then return false end
+  local n = SN.call(src, "name")
+  return not (n == "" or n == "---")
+end
+
+-- Telemetrie-Quelle ueber AppID (Zahl) oder Namen
+function SN.get(spec)
+  if not (system and system.getSource) then return nil end
+  local cat = rawget(_G, "CATEGORY_TELEMETRY_SENSOR") or rawget(_G, "CATEGORY_TELEMETRY")
+  local ok, src
+  if type(spec) == "number" then
+    if not cat then return nil end
+    ok, src = pcall(system.getSource, {category = cat, appId = spec})
+  else
+    if cat then ok, src = pcall(system.getSource, {category = cat, name = spec}) end
+    if not (ok and SN.isSet(src)) then ok, src = pcall(system.getSource, spec) end
+  end
+  if not (ok and SN.isSet(src)) then return nil end
+  if cat then
+    local c = SN.call(src, "category")
+    if c ~= nil and c ~= cat and c ~= rawget(_G, "CATEGORY_TELEMETRY") then return nil end   -- z.B. ein Kanal
+  end
+  return src
+end
+
+-- Korrektur der TEK-Kalibrierung fuer dieses Modell vorhanden? (gleicher Dateiname wie in scripts/tekkal)
+function SN.korrFile()
+  if not (io and io.open) then return false end
+  local name = "korrektur_" .. tostring(currentModelName() or "Modell"):gsub("[^%w%-_]", "_") .. ".txt"
+  for _, d in ipairs(SN.KORR_DIRS) do
+    local ok, f = pcall(io.open, d .. name, "r")
+    if ok and f then pcall(f.close, f); return true end
+  end
+  return false
+end
+
+function SN.wanted(w, R)
+  local d = w.dev or 0
+  if R.dev == "gps" or R.dev == "baro" then return d >= 1 end
+  if R.dev == "sm" then return d == 1 end
+  if R.dev == "frgps" then return d == 2 end
+  return false
+end
+
+-- Quelle einer Rolle suchen; zweiter Wert true = Korrektur-Sensor der TEK-Kalibrierung
+function SN.find(w, k)
+  local R = SN.ROLE[k]
+  if not SN.wanted(w, R) then return nil end
+  if R.korr and w.dev == 1 and w.snKorr then
+    local src = SN.get(R.korr)
+    local id = src and SN.call(src, "appId")
+    if src and (id == nil or id == R.korr) then return src, true end
+  end
+  local desc = k == "vario" and w.dev == 1
+  for _, id in ipairs(R.ids) do
+    for j = 0, 15 do
+      local src = SN.get(id + (desc and 15 - j or j))
+      if src then return src, false end
+    end
+  end
+  for _, n in ipairs(R.names) do
+    local src = SN.get(n)
+    if src then return src, false end
+  end
+  return nil
+end
+
+-- ein Feld fuellen: leer immer, mit force (Geraet gewaehlt, Neu suchen) auch ueberschreiben. Nicht gefunden: Feld
+-- bleibt (Sensor evtl. noch nicht erkannt); Rollen, die das Geraet nicht hat, leert force (z.B. Kurs beim Logger).
+function SN.fillKey(w, k, force)
+  local R = SN.ROLE[k]
+  if not SN.wanted(w, R) then
+    if force and (w.dev or 0) >= 1 then w[k] = nil end
+    return
+  end
+  if not force and SN.isSet(w[k]) then return end
+  local src, korr = SN.find(w, k)
+  if not src then return end
+  w[k] = src
+  if k == "vario" then w.varioType = (w.dev == 2 and not korr) and 2 or 1 end
+  if k == "airSrc" then w.airUnit = 1 end              -- Einheit des Sensors (ohne Einheit: Knoten)
+end
+
+function SN.fill(w, force)
+  if (w.dev or 0) < 1 then return end
+  w.snKorr = w.dev == 1 and SN.korrFile()
+  for _, k in ipairs(SN.KEYS) do SN.fillKey(w, k, force) end
+  w.snI, w.snNext = 0, nil
+end
+
+-- im Betrieb: leere Felder nachsuchen, eine Rolle pro wakeup, dann 20 s Pause
+function SN.step(w, now)
+  if (w.dev or 0) < 1 or (w.snNext and now < w.snNext) then return end
+  local i = (w.snI or 0) + 1
+  while SN.KEYS[i] and (SN.isSet(w[SN.KEYS[i]]) or not SN.wanted(w, SN.ROLE[SN.KEYS[i]])) do i = i + 1 end
+  local k = SN.KEYS[i]
+  if not k then w.snI, w.snNext = 0, now + 20; return end
+  SN.fillKey(w, k, false)
+  w.snI = i
+end
+
+-- Konfiguration: gefunden / fehlt, Zeilen mit je bis 4 Eintraegen
+function SN.summary(w)
+  local fr, mi = {}, {}
+  for _, k in ipairs(SN.KEYS) do
+    local R = SN.ROLE[k]
+    if SN.wanted(w, R) then
+      local src = w[k]
+      if SN.isSet(src) then
+        local t = R.lbl
+        if R.korr and SN.call(src, "appId") == R.korr then t = R.lbl .. " (" .. R.kname .. ")" end
+        fr[#fr + 1] = t
+      elseif k ~= "satSrc" then mi[#mi + 1] = R.lbl end
+    end
+  end
+  local function rows(t)
+    local r = {}
+    for i = 1, #t, 4 do r[#r + 1] = table.concat(t, ", ", i, math.min(i + 3, #t)) end
+    return r
+  end
+  return rows(fr), rows(mi)
+end
+
 -- ---------------------------------------------------------------- Ablauf
 
 local function create()
-  local w = {lastInvalidate = 0, win = {}, wt = {}, ring = {}, pv = {}, ps = {}, cnt = {}, view = 1}
+  local w = {lastInvalidate = 0, win = {}, wt = {}, ring = {}, pv = {}, ps = {}, cnt = {}, view = 1, dev = 1}
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
   return w
 end
@@ -1277,6 +1454,8 @@ local function wakeup(w)
       loadPoints(w)
     end
   end
+
+  SN.step(w, now)       -- 1.6: leere Quellen des Sensor-Geraets nachsuchen
 
   -- Hoehe: GPS-Hoehe, sonst aus dem Vario aufintegriert (wie Sollfahrt)
   local vario = readNumber(w.vario)
@@ -1670,11 +1849,28 @@ local function addNumber(w, label, prop, lo, hi)
 end
 
 local function configure(w)
+  -- 1.6 Sensor-Geraet: Quellen werden gesucht und unten in die Felder eingetragen
+  SN.fill(w, false)
+  local function rebuild()
+    if form.clear then pcall(form.clear); configure(w) end
+  end
+  local line = form.addLine("Sensor-Geraet")
+  form.addChoiceField(line, nil, {{"SM GPS-Logger 3", 1}, {"FrSky Vario (+ FrSky-GPS)", 2}, {"keines (Quellen von Hand)", 0}},
+    function() return w.dev or 0 end, function(v) w.dev = v; SN.fill(w, true); rebuild() end)
+  if (w.dev or 0) >= 1 then
+    local fr, mi = SN.summary(w)
+    for i, t in ipairs(fr) do local l = form.addLine(i == 1 and "  gefunden" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+    for i, t in ipairs(mi) do local l = form.addLine(i == 1 and "  fehlt" or ""); form.addStaticText(l, form.getFieldSlots(l)[0], t) end
+    line = form.addLine("Quellen neu suchen (ueberschreibt)")
+    if form.addTextButton then
+      form.addTextButton(line, nil, "Suchen", function() SN.fill(w, true); rebuild(); return true end)
+    end
+  end
   addSource(w, "GPS", "gps")
   addSource(w, "GPS-Geschw. (empfohlen)", "gpsSpd")
   addSource(w, "GPS Hoehe (Windschichten)", "gpsAlt")
   addSource(w, "Vario", "vario")
-  local line = form.addLine("Vario-Typ")
+  line = form.addLine("Vario-Typ")
   local tef
   form.addChoiceField(line, nil, {{"Kompensiert (TE)", 1}, {"Barometrisch", 2}},
     function() return w.varioType end,
@@ -1713,6 +1909,7 @@ end
 local function setDefaults(w)
   for _, k in ipairs(SOURCE_KEYS) do w[k] = nil end
   for _, d in ipairs(NUM_DEFS) do w[d.key] = d.def end
+  w.dev = 1
 end
 
 local function read(w)
@@ -1724,6 +1921,16 @@ local function read(w)
       local v = storage.read(d.key)
       w[d.key] = (type(v) == "number") and v or d.def
     end
+    -- 1.6: Sensor-Geraet gepackt in announceMode (announceMode + 10 * (dev + 1)), nicht am Speicherende (dort
+    -- gingen bei SkyNavigator am Sender Werte verloren). Fehlt es (bis 1.5): keines, Quellen bleiben wie gewaehlt.
+    local am = w.announceMode
+    if am >= 10 and am < 40 then
+      w.dev = math.floor(am / 10) - 1
+      am = am % 10
+    else
+      w.dev = 0
+    end
+    w.announceMode = (am >= 1 and am <= 3) and math.floor(am) or 2
     -- 1.5 (GPS-Logger 3): am Ende angehaengt, Ethos-Storage arbeitet nach Aufrufreihenfolge
     w.airSrc = validSource(storage.read("airSrc"))
     local au = storage.read("airUnit")
@@ -1732,12 +1939,17 @@ local function read(w)
     w.satSrc = validSource(storage.read("satSrc"))
   end
   w.cntSig = nil
+  SN.fill(w, false)          -- 1.6: leere Felder des Sensor-Geraets fuellen
 end
 
 local function write(w)
   storage.write("ver", STORE_VER)
   for _, k in ipairs(SOURCE_KEYS) do storage.write(k, w[k]) end
-  for _, d in ipairs(NUM_DEFS) do storage.write(d.key, w[d.key]) end
+  for _, d in ipairs(NUM_DEFS) do
+    local v = w[d.key]
+    if d.key == "announceMode" then v = (v or 2) + 10 * ((w.dev or 0) + 1) end
+    storage.write(d.key, v)
+  end
   storage.write("airSrc", w.airSrc)
   storage.write("airUnit", w.airUnit or 1)
   storage.write("crsSrc", w.crsSrc)
